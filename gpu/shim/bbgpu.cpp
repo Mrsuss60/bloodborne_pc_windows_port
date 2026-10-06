@@ -2,8 +2,9 @@
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
-#include "bbport_copy.h"
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include "bbport_toggles.h"
 #include <algorithm>
 #include <atomic>
@@ -22,6 +23,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
+#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "core/memory.h"
@@ -211,7 +213,11 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     StartProfileWriter();
 #endif
     g_sdk_version = config->sdk_version;
+#ifdef _WIN32
+    if (config->user_dir) _putenv_s("BB_GPU_USER_DIR", config->user_dir);
+#else
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
+#endif
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
@@ -268,6 +274,61 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
 
 extern "C" unsigned bbgpu_symbol_count(void) {
     return unsigned(g_symbols.size());
+}
+
+extern "C" uint64_t bbgpu_get_flip_count(void) {
+    return BbStats::flips.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t bbgpu_get_submit_count(void) {
+    return BbStats::submissions.load(std::memory_order_relaxed);
+}
+
+namespace Libraries::VideoOut {
+void GetFrametimeStats(double* avg_fps, double* p95_ms, double* p99_ms);
+}
+
+extern "C" void bbgpu_get_frametime_percentiles(double* avg_fps, double* p95_ms, double* p99_ms) {
+    Libraries::VideoOut::GetFrametimeStats(avg_fps, p95_ms, p99_ms);
+}
+
+extern "C" void bbgpu_dump_host_threads_hang(void* file_handle) {
+    FILE* f = static_cast<FILE*>(file_handle);
+    if (!f) return;
+    std::fprintf(f, "=== HOST GPU / PRESENTER THREADS ===\n");
+    std::fprintf(f, "GPU Stats:\n");
+    std::fprintf(f, "  Submissions: %llu, Flips: %llu, Draws: %llu, Dispatches: %llu\n",
+                 (unsigned long long)BbStats::submissions.load(std::memory_order_relaxed),
+                 (unsigned long long)BbStats::flips.load(std::memory_order_relaxed),
+                 (unsigned long long)BbStats::draws.load(std::memory_order_relaxed),
+                 (unsigned long long)BbStats::dispatches.load(std::memory_order_relaxed));
+    std::fprintf(f, "  GPU Idle Time: %.2f ms\n",
+                 (double)BbStats::gpu_idle_ns.load(std::memory_order_relaxed) / 1000000.0);
+    std::fprintf(f, "  Scheduler Sync Wait: %.2f ms\n",
+                 (double)BbStats::sync_recording_ns.load(std::memory_order_relaxed) / 1000000.0);
+    std::fprintf(f, "  Host Copies Wait: %.2f ms\n",
+                 (double)BbStats::host_copies_wait_ns.load(std::memory_order_relaxed) / 1000000.0);
+    std::fprintf(f, "  GPU Tick Wait: %.2f ms\n",
+                 (double)BbStats::tick_wait_ns.load(std::memory_order_relaxed) / 1000000.0);
+    std::fprintf(f, "  Host Wait (fences/queue): %.2f ms\n",
+                 (double)BbStats::t_host_wait.load(std::memory_order_relaxed) / 1000000.0);
+    std::fprintf(f, "  Texture Creation Time: %.2f ms, Staging Time: %.2f ms\n",
+                 (double)BbStats::t_image_create.load(std::memory_order_relaxed) / 1000000.0,
+                 (double)BbStats::t_staging.load(std::memory_order_relaxed) / 1000000.0);
+    std::fprintf(f, "  Page Protection Revoke Calls: %llu (%llu pages)\n",
+                 (unsigned long long)BbStats::protect_revoke_calls.load(std::memory_order_relaxed),
+                 (unsigned long long)BbStats::protect_revoke_pages.load(std::memory_order_relaxed));
+    std::fprintf(f, "====================================\n\n");
+    std::fflush(f);
+}
+
+extern "C" void bbgpu_dump_breadcrumbs(void* file_handle) {
+    if (!file_handle) return;
+    FILE* f = static_cast<FILE*>(file_handle);
+    std::fprintf(f, "\n=== GPU BREADCRUMBS STATE ===\n");
+    Vulkan::Breadcrumbs::ReportStuck("diagnostic dump");
+    std::fprintf(f, "=============================\n\n");
+    std::fflush(f);
 }
 
 // Kernel service thread: runs boost::asio timers for equeue timer events.

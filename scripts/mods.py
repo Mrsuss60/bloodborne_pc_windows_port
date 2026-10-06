@@ -101,6 +101,23 @@ def mod_files(folder):
             yield relative, source
 
 
+def make_link(link_path, target_path, target_is_directory=False):
+    try:
+        link_path.symlink_to(target_path, target_is_directory=target_is_directory)
+    except OSError:
+        if sys.platform == 'win32':
+            if target_is_directory:
+                import _winapi
+                _winapi.CreateJunction(str(target_path), str(link_path))
+            else:
+                try:
+                    os.link(str(target_path), str(link_path))
+                except OSError:
+                    shutil.copy2(str(target_path), str(link_path))
+        else:
+            raise
+
+
 def expand(directory):
     """Materialize one directory level; never write through a directory link."""
     if directory.is_symlink():
@@ -110,7 +127,7 @@ def expand(directory):
         directory.unlink()
         directory.mkdir()
         for entry in target.iterdir():
-            (directory / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+            make_link(directory / entry.name, entry, target_is_directory=entry.is_dir())
     elif directory.exists() and not directory.is_dir():
         raise ValueError(f'File/directory conflict at {directory.name}')
     else:
@@ -138,7 +155,7 @@ def build_overlay(game, out, mods):
     overlay = Path(tempfile.mkdtemp(prefix='mod-game-', dir=out))
     try:
         for entry in game.iterdir():
-            (overlay / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+            make_link(overlay / entry.name, entry, target_is_directory=entry.is_dir())
         replaced = added = 0
         for relative, source in replacements:
             # Each component takes the game's spelling when it exists in another case.
@@ -154,7 +171,7 @@ def build_overlay(game, out, mods):
                 raise ValueError(f'File/directory conflict: {relative}')
             else:
                 added += 1
-            destination.symlink_to(source)
+            make_link(destination, source)
         print(f'Mods: {replaced} game files replaced, {added} added', file=sys.stderr)
         return overlay
     except BaseException:

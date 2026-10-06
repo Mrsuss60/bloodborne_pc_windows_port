@@ -44,36 +44,25 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
 
     // 3D images can only use 1 layer.
     if (vk_src_type == vk::ImageType::e3D && src_layers != 1) {
-        LOG_WARNING(Render_Vulkan, "Coercing copy 3D source layers {} to 1.", src_layers);
         src_layers = 1;
     }
     if (vk_dst_type == vk::ImageType::e3D && dst_layers != 1) {
-        LOG_WARNING(Render_Vulkan, "Coercing copy 3D destination layers {} to 1.", dst_layers);
         dst_layers = 1;
     }
 
     // If the image type is equal, layer count must match. Take the minimum of both.
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy source layers {} and destination layers {} to minimum.",
-                        src_layers, dst_layers);
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
         // For 2D <-> 3D copies, 2D layer count must equal 3D depth.
         if (vk_src_type == vk::ImageType::e2D && vk_dst_type == vk::ImageType::e3D &&
             src_layers != depth) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy 2D source layers {} to 3D destination depth {}", src_layers,
-                        depth);
             src_layers = depth;
         }
         if (vk_src_type == vk::ImageType::e3D && vk_dst_type == vk::ImageType::e2D &&
             dst_layers != depth) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy 2D destination layers {} to 3D source depth {}", dst_layers,
-                        depth);
             dst_layers = depth;
         }
     }
@@ -461,21 +450,18 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     ASSERT(mip_block_h == (src->info.size.height >> src_dim));
     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
 
-    const auto [src_layers, dst_layers] =
-        SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
-
     const vk::ImageCopy image_copy{
         .srcSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = 0,
             .baseArrayLayer = 0,
-            .layerCount = src_layers,
+            .layerCount = 1,
         },
         .dstSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = mip,
             .baseArrayLayer = slice,
-            .layerCount = dst_layers,
+            .layerCount = 1,
         },
         .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
     };

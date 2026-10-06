@@ -10,6 +10,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "bbport_threads.h"
+
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -847,8 +849,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         // pointers in the registers; ahead of the GPU thread that memory may already be
         // reused. A fault returns here (runtime_fault_recover) and the draw is left to the GPU
         // thread. A jump out of the specialization leaks its partial allocations (rare).
-        sigjmp_buf recover;
-        if (sigsetjmp(recover, 0)) {
+        BbRecoverBuf recover;
+        if (BB_RECOVER_SET(recover)) {
             worker.failed = true;
             return {};
         }

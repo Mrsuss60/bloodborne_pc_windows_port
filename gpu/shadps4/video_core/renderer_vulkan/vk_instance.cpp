@@ -274,6 +274,7 @@ bool Instance::CreateDevice() {
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    buffer_marker = add_extension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =
@@ -666,10 +667,19 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // bbport: 64 MiB blocks (VMA default 256 MiB). A block goes back to the driver only once
+    // empty: images freed here and there (the texture collector) left 256 MiB blocks mostly
+    // empty and held. BB_VMA_BLOCK_MB=N.
+    static const VkDeviceSize block_size = [] {
+        const char* env = std::getenv("BB_VMA_BLOCK_MB");
+        return VkDeviceSize(env ? std::max(1ul, std::strtoul(env, nullptr, 10)) : 64ul) << 20;
+    }();
+
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        .preferredLargeHeapBlockSize = block_size,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -737,10 +747,15 @@ void Instance::CollectPhysicalMemoryInfo() {
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
+    total_local_memory = local_memory;
     if (!IsIntegrated()) {
-        // We reserve some memory for the system.
-        const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
-        total_memory_budget -= system_memory;
+        // Reserve memory for system only if we have plenty of dedicated VRAM (> 4 GB).
+        // On discrete GPUs with <= 4 GB VRAM, the driver's memory budget already accounts
+        // for OS/DWM, so subtracting 1 GB starves the application working set.
+        if (total_memory_budget > 4_GB) {
+            const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
+            total_memory_budget -= system_memory;
+        }
         return;
     }
     // Leave at least 8 GB for the system on integrated GPUs.
@@ -871,6 +886,21 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         case vk::Format::eR8G8Srgb:
             if (IsFormatSupported(vk::Format::eR8G8Unorm, flags)) {
                 return vk::Format::eR8G8Unorm;
+            }
+            break;
+        case vk::Format::eR32G32B32Sfloat:
+            if (IsFormatSupported(vk::Format::eR32G32B32A32Sfloat, flags)) {
+                return vk::Format::eR32G32B32A32Sfloat;
+            }
+            break;
+        case vk::Format::eR32G32B32Uint:
+            if (IsFormatSupported(vk::Format::eR32G32B32A32Uint, flags)) {
+                return vk::Format::eR32G32B32A32Uint;
+            }
+            break;
+        case vk::Format::eR32G32B32Sint:
+            if (IsFormatSupported(vk::Format::eR32G32B32A32Sint, flags)) {
+                return vk::Format::eR32G32B32A32Sint;
             }
             break;
         default:

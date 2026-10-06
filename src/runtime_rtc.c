@@ -68,10 +68,17 @@ static uint64_t now_utc(void) {
 }
 /* Offset of local time from UTC at the given UTC tick, in microseconds. */
 static int64_t local_offset(uint64_t utc) {
+#ifdef _WIN32
+    (void)utc;
+    long tz = 0;
+    _get_timezone(&tz);
+    return -(int64_t)tz * 1000000;
+#else
     time_t seconds=(time_t)((int64_t)(utc-UNIX_EPOCH_TICKS)/1000000);
     struct tm local;
     localtime_r(&seconds,&local);
     return (int64_t)local.tm_gmtoff*1000000;
+#endif
 }
 
 static ABI int32_t rtc_current_local(DateTime *t) {

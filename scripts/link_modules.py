@@ -15,6 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 from prepare import parse_self, span, unpack
 from link_libc import encode_id
 
@@ -76,6 +77,8 @@ def module(path):
 
 def patch_fs_loads(image, ph, base):
     """Rewrite initial-exec `mov rax, fs:[0]` to GS: glibc owns FS on Linux."""
+    if sys.platform == 'win32':
+        return 0
     patched = 0
     for p in ph:
         if p['type'] != 1 or not p['flags'] & 1:

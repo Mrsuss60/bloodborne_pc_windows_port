@@ -9,16 +9,29 @@ uintptr_t runtime_lookup(const RuntimeExport *table,size_t n,const char *name) {
     return 0;
 }
 int main(void) {
+#ifdef _WIN32
+    char temp_dir[MAX_PATH];
+    GetTempPathA(sizeof(temp_dir), temp_dir);
+    char root[512];
+    snprintf(root, sizeof(root), "%sbbport-mod-%lu", temp_dir, (unsigned long)GetCurrentProcessId());
+    mkdir(root, 0755);
+#else
     char root[]="/tmp/bbport-mod-files-XXXXXX";
     assert(mkdtemp(root));
-    char game[512],user[512],source[512],link[512];
+#endif
+    char game[1024],user[1024],source[1024],link[1024];
     snprintf(game,sizeof(game),"%s/game",root);
     snprintf(user,sizeof(user),"%s/user",root);
     snprintf(source,sizeof(source),"%s/mod.dcx",root);
     snprintf(link,sizeof(link),"%s/game/asset.dcx",root);
     assert(!mkdir(game,0755));
     FILE *f=fopen(source,"w"); assert(f); assert(fputs("modded",f)>=0); assert(!fclose(f));
+#ifdef _WIN32
+    /* Windows hard link works on any NTFS volume without elevated symlink privileges */
+    assert(CreateHardLinkA(link, source, NULL));
+#else
     assert(!symlink(source,link));
+#endif
     runtime_file_configure(game,user);
     for (int i=0;i<3;++i) {
         const char *path=i==0 ? "/app0/asset.dcx" : i==1 ? "/hostapp/asset.dcx" : "asset.dcx";
@@ -47,7 +60,7 @@ int main(void) {
     assert(!path_op("/data/test-save",2,0));
     assert(!unlink(link) && !unlink(source) && !rmdir(game));
     const char *dirs[]={"temp0","download0","data"};
-    for (int i=0;i<3;++i) { char p[1024]; snprintf(p,sizeof(p),"%s/%s",user,dirs[i]); assert(!rmdir(p)); }
+    for (int i=0;i<3;++i) { char p[2048]; snprintf(p,sizeof(p),"%s/%s",user,dirs[i]); assert(!rmdir(p)); }
     assert(!rmdir(user) && !rmdir(root));
     puts("Guest mod files: reads, stat, merged listing, readonly assets and writable saves PASS");
 }

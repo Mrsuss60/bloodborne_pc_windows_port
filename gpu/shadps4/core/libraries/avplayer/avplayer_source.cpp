@@ -313,9 +313,20 @@ bool AvPlayerSource::Stop() {
         m_up_data_streamer->Reset();
     }
 
-    m_video_decoder_thread.Stop();
-    m_audio_decoder_thread.Stop();
-    m_demuxer_thread.Stop();
+    m_video_decoder_thread.RequestStop();
+    m_audio_decoder_thread.RequestStop();
+    m_demuxer_thread.RequestStop();
+
+    m_video_packets_cv.Notify();
+    m_audio_packets_cv.Notify();
+    m_video_buffers_cv.Notify();
+    m_audio_buffers_cv.Notify();
+    m_video_frames_cv.Notify();
+    m_audio_frames_cv.Notify();
+
+    m_video_decoder_thread.Join();
+    m_audio_decoder_thread.Join();
+    m_demuxer_thread.Join();
 
     m_current_audio_frame.reset();
     m_current_video_frame.reset();

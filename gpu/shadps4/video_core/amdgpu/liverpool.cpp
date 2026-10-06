@@ -3,7 +3,14 @@
 
 #include <chrono>
 #include <pthread.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <sys/resource.h>
+#endif
 #include <time.h>
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
@@ -102,12 +109,16 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+#ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
+#endif
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
+#elif defined(_WIN32)
+    gpu_tid = GetCurrentThreadId();
 #endif
 
     while (!stoken.stop_requested()) {
@@ -235,13 +246,29 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
 } // namespace
 
 namespace {
+// bbport: a label written straight into guest memory (no backing view): one store. A memcpy of a
+// variable 4 or 8 bytes is two overlapping stores in glibc; a thread preempted between them
+// wrote the label again after the guest had freed its block (runtime_memory_write_backing).
+void StoreLabel(void* address, u64 value, u32 num_bytes) {
+    if (num_bytes == 8 && (reinterpret_cast<uintptr_t>(address) & 7) == 0) {
+        __atomic_store_n(static_cast<u64*>(address), value, __ATOMIC_RELEASE);
+    } else if (num_bytes == 4 && (reinterpret_cast<uintptr_t>(address) & 3) == 0) {
+        __atomic_store_n(static_cast<u32*>(address), u32(value), __ATOMIC_RELEASE);
+    } else {
+        auto* dst = static_cast<u8*>(address);
+        for (u32 i = 0; i < num_bytes; ++i) {
+            __atomic_store_n(dst + i, u8(value >> (8 * i)), __ATOMIC_RELEASE);
+        }
+    }
+}
+
 void SignalEop(const PM4CmdEventWriteEop& eop) {
     eop.SignalFence(
         [](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                memcpy(address, &data, num_bytes);
+                StoreLabel(address, data, num_bytes);
             }
         },
         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
@@ -336,7 +363,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
         auto* memory = Core::Memory::Instance();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
         if (!memory->TryWriteBacking(address, &value, num_bytes)) {
-            memcpy(address, &value, num_bytes);
+            StoreLabel(address, value, num_bytes);
         }
     });
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
@@ -1325,7 +1352,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         draw_prep->EndSubmission();
     }
     if (seq != NoSeq && BbStats::enabled) {
-        BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
+#ifndef _WIN32
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
                                        std::memory_order_relaxed);
@@ -1335,6 +1362,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             BbStats::gpu_vol_switches.store(usage.ru_nvcsw, std::memory_order_relaxed);
             BbStats::gpu_minor_faults.store(usage.ru_minflt, std::memory_order_relaxed);
         }
+#else
+        FILETIME creation, exit, kernel, user;
+        if (GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) {
+            ULARGE_INTEGER k, u;
+            k.LowPart = kernel.dwLowDateTime;
+            k.HighPart = kernel.dwHighDateTime;
+            u.LowPart = user.dwLowDateTime;
+            u.HighPart = user.dwHighDateTime;
+            BbStats::gpu_user_us.store(u.QuadPart / 10, std::memory_order_relaxed);
+            BbStats::gpu_sys_us.store(k.QuadPart / 10, std::memory_order_relaxed);
+        }
+#endif
     }
 
     FIBER_EXIT;
@@ -1684,6 +1723,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
+    BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
     work_retired = false;
     submit_cv.notify_one();
 }
@@ -1702,6 +1742,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
+    BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
     work_retired = false;
     submit_cv.notify_one();
 }

@@ -714,7 +714,7 @@ public:
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
-        if (recorder_thread.joinable() && !direct_mode) {
+        if (recorder_running && !direct_mode) {
             SyncRecording();
             direct_mode = true;
             direct_recordings.fetch_add(1, std::memory_order_relaxed);
@@ -730,7 +730,7 @@ public:
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
-        if (!recorder_thread.joinable() || direct_mode) {
+        if (!recorder_running || direct_mode) {
             func(current_cmdbuf);
             return;
         }
@@ -750,7 +750,7 @@ public:
 
     /// True when Record() defers commands (and RecordData() copies into chunks).
     [[nodiscard]] bool IsRecordingDeferred() const noexcept {
-        return recorder_thread.joinable() && !direct_mode &&
+        return recorder_running && !direct_mode &&
                !BbToggle::Disabled(BbToggle::ThreadedRecording);
     }
 
@@ -920,6 +920,7 @@ private:
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);
     std::jthread recorder_thread;
+    bool recorder_running = false;
     tracy::VkCtxScope* profiler_scope{};
 };
 

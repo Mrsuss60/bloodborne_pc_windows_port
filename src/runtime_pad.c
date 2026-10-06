@@ -16,6 +16,9 @@
 #include <time.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -55,13 +58,13 @@ _Static_assert(__builtin_offsetof(PadData,touches)==60,"OrbisPadData touch offse
 _Static_assert(__builtin_offsetof(PadData,timestamp)==80,"OrbisPadData timestamp offset");
 _Static_assert(sizeof(ControllerInfo)==28,"OrbisPadControllerInformation layout");
 
-static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+static HostMutex lock = HOST_MUTEX_INIT;
 static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
 static size_t reads;
 static uint8_t connected_count;
 
-static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
+static uint64_t now_us(void) { return host_monotonic_ns() / 1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
 static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
 static uint16_t touch_axis(float v, int max) {
@@ -134,10 +137,15 @@ static void sample_host(PadData *d) {
     }
     if (!k) return;
     static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
-        {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_SQUARE},
-        {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
-        {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
-        {SDL_SCANCODE_RETURN,BTN_OPTIONS},
+        {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_RETURN,BTN_CROSS}, {SDL_SCANCODE_KP_ENTER,BTN_CROSS},
+        {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_ESCAPE,BTN_CIRCLE},
+        {SDL_SCANCODE_E,BTN_SQUARE}, {SDL_SCANCODE_Q,BTN_TRIANGLE},
+        {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
+        {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2},
+        {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
+        {SDL_SCANCODE_F1,BTN_OPTIONS}, {SDL_SCANCODE_O,BTN_OPTIONS},
+        {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN},
+        {SDL_SCANCODE_LEFT,BTN_LEFT}, {SDL_SCANCODE_RIGHT,BTN_RIGHT},
         {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
     };
     for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
@@ -160,16 +168,29 @@ static struct { uint32_t buttons; int stick[4]; int touch_side; } injected={0,{-
 static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 static void read_inject(void) {
-    static const char *path; static int checked; static uint64_t last_check; static struct timespec mtime;
+    static const char *path; static int checked; static uint64_t last_check;
+#ifndef _WIN32
+    static struct timespec mtime;
+#endif
     if (!checked) { path=getenv("BB_PAD_FILE"); checked=1; }
     if (!path || !*path) return;
     uint64_t now=now_us();
     if (now-last_check<20000) return;
     last_check=now;
-    struct stat st;
+#ifdef _WIN32
+    static FILETIME last_ft;
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    FILETIME ft;
+    GetFileTime(hFile, NULL, NULL, &ft);
+    CloseHandle(hFile);
+    if (ft.dwLowDateTime == last_ft.dwLowDateTime && ft.dwHighDateTime == last_ft.dwHighDateTime) return;
+    last_ft = ft;
+#else
     if (stat(path,&st)!=0) return;
     if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
     mtime=st.st_mtim;
+#endif
     FILE *f=fopen(path,"r");
     if (!f) return;
     static const struct { const char *name; uint32_t ps; } names[]={
@@ -279,16 +300,16 @@ static void sample(PadData *d) {
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
 }
 
-static ABI int32_t pad_init(void) { pthread_mutex_lock(&lock); initialized=1; pthread_mutex_unlock(&lock); return 0; }
+static ABI int32_t pad_init(void) { host_lock(&lock); initialized=1; host_unlock(&lock); return 0; }
 static ABI int32_t pad_open(int32_t user, int32_t type, int32_t index, const void *param) {
     (void)param;
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (user!=1) return ERR_INVALID_ARG;
     if (type!=0 && type!=2) return ERR_INVALID_ARG; /* standard / special port */
     if (index) return ERR_INVALID_ARG;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     int already=opened; opened=1;
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     if (already) return ERR_ALREADY_OPENED;
     puts("Runtime: pad opened for user 1 (SDL gamepad or keyboard)");
     return PAD_HANDLE;
@@ -300,9 +321,9 @@ static ABI int32_t pad_close(int32_t handle) {
 static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!data) return ERR_INVALID_ARG;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     sample(data); ++reads;
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return 0;
 }
 /* Buffered read: the port samples once per call, so one entry is returned. */
@@ -319,19 +340,19 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
     info->pixel_density=44.86f; info->resolution_x=1920; info->resolution_y=943;
     info->dead_zone_left=info->dead_zone_right=2;
     info->connection_type=0; info->connected=1; info->device_class=0;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     current_gamepad();
     info->connected_count=connected_count ? connected_count : 1;
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return 0;
 }
 static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
     if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return 0;
 }
 static ABI int32_t pad_ok_handle(int32_t handle) { return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }

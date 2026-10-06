@@ -6,14 +6,15 @@ bbport.ini
 fsr4_shaders/
 pgo/
 *.png
-last_run.log
+*.log
+launcher.log
+launcher_settings.json
 dist/
 packaging/runtime-paths.nix
 fsr4_411/
 vkd3d-proton.cache
 tools/fsr4cap/*.exe
 perf.data
-# Local leftovers: patch backups, generated SPIR-V, analysis outputs, test saves and routes
 *.orig
 /*.spv
 /1060/
@@ -23,3 +24,10 @@ perf.data
 /bloodborne_upscalers_*.md
 mods.json
 patches.json
+*.zip
+FORK/
+EBOOT/
+scratch/
+test_th.*
+.vscode/
+.idea/

@@ -46,19 +46,21 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         return;
     }
 
-    const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
-    const s64 min_spacing_expected = device_local_memory - 1_GB;
-    const s64 min_spacing_critical = device_local_memory - 512_MB;
-    const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
-    const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
-    const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
-    pressure_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_PRESSURE_GC_MEMORY));
-    critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
-    trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    u64 budget = instance.GetDeviceMemoryBudgetNow() ? instance.GetDeviceMemoryBudgetNow()
+                                                    : instance.GetTotalMemoryBudget();
+    const u64 local_mem = instance.GetDeviceLocalMemory();
+    const bool is_low_vram = (local_mem > 0 && local_mem <= 4096ULL * 1024 * 1024) ||
+                             (budget > 0 && budget <= 4096ULL * 1024 * 1024);
+    const u64 base_mem = is_low_vram && local_mem > 0 ? local_mem : budget;
+    if (base_mem > 0) {
+        trigger_gc_memory = base_mem / 100 * (is_low_vram ? 70 : 70);
+        pressure_gc_memory = base_mem / 100 * (is_low_vram ? 90 : 85);
+        critical_gc_memory = base_mem / 100 * (is_low_vram ? 95 : 95);
+    } else {
+        pressure_gc_memory = DEFAULT_PRESSURE_GC_MEMORY;
+        critical_gc_memory = DEFAULT_CRITICAL_GC_MEMORY;
+        trigger_gc_memory = 0;
+    }
 }
 
 TextureCache::~TextureCache() = default;
@@ -113,11 +115,14 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
 }
 
+static inline u64 MaybeDirtyHash(const Image& image) {
+    return XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
         // Initialize hash
-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = XXH3_64bits(addr, image.info.guest_size);
+        image.hash = MaybeDirtyHash(image);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
@@ -771,17 +776,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
-        const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
+        const u64 hash = MaybeDirtyHash(image);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
@@ -804,14 +799,12 @@ void TextureCache::RefreshImage(Image& image) {
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
         // Protect GPU modified resources from accidental CPU reuploads.
-        if (is_gpu_modified && !is_gpu_dirty) {
-            const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
-            if (image.mip_hashes[m] == hash) {
-                continue;
-            }
-            image.mip_hashes[m] = hash;
+        const u8* mip_addr = std::bit_cast<u8*>(image.info.guest_address) + mip_offset;
+        const u64 mip_hash = XXH3_64bits(mip_addr, mip_size);
+        if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
+            continue;
         }
+        image.mip_hashes[m] = mip_hash;
 
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
@@ -1025,54 +1018,118 @@ void TextureCache::GarbageCollectImages() {
             const char* env = std::getenv("BB_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
-        if (instance.IsIntegrated() || forced_budget) {
-            const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
-            if (budget != 0) {
-                trigger_gc_memory = budget / 10 * 7;
-                pressure_gc_memory = budget / 100 * 85;
-                critical_gc_memory = budget / 100 * 95;
-            }
+        u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
+        const u64 local_mem = instance.GetDeviceLocalMemory();
+        if (budget != 0 || local_mem != 0) {
+            const bool is_low_vram = (local_mem > 0 && local_mem <= 4096ULL * 1024 * 1024) ||
+                                     (budget > 0 && budget <= 4096ULL * 1024 * 1024);
+            const u64 base_mem = !forced_budget && is_low_vram && local_mem > 0 ? local_mem : budget;
+            static const u64 trig_pct = [is_low_vram] {
+                const char* e = std::getenv("BB_GC_TRIGGER");
+                return e ? std::strtoull(e, nullptr, 10) : (is_low_vram ? 70 : 70);
+            }();
+            static const u64 pres_pct = [is_low_vram] {
+                const char* e = std::getenv("BB_GC_PRESSURE");
+                return e ? std::strtoull(e, nullptr, 10) : (is_low_vram ? 90 : 80);
+            }();
+            static const u64 crit_pct = [is_low_vram] {
+                const char* e = std::getenv("BB_GC_CRITICAL");
+                return e ? std::strtoull(e, nullptr, 10) : (is_low_vram ? 95 : 88);
+            }();
+            trigger_gc_memory = base_mem / 100 * trig_pct;
+            pressure_gc_memory = base_mem / 100 * pres_pct;
+            critical_gc_memory = base_mem / 100 * crit_pct;
         }
+    }
+    BbStats::gc_used_bytes.store(total_used_memory, std::memory_order_relaxed);
+    BbStats::gc_trigger_bytes.store(trigger_gc_memory, std::memory_order_relaxed);
+    // bbport: gc_tick (one per guest submission, hundreds a second) at each of the last 64
+    // seconds, for ages in seconds. The usage compared is all of our VRAM, not only images: on a
+    // discrete GPU it stays over the trigger, where an age of 16 ticks (~3 frames) evicted every
+    // texture briefly off screen and uploaded it again. Below the pressure mark an image goes
+    // once unused for BB_GC_IDLE_SECONDS (20): the textures of an area left behind.
+    const u64 second = u64(std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+    if (second != gc_second) {
+        gc_second = second;
+        BbStats::coarse_second.store(u32(second), std::memory_order_relaxed);
+        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
     }
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    static const u64 idle_seconds = [] {
+        const char* env = std::getenv("BB_GC_IDLE_SECONDS");
+        return std::clamp<u64>(env ? std::strtoull(env, nullptr, 10) : 20, 1, 63);
+    }();
+    // The tick at the start of that second (an older one where no submission came then).
+    const u64 idle_tick =
+        gc_tick_at_second[(second - idle_seconds) % gc_tick_at_second.size()];
+    const u64 pressure_seconds = std::clamp<u64>(idle_seconds / 4, 3ULL, 5ULL);
+    const u64 raw_press_tick =
+        gc_tick_at_second[(second - pressure_seconds) % gc_tick_at_second.size()];
+    const u64 pressure_tick = raw_press_tick ? raw_press_tick : (gc_tick > 300 ? gc_tick - 300 : 0);
+    const u64 raw_crit_tick =
+        gc_tick_at_second[(second - 1) % gc_tick_at_second.size()];
+    const u64 critical_tick = raw_crit_tick ? raw_crit_tick : (gc_tick > 120 ? gc_tick - 120 : 0);
+
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
-    u64 ticks_to_destroy = 0;
+    u64 below_tick = 0;
     size_t num_deletions = 0;
+    u32 visited = 0;
+    u32 sync_downloads_this_pass = 0;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
-        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
-        num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        if (aggresive) {
+            below_tick = critical_tick;
+            num_deletions = 16;
+        } else if (pressured) {
+            below_tick = pressure_tick;
+            num_deletions = 6;
+        } else {
+            below_tick = idle_tick;
+            num_deletions = 4;
+        }
+        visited = 0;
     };
     const auto clean_up = [&](ImageId image_id) {
-        if (num_deletions == 0) {
+        if (num_deletions == 0 || ++visited > 256) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
-            return false;
-        }
-        if (download && !pressured) {
+        // bbport: images that cannot go now (GPU-written: their contents exist only here, and
+        // tiled ones cannot be written back at all) neither use up the deletions nor stay first
+        // in line. The oldest ten being such render targets stopped the collector for good, and
+        // VRAM grew with every area visited up to the pressure mark (~10 GB on 16 GB).
+        if ((tiled && download) || (download && !pressured)) {
+            lru_cache.Touch(image.lru_id, gc_tick);
+            BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (download) {
+            if (sync_downloads_this_pass >= 1) {
+                // Rate-limit synchronous GPU flushes to at most 1 per submission pass
+                // to prevent multiple consecutive pipeline stalls and frame hitches.
+                lru_cache.Touch(image.lru_id, gc_tick);
+                return false;
+            }
             // bbport: synchronously, while the image still protects its pages. A deferred
             // write-back landed after FreeImage had unprotected them, over whatever the game
-            // had meanwhile stored there (e.g. its heap after unloading an area).
+            // had mapped there since (0x28ce9b5).
             DownloadImageMemory(image_id, true);
             ++gc_downloads;
+            ++sync_downloads_this_pass;
         }
+        --num_deletions;
         ++gc_evictions;
+        BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -1090,12 +1147,12 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    lru_cache.ForEachItemBelow(below_tick, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        lru_cache.ForEachItemBelow(below_tick, clean_up);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
     if (pressured || gc_downloads != 0) {

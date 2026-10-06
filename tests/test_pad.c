@@ -1,6 +1,16 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <fcntl.h>
+#include <stdlib.h>
+static inline int setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+#define usleep(us) Sleep((us) / 1000)
+#endif
 #include "../src/runtime_pad.c"
 
 static int capture;
@@ -19,7 +29,14 @@ static void inject(const char *path, const char *tokens) {
 }
 
 int main(void) {
+#ifdef _WIN32
+    char temp_dir[MAX_PATH];
+    GetTempPathA(sizeof(temp_dir), temp_dir);
+    char path[512];
+    snprintf(path, sizeof(path), "%sbbport-pad-test-XXXXXX", temp_dir);
+#else
     char path[]="/tmp/bbport-pad-test-XXXXXX";
+#endif
     int fd=mkstemp(path);
     assert(fd>=0);
     close(fd);

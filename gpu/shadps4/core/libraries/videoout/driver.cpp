@@ -7,7 +7,9 @@
 #include <chrono>
 #include <cstdio>
 #include <time.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include "common/assert.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -287,14 +289,58 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+constexpr size_t FT_HISTORY_CAP = 1024;
+static std::atomic<size_t> s_ft_count{0};
+static double s_ft_history[FT_HISTORY_CAP];
+static std::chrono::steady_clock::time_point s_last_flip_pt;
+
+void RecordFlipFrameTime() {
+    auto now = std::chrono::steady_clock::now();
+    if (s_last_flip_pt.time_since_epoch().count() != 0) {
+        double ms = std::chrono::duration<double, std::milli>(now - s_last_flip_pt).count();
+        size_t idx = s_ft_count.fetch_add(1, std::memory_order_relaxed);
+        s_ft_history[idx % FT_HISTORY_CAP] = ms;
+    }
+    s_last_flip_pt = now;
+}
+
+void GetFrametimeStats(double* avg_fps, double* p95_ms, double* p99_ms) {
+    size_t count = s_ft_count.load(std::memory_order_relaxed);
+    if (count == 0) {
+        if (p95_ms) *p95_ms = 0.0;
+        if (p99_ms) *p99_ms = 0.0;
+        return;
+    }
+    size_t n = std::min(count, FT_HISTORY_CAP);
+    std::vector<double> samples;
+    samples.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        samples.push_back(s_ft_history[i]);
+    }
+    std::sort(samples.begin(), samples.end());
+    if (p95_ms) {
+        size_t idx95 = (n * 95) / 100;
+        if (idx95 >= n) idx95 = n - 1;
+        *p95_ms = samples[idx95];
+    }
+    if (p99_ms) {
+        size_t idx99 = (n * 99) / 100;
+        if (idx99 >= n) idx99 = n - 1;
+        *p99_ms = samples[idx99];
+    }
+}
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting, then present the frame (bbport: on the swap thread).
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
     });
+
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
+    BbStats::flips.fetch_add(1, std::memory_order_relaxed);
+    RecordFlipFrameTime();
 
     // bbport: BB_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false);
@@ -331,9 +377,11 @@ void VideoOutDriver::Flip(const Request& req) {
         last_twf = twf;
         const u64 copy_ns = BbStats::t_copy.load(), copy_bytes = BbStats::copy_bytes.load();
         u64 proc_flt = 0;
+#ifndef _WIN32
         if (rusage usage{}; getrusage(RUSAGE_SELF, &usage) == 0) {
             proc_flt = usage.ru_minflt;
         }
+#endif
         const u64 t_now[6] = {BbStats::t_resident.load(), BbStats::t_protect.load(),
                               BbStats::t_image_create.load(), BbStats::t_refresh.load(),
                               BbStats::t_staging.load(), BbStats::t_host_wait.load()};
@@ -343,11 +391,13 @@ void VideoOutDriver::Flip(const Request& req) {
                   user_us = BbStats::gpu_user_us.load(), invol = BbStats::gpu_invol_switches.load(),
                   vol = BbStats::gpu_vol_switches.load();
         u64 gpu_ns = 0;
+#ifndef _WIN32
         if (const int clock = BbStats::gpu_thread_clock.load(); clock != -1) {
             timespec ts{};
             clock_gettime(static_cast<clockid_t>(clock), &ts);
             gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
         }
+#endif
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();

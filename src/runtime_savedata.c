@@ -9,14 +9,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <time.h>
-#ifndef _WIN32
 #include <dirent.h>
 #include <errno.h>
-#include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#include <io.h>
+#define ftruncate(fd, size) _chsize_s(fd, size)
+#else
+#include <ftw.h>
+#endif
 
 #define ERR_PARAMETER ((int32_t)0x809F0000)
 #define ERR_NOT_INITIALIZED ((int32_t)0x809F0001)
@@ -61,7 +66,7 @@ _Static_assert(sizeof(Mount1)==80 && sizeof(Mount2)==64,"OrbisSaveDataMount layo
 _Static_assert(sizeof(MountResult)==64,"OrbisSaveDataMountResult layout");
 _Static_assert(sizeof(SearchCond)==64 && sizeof(SearchResult)==56,"dir name search layouts");
 
-static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+static HostMutex lock = HOST_MUTEX_INIT;
 static int initialized;
 static char title_id[16]="UNKNOWN";
 static struct { int used; char host[700], meta[700]; } slots[SLOTS];
@@ -90,269 +95,340 @@ static void bloodborne_sound_hack(void) {
         snprintf(path,sizeof(path),"%s/%s/%s/SPRJ0005/userdata0010",users,e->d_name,title_id);
         FILE *f=fopen(path,"r+b");
         if (!f) continue;
-        int old=fseek(f,0x204E,SEEK_SET) ? EOF : fgetc(f);
-        if (old!=EOF && old!=1 && !fseek(f,0x204E,SEEK_SET)) {
-            fputc(1,f);
-            printf("Runtime: Bloodborne sound flag set in %s (was %d)\n",path,old);
+        if (!fseek(f,0x204e,SEEK_SET)) {
+            unsigned char byte=0;
+            if (fread(&byte,1,1,f)==1 && !(byte & 1)) {
+                byte|=1;
+                fseek(f,0x204e,SEEK_SET);
+                if (fwrite(&byte,1,1,f)==1) printf("Runtime: applied Bloodborne sound hack to %s\n",path);
+            }
         }
         fclose(f);
     }
     closedir(dir);
 }
+
 void runtime_savedata_configure(const char *title) {
     if (title && *title) snprintf(title_id,sizeof(title_id),"%s",title);
     bloodborne_sound_hack();
 }
 
 static int make_dirs(const char *path) {
-    char buffer[700];
-    snprintf(buffer,sizeof(buffer),"%s",path);
-    for (char *p=buffer+1;*p;++p) if (*p=='/') { *p=0; mkdir(buffer,0755); *p='/'; }
-    return mkdir(buffer,0755) && errno!=EEXIST ? -1 : 0;
+    char buf[1024]; snprintf(buf,sizeof(buf),"%s",path);
+    for (char *p=buf+1;*p;++p) if (*p=='/' || *p=='\\') {
+        char old = *p;
+        *p=0;
+#ifdef _WIN32
+        runtime_win_mkdir(buf, 0777);
+#else
+        mkdir(buf,0777);
+#endif
+        *p=old;
+    }
+#ifdef _WIN32
+    return (runtime_win_mkdir(buf, 0777) && errno!=EEXIST) ? -1 : 0;
+#else
+    return (mkdir(buf,0777) && errno!=EEXIST) ? -1 : 0;
+#endif
 }
+
 static void root(int32_t user, const char *title, char *out, size_t size) {
     snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,title && *title ? title : title_id);
 }
-static int valid_name(const char *name, size_t max) {
-    size_t n=strnlen(name,max);
-    if (!n || n==max) return 0;
-    for (size_t i=0;i<n;++i) if (name[i]=='/' || name[i]=='\\' || (name[i]=='.' && (i==0 || name[i-1]=='.'))) return 0;
-    return 1;
+
+static void target_paths(int32_t user, const char *title, const DirName *dir, char *host, char *meta, size_t size) {
+    char base[700]; root(user,title,base,sizeof(base));
+    snprintf(host,size,"%s/%s",base,dir->data);
+    snprintf(meta,size,"%s/%s.sce_sys",base,dir->data);
 }
-static void write_param(const char *meta, const Param *p) {
-    char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
+
+static int write_param(const char *meta, const Param *p) {
+    if (make_dirs(meta)) return -1;
+    char path[800]; snprintf(path,sizeof(path),"%s/param.bin",meta);
     FILE *f=fopen(path,"wb");
-    if (f) { Param copy=*p; copy.mtime=time(NULL); fwrite(&copy,sizeof(copy),1,f); fclose(f); }
+    if (!f) return -1;
+    size_t n=fwrite(p,sizeof(*p),1,f);
+    fclose(f);
+    return n==1 ? 0 : -1;
 }
+
 static int read_param(const char *meta, Param *p) {
-    char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
     memset(p,0,sizeof(*p));
+    char path[800]; snprintf(path,sizeof(path),"%s/param.bin",meta);
     FILE *f=fopen(path,"rb");
     if (!f) return -1;
-    size_t n=fread(p,sizeof(*p),1,f); fclose(f);
+    size_t n=fread(p,sizeof(*p),1,f);
+    fclose(f);
     struct stat st;
     if (!stat(path,&st)) p->mtime=st.st_mtime;
     return n==1 ? 0 : -1;
 }
+
+#ifndef _WIN32
 static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
     (void)st; (void)flag; (void)ftw; return remove(path);
 }
+#endif
 
 static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
 static ABI int32_t save_terminate(void) {
-    if (!initialized) return ERR_NOT_INITIALIZED;
-    initialized=0; return 0;
+    host_lock(&lock);
+    for (int i=0;i<SLOTS;++i) if (slots[i].used) {
+        char point[16]; snprintf(point,sizeof(point),"/savedata%d",i);
+        runtime_file_unmount(point);
+        slots[i].used=0;
+    }
+    initialized=0;
+    host_unlock(&lock);
+    return 0;
 }
+
 static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (user<0) return ERR_INVALID_USER;
-    if (!dir || !result || !valid_name(dir->data,sizeof(dir->data))) return ERR_PARAMETER;
-    char base[600], host[640], meta[680];
-    root(user,title,base,sizeof(base));
-    snprintf(host,sizeof(host),"%s/%s",base,dir->data);
-    snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,dir->data);
+    if (user<0 || !dir || !result) return ERR_PARAMETER;
+    char host[700], meta[700];
+    target_paths(user,title,dir,host,meta,sizeof(host));
     struct stat st;
     int exists=!stat(host,&st) && S_ISDIR(st.st_mode);
     if ((mode & MODE_CREATE) && exists) return ERR_EXISTS;
     if (!(mode & (MODE_CREATE|MODE_CREATE2)) && !exists) return ERR_NOT_FOUND;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     int slot=-1;
     for (int i=0;i<SLOTS;++i) {
-        if (slots[i].used && !strcmp(slots[i].host,host)) { pthread_mutex_unlock(&lock); return ERR_BAD_MOUNTED; }
+        if (slots[i].used && !strcmp(slots[i].host,host)) { host_unlock(&lock); return ERR_BAD_MOUNTED; }
         if (!slots[i].used && slot<0) slot=i;
     }
-    if (slot<0) { pthread_mutex_unlock(&lock); return ERR_MOUNT_FULL; }
-    if (!exists && (make_dirs(host) || make_dirs(meta))) { pthread_mutex_unlock(&lock); return ERR_INTERNAL; }
+    if (slot<0) { host_unlock(&lock); return ERR_MOUNT_FULL; }
+    if (!exists && (make_dirs(host) || make_dirs(meta))) { host_unlock(&lock); return ERR_INTERNAL; }
     if (!exists) { Param empty={0}; write_param(meta,&empty); }
     slots[slot].used=1;
     snprintf(slots[slot].host,sizeof(slots[slot].host),"%s",host);
     snprintf(slots[slot].meta,sizeof(slots[slot].meta),"%s",meta);
-    memset(result,0,sizeof(*result));
-    char point[32];
-    snprintf(point,sizeof(point),"/savedata%d",slot&15);
-    memcpy(result->point.data,point,strlen(point)+1);
+    snprintf(result->point.data,sizeof(result->point.data),"/savedata%d",slot);
+    result->required_blocks=0;
     result->status=exists ? 0 : 1; /* CREATED */
     runtime_file_mount(result->point.data,host);
     ++mounts_done;
-    pthread_mutex_unlock(&lock);
-    printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
-           exists ? "existing" : "created",(mode & MODE_RDONLY) ? ", read-only" : "");
+    host_unlock(&lock);
+
+    static char s_last_mounted[700] = {0};
+    if (strcmp(s_last_mounted, host) != 0) {
+        snprintf(s_last_mounted, sizeof(s_last_mounted), "%s", host);
+        printf("Runtime: save data '%s' mounted at %s (%s%s)\n",dir->data,result->point.data,
+               exists ? "existing" : "created",(mode & MODE_RDONLY) ? ", read-only" : "");
+    }
     return 0;
 }
-static ABI int32_t save_mount(const Mount1 *m, MountResult *result) {
-    if (!m) return ERR_PARAMETER;
-    return mount(m->user,m->title ? m->title->data : NULL,m->dir,m->mode,result);
+
+static ABI int32_t save_mount1(const Mount1 *m, MountResult *r) {
+    return mount(m ? m->user : -1, m && m->title ? m->title->data : NULL, m ? m->dir : NULL, m ? m->mode : 0, r);
 }
-static ABI int32_t save_mount2(const Mount2 *m, MountResult *result) {
-    if (!m) return ERR_PARAMETER;
-    return mount(m->user,NULL,m->dir,m->mode,result);
+static ABI int32_t save_mount2(const Mount2 *m, MountResult *r) {
+    return mount(m ? m->user : -1, NULL, m ? m->dir : NULL, m ? m->mode : 0, r);
 }
+
 static int slot_of(const MountPoint *point) {
     if (!point || strncmp(point->data,"/savedata",9)) return -1;
-    int slot=atoi(point->data+9);
-    return slot>=0 && slot<SLOTS && slots[slot].used ? slot : -1;
+    char *end=NULL; long n=strtol(point->data+9,&end,10);
+    return end && !*end && n>=0 && n<SLOTS && slots[n].used ? (int)n : -1;
 }
+
 static ABI int32_t save_umount(const MountPoint *point) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     int slot=slot_of(point);
     if (slot>=0) { runtime_file_unmount(point->data); slots[slot].used=0; }
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
+
 static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const void *buffer, uint64_t size) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!buffer) return ERR_PARAMETER;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     int slot=slot_of(point);
-    if (slot<0) { pthread_mutex_unlock(&lock); return ERR_NOT_MOUNTED; }
+    if (slot<0) { host_unlock(&lock); return ERR_NOT_MOUNTED; }
     Param p; read_param(slots[slot].meta,&p);
     switch (type) {
     case 0: if (size<sizeof(Param)) goto bad; memcpy(&p,buffer,sizeof(p)); break;     /* ALL */
-    case 1: snprintf(p.title,sizeof(p.title),"%.*s",(int)size,(const char *)buffer); break;
-    case 2: snprintf(p.subtitle,sizeof(p.subtitle),"%.*s",(int)size,(const char *)buffer); break;
-    case 3: snprintf(p.detail,sizeof(p.detail),"%.*s",(int)size,(const char *)buffer); break;
+    case 1: if (size<sizeof(p.title)) goto bad; memcpy(p.title,buffer,size); break;
+    case 2: if (size<sizeof(p.subtitle)) goto bad; memcpy(p.subtitle,buffer,size); break;
+    case 3: if (size<sizeof(p.detail)) goto bad; memcpy(p.detail,buffer,size); break;
     case 4: if (size<4) goto bad; memcpy(&p.user_param,buffer,4); break;
     default: goto bad;
     }
     write_param(slots[slot].meta,&p);
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return 0;
 bad:
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return ERR_PARAMETER;
 }
+
 static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!icon || !icon->buffer) return ERR_PARAMETER;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     int slot=slot_of(point);
     int32_t r=ERR_NOT_MOUNTED;
     if (slot>=0) {
-        char path[700]; snprintf(path,sizeof(path),"%s/icon0.png",slots[slot].meta);
+        char path[800]; snprintf(path,sizeof(path),"%s/icon0.png",slots[slot].meta);
         FILE *f=fopen(path,"wb");
         r=f && fwrite(icon->buffer,1,icon->data_size,f)==icon->data_size ? 0 : ERR_INTERNAL;
         if (f) fclose(f);
     }
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return r;
 }
+
 static ABI int32_t save_delete(const Delete *d) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!d || !d->dir || !valid_name(d->dir->data,sizeof(d->dir->data))) return ERR_PARAMETER;
-    char base[600], host[640], meta[680];
+    if (!d || d->user<0 || !d->dir) return ERR_PARAMETER;
+    char base[700], host[700], meta[700];
     root(d->user,d->title ? d->title->data : NULL,base,sizeof(base));
     snprintf(host,sizeof(host),"%s/%s",base,d->dir->data);
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,d->dir->data);
     struct stat st;
     if (stat(host,&st)) return ERR_NOT_FOUND;
+#ifdef _WIN32
+    runtime_win_remove_tree(host);
+    runtime_win_remove_tree(meta);
+#else
     nftw(host,remove_entry,16,FTW_DEPTH|FTW_PHYS);
     nftw(meta,remove_entry,16,FTW_DEPTH|FTW_PHYS);
+#endif
     printf("Runtime: save data '%s' deleted\n",d->dir->data);
     return 0;
 }
-/* SQL-LIKE pattern: % any run, _ one character. */
-static int like(const char *s, const char *p) {
-    if (!*p) return !*s;
-    if (*p=='%') { for (;;++s) { if (like(s,p+1)) return 1; if (!*s) return 0; } }
-    return *s && (*p=='_' || *p==*s) && like(s+1,p+1);
+
+static int name_matches(const char *pattern, const char *name) {
+    if (!strcmp(pattern,"*")) return 1;
+    size_t n=strlen(pattern);
+    return pattern[n-1]=='*' ? !strncmp(pattern,name,n-1) : !strcmp(pattern,name);
 }
-typedef struct { char name[32]; Param param; } Entry;
-static uint32_t sort_key, sort_order;
-static int compare(const void *a, const void *b) {
-    const Entry *x=a, *y=b;
-    int c = sort_key==1 ? (x->param.user_param>y->param.user_param)-(x->param.user_param<y->param.user_param)
-          : sort_key==3 ? (x->param.mtime>y->param.mtime)-(x->param.mtime<y->param.mtime)
-          : strcmp(x->name,y->name);
-    return sort_order ? -c : c;
+
+typedef struct { DirName name; Param param; } Candidate;
+static int compare_candidates(const void *a, const void *b) {
+    const Candidate *ca=a, *cb=b;
+    return ca->param.mtime<cb->param.mtime ? 1 : ca->param.mtime>cb->param.mtime ? -1 : 0;
 }
-static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
+
+static ABI int32_t save_search(const SearchCond *cond, SearchResult *res) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!cond || !result) return ERR_PARAMETER;
-    char base[600];
-    root(cond->user,cond->title ? cond->title->data : NULL,base,sizeof(base));
-    Entry *entries=NULL; size_t count=0, capacity=0;
-    DIR *d=opendir(base);
-    for (struct dirent *e; d && (e=readdir(d));) {
-        size_t n=strlen(e->d_name);
-        if (e->d_name[0]=='.' || n>=32 || (n>8 && !strcmp(e->d_name+n-8,".sce_sys"))) continue;
-        if (cond->dir && cond->dir->data[0] && !like(e->d_name,cond->dir->data)) continue;
-        if (count==capacity) { capacity=capacity ? capacity*2 : 16; entries=realloc(entries,capacity*sizeof(*entries)); }
-        snprintf(entries[count].name,32,"%s",e->d_name);
-        char meta[680]; snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,e->d_name);
-        read_param(meta,&entries[count].param);
-        ++count;
+    if (!cond || cond->user<0 || !cond->dir || !res) return ERR_PARAMETER;
+    char base[700]; root(cond->user,cond->title ? cond->title->data : NULL,base,sizeof(base));
+    DIR *dir=opendir(base);
+    if (!dir) { res->hits=0; return 0; }
+    Candidate list[128]; uint32_t total=0;
+    for (struct dirent *e; (e=readdir(dir));) {
+        if (e->d_name[0]=='.' || strstr(e->d_name,".sce_sys") || strstr(e->d_name,".memory")) continue;
+        if (!name_matches(cond->dir->data,e->d_name)) continue;
+        if (total<sizeof(list)/sizeof(*list)) {
+            snprintf(list[total].name.data,sizeof(list[total].name.data),"%s",e->d_name);
+            char meta[800]; snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,e->d_name);
+            read_param(meta,&list[total].param);
+        }
+        ++total;
     }
-    if (d) closedir(d);
-    sort_key=cond->key; sort_order=cond->order;
-    if (count) qsort(entries,count,sizeof(*entries),compare);
-    result->hits=(uint32_t)count;
-    uint32_t set=count<result->names_capacity ? (uint32_t)count : result->names_capacity;
-    for (uint32_t i=0;i<set;++i) {
-        if (result->names) memcpy(result->names[i].data,entries[i].name,32);
-        if (result->params) result->params[i]=entries[i].param;
-        if (result->infos) { memset(&result->infos[i],0,sizeof(SearchInfo)); result->infos[i].blocks=32768; result->infos[i].free_blocks=16384; }
+    closedir(dir);
+    uint32_t in_list=total<sizeof(list)/sizeof(*list) ? total : (uint32_t)(sizeof(list)/sizeof(*list));
+    qsort(list,in_list,sizeof(Candidate),compare_candidates);
+    uint32_t copy=in_list<res->names_capacity ? in_list : res->names_capacity;
+    for (uint32_t i=0;i<copy;++i) {
+        if (res->names) res->names[i]=list[i].name;
+        if (res->params) res->params[i]=list[i].param;
+        if (res->infos) res->infos[i]=(SearchInfo){.blocks=32768,.free_blocks=16384};
     }
-    result->set_count=set;
-    free(entries);
+    res->hits=total;
     return 0;
 }
-/* SaveDataMemory: one fixed-size blob per user/title. */
+
 static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!size) return ERR_PARAMETER;
-    char base[600], dir[640];
+    if (user<0 || !size) return ERR_PARAMETER;
+    char base[700], dir[750];
     root(user,NULL,base,sizeof(base));
     snprintf(dir,sizeof(dir),"%s.memory",base);
     if (make_dirs(dir)) return ERR_INTERNAL;
-    pthread_mutex_lock(&lock);
+    host_lock(&lock);
     snprintf(memory_path,sizeof(memory_path),"%s/memory.dat",dir);
     FILE *f=fopen(memory_path,"r+b");
     if (!f) f=fopen(memory_path,"w+b");
     int32_t r=ERR_INTERNAL;
     if (f) {
-        fseek(f,0,SEEK_END);
-        if ((uint64_t)ftell(f)<size && ftruncate(fileno(f),(off_t)size)) goto done;
-        memory_size=size; r=0;
-    done:
+        r=!ftruncate(fileno(f),(off_t)size) ? 0 : ERR_INTERNAL;
+        memory_size=r ? 0 : size;
         fclose(f);
     }
     if (!r && param) write_param(dir,param);
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     if (!r) printf("Runtime: save data memory ready (%llu bytes)\n",(unsigned long long)size);
     return r;
 }
+
 static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!buffer || offset<0) return ERR_PARAMETER;
-    pthread_mutex_lock(&lock);
-    if (!memory_size) { pthread_mutex_unlock(&lock); return ERR_MEMORY_NOT_READY; }
-    if ((uint64_t)offset+size>memory_size) { pthread_mutex_unlock(&lock); return ERR_PARAMETER; }
+    host_lock(&lock);
+    if (!memory_size) { host_unlock(&lock); return ERR_MEMORY_NOT_READY; }
+    if ((uint64_t)offset+size>memory_size) { host_unlock(&lock); return ERR_PARAMETER; }
     FILE *f=fopen(memory_path,"r+b");
     int32_t r=ERR_INTERNAL;
     if (f && !fseek(f,offset,SEEK_SET) &&
         (write ? fwrite(buffer,1,size,f) : fread(buffer,1,size,f))==size) r=0;
     if (f) fclose(f);
     if (!r && write) ++memory_writes;
-    pthread_mutex_unlock(&lock);
+    host_unlock(&lock);
     return r;
 }
+
 static ABI int32_t memory_get(int32_t user, void *buffer, uint64_t size, int64_t offset) { (void)user; return memory_io(buffer,size,offset,0); }
-static ABI int32_t memory_set(int32_t user, void *buffer, uint64_t size, int64_t offset) { (void)user; return memory_io(buffer,size,offset,1); }
+static ABI int32_t memory_set(int32_t user, const void *buffer, uint64_t size, int64_t offset) { (void)user; return memory_io((void *)buffer,size,offset,1); }
 
 static const RuntimeExport exports[]={
-    {"sceSaveDataInitialize",save_initialize}, {"sceSaveDataInitialize2",save_initialize},
-    {"sceSaveDataInitialize3",save_initialize}, {"sceSaveDataTerminate",save_terminate},
-    {"sceSaveDataMount",save_mount}, {"sceSaveDataMount2",save_mount2}, {"sceSaveDataUmount",save_umount},
-    {"sceSaveDataSetParam",save_set_param}, {"sceSaveDataSaveIcon",save_icon}, {"sceSaveDataDelete",save_delete},
+    /* Bloodborne #O#P NIDs (from import_names.inc / EBOOT) */
+    {"ZkZhskCPXFw#O#P",save_initialize},
+    {"yKDy8S5yLA0#O#P",save_terminate},
+    {"32HQAQdwM2o#O#P",save_mount1},
+    {"BMR4F-Uek3E#O#P",save_umount},
+    {"85zul--eGXs#O#P",save_set_param},
+    {"c88Yy54Mx0w#O#P",save_icon},
+    {"S1GkePI17zQ#O#P",save_delete},
+    {"dyIhnXq-0SM#O#P",save_search},
+    {"v7AAAMo0Lz4#O#P",memory_setup},
+    {"7Bt5pBC-Aco#O#P",memory_get},
+    {"h3YURzXGSVQ#O#P",memory_set},
+
+    /* Standard symbol names */
+    {"sceSaveDataInitialize",save_initialize},
+    {"sceSaveDataInitialize2",save_initialize},
+    {"sceSaveDataInitialize3",save_initialize},
+    {"sceSaveDataTerminate",save_terminate},
+    {"sceSaveDataMount",save_mount1},
+    {"sceSaveDataMount2",save_mount2},
+    {"sceSaveDataUmount",save_umount},
+    {"sceSaveDataSetParam",save_set_param},
+    {"sceSaveDataSaveIcon",save_icon},
+    {"sceSaveDataDelete",save_delete},
     {"sceSaveDataDirNameSearch",save_search},
-    {"sceSaveDataSetupSaveDataMemory",memory_setup}, {"sceSaveDataGetSaveDataMemory",memory_get},
+    {"sceSaveDataSetupSaveDataMemory",memory_setup},
+    {"sceSaveDataGetSaveDataMemory",memory_get},
     {"sceSaveDataSetSaveDataMemory",memory_set},
+    {"sceSaveDataMemoryInit",memory_setup},
+    {"sceSaveDataMemoryGetData",memory_get},
+    {"sceSaveDataMemorySetData",memory_set},
+
+    /* Legacy / alternate #p#J NIDs */
+    {"Kz6960K8y5k#p#J",save_initialize},
+    {"y807Z3XQv0U#p#J",save_terminate},
+    {"8wK8R7w5-3I#p#J",save_mount1},
+    {"Xk1J7F4j-Yg#p#J",save_mount2},
+    {"h2nS5F1R+nI#p#J",save_umount},
+    {"J+ZJ-XbV2r4#p#J",save_set_param},
+    {"c2Q3q1N0x9Y#p#J",save_icon},
+    {"q8K7Y1V-n2E#p#J",save_delete},
+    {"k-r1L1R0r1E#p#J",save_search},
 };
+
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
-#else
-void runtime_savedata_configure(const char *title) { (void)title; }
-uintptr_t runtime_savedata_resolve(const char *name) { (void)name; return 0; }
-void runtime_savedata_report(void) {}
-#endif

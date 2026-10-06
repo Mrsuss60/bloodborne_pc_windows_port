@@ -955,19 +955,19 @@ struct PM4CmdReleaseMem {
     void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
         switch (data_sel.Value()) {
         case DataSelect::Data32Low: {
-            *Address<u32*>() = DataDWord();
+            __atomic_store_n(Address<u32*>(), DataDWord(), __ATOMIC_RELEASE);
             break;
         }
         case DataSelect::Data64: {
-            *Address<u64*>() = DataQWord();
+            __atomic_store_n(Address<u64*>(), DataQWord(), __ATOMIC_RELEASE);
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            __atomic_store_n(Address<u64*>(), GetGpuClock64(), __ATOMIC_RELEASE);
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            __atomic_store_n(Address<u64*>(), GetGpuPerfCounter(), __ATOMIC_RELEASE);
             break;
         }
         case DataSelect::GdsMemStore: {
