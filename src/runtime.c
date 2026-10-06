@@ -44,7 +44,7 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
     }
     unsigned char **block=&tls_blocks[index[0]];
     if (!*block) {
-        *block=calloc(1,tls_modules[index[0]].memsz);
+        *block=runtime_low_calloc(1,tls_modules[index[0]].memsz);
         if (!*block) { fputs("Cannot allocate module TLS\n",stderr); exit(1); }
         memcpy(*block,tls_modules[index[0]].data,tls_modules[index[0]].filesz);
     }

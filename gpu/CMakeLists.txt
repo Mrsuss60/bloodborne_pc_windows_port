@@ -4,6 +4,8 @@ cmake_minimum_required(VERSION 3.24)
 project(bbgpu LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -40,19 +42,85 @@ elseif (BB_PGO STREQUAL "use")
                         -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
 endif()
 
+if (WIN32)
+    if (DEFINED ENV{MINGW_PREFIX})
+        list(APPEND CMAKE_PREFIX_PATH "$ENV{MINGW_PREFIX}")
+    elseif (EXISTS "C:/msys64/mingw64")
+        list(APPEND CMAKE_PREFIX_PATH "C:/msys64/mingw64")
+    endif()
+    if (DEFINED ENV{SDL3_DIR})
+        list(APPEND CMAKE_PREFIX_PATH "$ENV{SDL3_DIR}")
+    endif()
+    if (DEFINED ENV{VULKAN_SDK})
+        list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
+    endif()
+    add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
+    if (EXISTS "C:/msys64/mingw64/lib")
+        link_directories("C:/msys64/mingw64/lib")
+    endif()
+endif()
+
 find_package(Vulkan REQUIRED)
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
-find_package(magic_enum REQUIRED)
+if (WIN32)
+    if (NOT TARGET magic_enum::magic_enum)
+        add_library(magic_enum::magic_enum INTERFACE IMPORTED)
+        find_path(MAGIC_ENUM_INC NAMES magic_enum/magic_enum.hpp PATHS "$ENV{MINGW_PREFIX}/include" "C:/msys64/mingw64/include")
+        if (MAGIC_ENUM_INC)
+            target_include_directories(magic_enum::magic_enum INTERFACE "${MAGIC_ENUM_INC}")
+        endif()
+    endif()
+else()
+    find_package(magic_enum REQUIRED)
+endif()
 find_package(tsl-robin-map REQUIRED)
-find_package(VulkanMemoryAllocator CONFIG REQUIRED)
+if (NOT TARGET GPUOpen::VulkanMemoryAllocator)
+    add_library(GPUOpen::VulkanMemoryAllocator INTERFACE IMPORTED)
+    find_path(VMA_INC NAMES vk_mem_alloc.h PATHS "$ENV{MINGW_PREFIX}/include" "C:/msys64/mingw64/include")
+    if (VMA_INC)
+        target_include_directories(GPUOpen::VulkanMemoryAllocator INTERFACE "${VMA_INC}")
+    endif()
+endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
-pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
-find_package(miniz REQUIRED)
+if (WIN32)
+    find_package(SDL3 QUIET CONFIG)
+    if (TARGET SDL3::SDL3)
+        add_library(PkgConfig::SDL3 INTERFACE IMPORTED)
+        target_link_libraries(PkgConfig::SDL3 INTERFACE SDL3::SDL3)
+    else()
+        find_path(SDL3_INC NAMES SDL3/SDL.h PATHS "$ENV{SDL3_DIR}/include" "C:/msys64/mingw64/include")
+        find_library(SDL3_LIB NAMES SDL3 libSDL3.dll.a PATHS "$ENV{SDL3_DIR}/lib" "C:/msys64/mingw64/lib")
+        if (SDL3_INC AND SDL3_LIB)
+            add_library(PkgConfig::SDL3 INTERFACE IMPORTED)
+            target_include_directories(PkgConfig::SDL3 INTERFACE "${SDL3_INC}")
+            target_link_libraries(PkgConfig::SDL3 INTERFACE "${SDL3_LIB}")
+        else()
+            pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+        endif()
+    endif()
+else()
+    pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
+    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+endif()
+if (WIN32)
+    if (NOT TARGET miniz::miniz)
+        add_library(miniz::miniz INTERFACE IMPORTED)
+        find_path(MINIZ_INC NAMES miniz.h PATHS "$ENV{MINGW_PREFIX}/include" "C:/msys64/mingw64/include")
+        if (MINIZ_INC)
+            target_include_directories(miniz::miniz INTERFACE "${MINIZ_INC}")
+        endif()
+        find_library(MINIZ_LIB NAMES miniz libminiz.a PATHS "$ENV{MINGW_PREFIX}/lib" "C:/msys64/mingw64/lib")
+        if (MINIZ_LIB)
+            target_link_libraries(miniz::miniz INTERFACE "${MINIZ_LIB}")
+        endif()
+    endif()
+else()
+    find_package(miniz REQUIRED)
+endif()
 find_package(Zydis REQUIRED)
-find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
+find_program(GLSLANG_COMPILER NAMES glslang glslangValidator PATHS "C:/msys64/mingw64/bin" REQUIRED)
 
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
@@ -116,11 +184,19 @@ set(COMMON
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
-add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
-    shadps4/core/libraries/gnmdriver/gnmdriver.cpp
-    shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
-    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
-    shadps4/core/libraries/videodec/video_utils.cpp)
+if (WIN32)
+    add_library(bbgpu STATIC ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+        shadps4/core/libraries/gnmdriver/gnmdriver.cpp
+        shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
+        shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
+        shadps4/core/libraries/videodec/video_utils.cpp)
+else()
+    add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+        shadps4/core/libraries/gnmdriver/gnmdriver.cpp
+        shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
+        shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
+        shadps4/core/libraries/videodec/video_utils.cpp)
+endif()
 add_dependencies(bbgpu host_shaders)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
@@ -134,12 +210,22 @@ set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
+if (WIN32)
+    target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
-# Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+if (NOT WIN32)
+    # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
+    target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
-target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+if (WIN32)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+        tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit ws2_32)
+else()
+    target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+        tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
@@ -184,3 +270,29 @@ add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
 target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
 target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
+
+file(GLOB RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime*.c")
+if (WIN32)
+    list(APPEND RUNTIME_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../src/win32_compat.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../src/win32_memory.c"
+    )
+endif()
+add_executable(bbport
+    ../src/probe.c
+    ${RUNTIME_SOURCES}
+    ../src/vulkan_smoke.c
+)
+target_include_directories(bbport PRIVATE .. ../src)
+target_link_libraries(bbport PRIVATE bbgpu "${CMAKE_CURRENT_SOURCE_DIR}/../out/libatrac9.a" Vulkan::Vulkan)
+if (WIN32)
+    target_link_libraries(bbport PRIVATE ws2_32 dbghelp ntdll winmm)
+    target_link_options(bbport PRIVATE "-Wl,--disable-dynamicbase" "-Wl,--disable-high-entropy-va")
+endif()
+set_target_properties(bbport PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../out")
+
+add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c)
+target_include_directories(bb-gpu-capabilities PRIVATE .. ../src)
+target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
+set_target_properties(bb-gpu-capabilities PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../out")
+

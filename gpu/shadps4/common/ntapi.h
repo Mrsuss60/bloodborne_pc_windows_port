@@ -509,11 +509,13 @@ typedef struct _TEB {                             /* win32/win64 */
 static_assert(offsetof(TEB, DeallocationStack) ==
               0x1478); /* The only member we care about at the moment */
 
+#if !defined(QUEUE_USER_APC_FLAGS_NONE) && (!defined(NTDDI_WIN10_MN) || NTDDI_VERSION < NTDDI_WIN10_MN)
 typedef enum _QUEUE_USER_APC_FLAGS {
     QueueUserApcFlagsNone,
     QueueUserApcFlagsSpecialUserApc,
     QueueUserApcFlagsMaxValue
 } QUEUE_USER_APC_FLAGS;
+#endif
 
 typedef union _USER_APC_OPTION {
     ULONG_PTR UserApcFlags;

@@ -7,9 +7,9 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "bbport_threads.h"
+
 extern "C" std::uint64_t runtime_disabled_optimizations;
-/// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
-extern "C" __thread sigjmp_buf* runtime_fault_recover;
 
 namespace BbToggle {
 enum : std::uint64_t {
@@ -62,6 +62,9 @@ enum : std::uint64_t {
     // when nothing moves. Static-camera flicker of railings/window bars p99.9 -45% (2026-10-03).
     TaaKeepNearerHistory = 1ull << 55,
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
+    /// Scene textures use BB_ANISO (16) times anisotropic filtering instead of the game's
+    /// ratio; bit set: the game's own samplers (A/B while the game runs).
+    ForcedAniso = 1ull << 61,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
@@ -78,7 +81,7 @@ inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};
 inline std::atomic<std::uint64_t> buffer_upload_bytes{0};
 inline std::atomic<int> gpu_thread_clock{-1}; ///< clockid_t of the GPU command thread
-inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};
+inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0}, flips{0};
 /// Frames the GPU command thread has started (display pass), for per-frame diagnostics.
 inline std::atomic<std::uint64_t> gpu_frames{0};
 /// Wall time spent in operations suspected of stalls (ns, all threads).
@@ -112,6 +115,12 @@ inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// for host copies before a submission or fence, and for GPU ticks.
 inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
     copy_threads_wait_ns{0}, host_copy_waits{0};
+/// The texture cache collector: the usage it compares, the mark it starts at, images it freed.
+inline std::atomic<std::uint64_t> gc_used_bytes{0}, gc_trigger_bytes{0}, gc_freed_images{0};
+/// Seconds of a steady clock, updated at every guest submission (cheap ages for caches).
+inline std::atomic<std::uint32_t> coarse_second{0};
+/// Images the collector passed over (GPU-written, not evictable without memory pressure).
+inline std::atomic<std::uint64_t> gc_kept_images{0};
 struct WaitTimer {
     std::atomic<std::uint64_t>& total;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();

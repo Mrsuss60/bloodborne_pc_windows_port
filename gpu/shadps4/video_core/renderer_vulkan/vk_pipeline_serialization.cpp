@@ -381,8 +381,9 @@ void PipelineCache::WarmUp() {
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
-        LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
+        LOG_WARNING(Render, "{} stale pipelines were found: clearing cache to regenerate cleanly",
                     num_total_pipelines - num_pipelines);
+        Storage::DataBase::Instance().Clear();
     }
 
     Storage::DataBase::Instance().FinishPreload();

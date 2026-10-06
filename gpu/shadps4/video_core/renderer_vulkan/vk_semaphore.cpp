@@ -9,6 +9,9 @@
 
 namespace Vulkan {
 
+#ifdef WAIT_TIMEOUT
+#undef WAIT_TIMEOUT
+#endif
 constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
 
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {

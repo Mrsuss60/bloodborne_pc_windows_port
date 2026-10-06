@@ -133,6 +133,11 @@ public:
         return maintenance_8;
     }
 
+    /// bbport: VK_AMD_buffer_marker (GPU breadcrumbs).
+    bool IsBufferMarkerSupported() const {
+        return buffer_marker;
+    }
+
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
@@ -485,6 +490,11 @@ public:
         return total_memory_budget;
     }
 
+    /// Returns the physical device-local memory size (dedicated VRAM).
+    [[nodiscard]] u64 GetDeviceLocalMemory() const {
+        return total_local_memory;
+    }
+
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
@@ -558,6 +568,7 @@ private:
     bool workgroup_memory_explicit_layout{};
     bool maintenance_5{};
     bool maintenance_8{};
+    bool buffer_marker{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
@@ -567,6 +578,7 @@ private:
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
+    u64 total_local_memory{};
     std::vector<size_t> valid_heaps;
 };
 

@@ -32,6 +32,15 @@ int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 int bbgpu_overlay_captures_input(void);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+/* Flips and submissions query for heartbeat / diagnostics. */
+uint64_t bbgpu_get_flip_count(void);
+uint64_t bbgpu_get_submit_count(void);
+/* Dumps host GPU / presenter thread states and counters to a log file. */
+void bbgpu_dump_host_threads_hang(void *file_handle);
+/* Computes average FPS and p95/p99 frame times in milliseconds over recent flips. */
+void bbgpu_get_frametime_percentiles(double *avg_fps, double *p95_ms, double *p99_ms);
+/* Dumps GPU breadcrumbs state to log/crash files. */
+void bbgpu_dump_breadcrumbs(void *file_handle);
 #ifdef __cplusplus
 }
 #endif

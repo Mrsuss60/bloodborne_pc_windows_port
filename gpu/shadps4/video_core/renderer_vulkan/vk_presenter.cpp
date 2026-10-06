@@ -161,9 +161,18 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
-    Check(draw_scheduler.CommandBuffer().reset());
-    Check(present_scheduler.CommandBuffer().reset());
-    Check(flip_scheduler.CommandBuffer().reset());
+    if (rasterizer) {
+        rasterizer->GetPipelineCache().Sync();
+    }
+    if (draw_scheduler.CommandBuffer()) {
+        (void)draw_scheduler.CommandBuffer().reset();
+    }
+    if (present_scheduler.CommandBuffer()) {
+        (void)present_scheduler.CommandBuffer().reset();
+    }
+    if (flip_scheduler.CommandBuffer()) {
+        (void)flip_scheduler.CommandBuffer().reset();
+    }
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -213,10 +222,23 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
 
     VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
                                      &unsafe_image, &frame->allocation, nullptr);
+    if (result != VK_SUCCESS) {
+        VmaAllocationCreateInfo fallback_alloc = alloc_info;
+        fallback_alloc.flags = 0;
+        result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &fallback_alloc,
+                                &unsafe_image, &frame->allocation, nullptr);
+    }
     if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
+        LOG_CRITICAL(Render_Vulkan, "Failed allocating frame texture with error {}",
                      vk::to_string(vk::Result{result}));
-        UNREACHABLE();
+        VmaAllocationCreateInfo sys_alloc = alloc_info;
+        sys_alloc.flags = 0;
+        sys_alloc.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &sys_alloc,
+                                &unsafe_image, &frame->allocation, nullptr);
+        if (result != VK_SUCCESS) {
+            UNREACHABLE();
+        }
     }
     frame->image = vk::Image{unsafe_image};
     SetObjectName(device, frame->image, "Frame image #{}", frame->id);

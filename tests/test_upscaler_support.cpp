@@ -5,14 +5,33 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+static inline int setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+static inline int unsetenv(const char *name) {
+    return _putenv_s(name, "");
+}
+#endif
 #include "bbport_settings.h"
 
 int main() {
     using namespace BbSettings;
+#ifdef _WIN32
+    char temp_dir[MAX_PATH];
+    GetTempPathA(sizeof(temp_dir), temp_dir);
+    char path[512];
+    snprintf(path, sizeof(path), "%sbbport-upscaler-test-%lu", temp_dir, (unsigned long)GetCurrentProcessId());
+    FILE *init_f = fopen(path, "w");
+    if (init_f) fclose(init_f);
+#else
     char path[] = "/tmp/bbport-upscaler-test-XXXXXX";
     const int fd = mkstemp(path);
     assert(fd >= 0);
     close(fd);
+#endif
     setenv("BB_CONFIG", path, 1);
     unsetenv("BB_UPSCALER");
     unsetenv("BB_UPSCALE_PRESET");

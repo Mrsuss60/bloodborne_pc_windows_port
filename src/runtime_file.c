@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
+#ifdef _WIN32
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -16,6 +16,85 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#include <inttypes.h>
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0
+#endif
+#ifndef O_SYNC
+#define O_SYNC 0
+#endif
+#ifndef mkdir
+#define mkdir(p, m) _mkdir(p)
+#endif
+#define fsync(fd) _commit(fd)
+#ifndef realpath
+#define realpath(N, R) _fullpath(R, N, MAX_PATH)
+#endif
+static ssize_t win_pread(int fd, void *buf, size_t count, int64_t offset) {
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "Runtime ERROR: win_pread _get_osfhandle(fd=%d) failed: Win32 error %lu\n", fd, (unsigned long)err);
+        return -1;
+    }
+    OVERLAPPED ov = {0};
+    ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFF);
+    DWORD read_bytes = 0;
+    DWORD to_read = (DWORD)(count > 0xFFFFFFFFULL ? 0xFFFFFFFFULL : count);
+    if (!ReadFile(h, buf, to_read, &read_bytes, &ov)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_HANDLE_EOF) return 0;
+        fprintf(stderr, "Runtime ERROR: ReadFile(fd=%d, offset=%" PRId64 ", count=%zu) failed: Win32 error %lu\n",
+                fd, offset, count, (unsigned long)err);
+        return -1;
+    }
+    return (ssize_t)read_bytes;
+}
+static ssize_t win_pwrite(int fd, const void *buf, size_t count, int64_t offset) {
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "Runtime ERROR: win_pwrite _get_osfhandle(fd=%d) failed: Win32 error %lu\n", fd, (unsigned long)err);
+        return -1;
+    }
+    OVERLAPPED ov = {0};
+    ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
+    ov.OffsetHigh = (DWORD)((offset >> 32) & 0xFFFFFFFF);
+    DWORD written_bytes = 0;
+    DWORD to_write = (DWORD)(count > 0xFFFFFFFFULL ? 0xFFFFFFFFULL : count);
+    if (!WriteFile(h, buf, to_write, &written_bytes, &ov)) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "Runtime ERROR: WriteFile(fd=%d, offset=%" PRId64 ", count=%zu) failed: Win32 error %lu\n",
+                fd, offset, count, (unsigned long)err);
+        return -1;
+    }
+    return (ssize_t)written_bytes;
+}
+#ifndef pread
+#define pread win_pread
+#endif
+#ifndef pwrite
+#define pwrite win_pwrite
+#endif
+#else
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define MAX_FILES 1024
 #define MAX_MOUNTS 16
@@ -109,7 +188,11 @@ static int host_flags(int flags) {
     if (flags&0x400) r|=O_TRUNC;
     if (flags&0x800) r|=O_EXCL;
     if (flags&0x20000) r|=O_DIRECTORY;
+#ifdef _WIN32
+    return r|O_CLOEXEC|O_BINARY;
+#else
     return r|O_CLOEXEC;
+#endif
 }
 static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
 static Listing *list_directory(const char *path) {
@@ -129,6 +212,16 @@ static Listing *list_directory(const char *path) {
         if (!l->offsets || !l->types || !l->names) { fputs("Out of memory listing directory\n",stderr); exit(1); }
         memcpy(l->names+bytes,e->d_name,n);
         l->offsets[l->count]=bytes;
+#ifdef _WIN32
+        unsigned char type=0;
+        char full[2048];
+        snprintf(full,sizeof(full),"%s/%s",path,e->d_name);
+        struct _stat64 entry;
+        if (!_stat64(full,&entry)) {
+            type=S_ISDIR(entry.st_mode) ? 4 : S_ISREG(entry.st_mode) ? 8 : 0;
+        }
+        l->types[l->count]=type;
+#else
         unsigned char type=e->d_type;
         if (type==DT_LNK || type==DT_UNKNOWN) {
             struct stat entry;
@@ -136,11 +229,24 @@ static Listing *list_directory(const char *path) {
                 type=S_ISDIR(entry.st_mode) ? DT_DIR : S_ISREG(entry.st_mode) ? DT_REG : type;
         }
         l->types[l->count]=type==DT_DIR ? 4 : type==DT_REG ? 8 : type==DT_LNK ? 10 : 0;
+#endif
         ++l->count; bytes+=n;
     }
     closedir(d);
     return l;
 }
+#ifdef _WIN32
+static void convert_stat(const struct _stat64 *s,GuestStat *g) {
+    memset(g,0,sizeof(*g));
+    g->dev=(uint32_t)s->st_dev; g->ino=(uint32_t)s->st_ino;
+    g->mode=(uint16_t)s->st_mode; g->nlink=(uint16_t)s->st_nlink;
+    g->size=s->st_size; g->blocks=(s->st_size+511)/512; g->blksize=4096;
+    g->atime=(GuestTimespec){s->st_atime,0};
+    g->mtime=(GuestTimespec){s->st_mtime,0};
+    g->ctime=(GuestTimespec){s->st_ctime,0};
+    g->birthtime=g->ctime;
+}
+#else
 static void convert_stat(const struct stat *s,GuestStat *g) {
     memset(g,0,sizeof(*g));
     g->dev=(uint32_t)s->st_dev; g->ino=(uint32_t)s->st_ino;
@@ -151,6 +257,7 @@ static void convert_stat(const struct stat *s,GuestStat *g) {
     g->ctime=(GuestTimespec){s->st_ctim.tv_sec,s->st_ctim.tv_nsec};
     g->birthtime=g->ctime;
 }
+#endif
 static File *get(int fd) {
     if (fd<3 || fd>=MAX_FILES || !files[fd].used) return NULL;
     return &files[fd];
@@ -169,16 +276,42 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
-    if (e) return -e;
-    int host=open(path,host_flags(flags),mode ? mode : 0644);
-    if (host<0) {
-        e=errno;
-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
-        return -e;
-    }
-    struct stat s;
+    int host=-1;
     Listing *dir=NULL;
-    if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
+#ifdef _WIN32
+    struct _stat64 s;
+    if (!_stat64(path,&s) && S_ISDIR(s.st_mode)) {
+        HANDLE h = CreateFileA(path, FILE_LIST_DIRECTORY, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                               NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            host = _open_osfhandle((intptr_t)h, _O_RDONLY);
+        } else {
+            DWORD err = GetLastError();
+            fprintf(stderr, "Runtime WARNING: CreateFileA(dir '%s') failed: Win32 error %lu\n", path, (unsigned long)err);
+        }
+        if (host >= 0) dir = list_directory(path);
+    }
+#else
+    struct stat s;
+#endif
+    if (host < 0) {
+        host=open(path,host_flags(flags),mode ? mode : 0644);
+        if (host<0) {
+            e=errno;
+            if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+            else {
+                DWORD win_err = GetLastError();
+                fprintf(stderr, "Runtime ERROR: open('%s' -> '%s', flags=0x%x) failed: errno=%d, Win32 error %lu\n",
+                        guest, path, flags, e, (unsigned long)win_err);
+            }
+            return -e;
+        }
+#ifdef _WIN32
+        if (!_fstat64(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
+#else
+        if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
+#endif
+    }
     pthread_mutex_lock(&lock);
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
@@ -187,6 +320,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     pthread_mutex_unlock(&lock);
+    CHECK_LOW_ADDR((uintptr_t)fd);
     if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
     const char *mod_trace=getenv("BB_MOD_TRACE"), *mod_root=getenv("BB_MODS_DIR");
     if (mod_trace && mod_trace[0]=='1' && mod_root) {
@@ -231,17 +365,46 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     touch_for_write(buffer,size);
+#ifdef _WIN32
+    uint64_t total_read = 0;
+    while (total_read < size) {
+        size_t chunk = (size - total_read > 0x40000000ULL) ? 0x40000000ULL : (size_t)(size - total_read);
+        int n = read(h, (char *)buffer + total_read, (unsigned int)chunk);
+        if (n < 0) {
+            int e = errno;
+            DWORD werr = GetLastError();
+            fprintf(stderr, "Runtime ERROR: read(fd %d, chunk %zu) failed: errno %d, Win32 error %lu\n",
+                    fd, chunk, e, (unsigned long)werr);
+            if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,e);
+            return -e;
+        }
+        if (n == 0) break;
+        total_read += (uint64_t)n;
+    }
+    __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,total_read,__ATOMIC_RELAXED);
+    return (int64_t)total_read;
+#else
     ssize_t n=read(h,buffer,size);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
+#endif
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     touch_for_write(buffer,size);
     ssize_t n=pread(h,buffer,size,offset);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    if (n<0) {
+        int e = errno;
+#ifdef _WIN32
+        DWORD werr = GetLastError();
+        fprintf(stderr, "Runtime ERROR: pread(fd %d, size %llu, offset %lld) failed: errno %d, Win32 error %lu\n",
+                fd, (unsigned long long)size, (long long)offset, e, (unsigned long)werr);
+#endif
+        if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,e);
+        return -e;
+    }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
@@ -268,24 +431,54 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
         if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
         return -EINVAL;
     }
+#ifdef _WIN32
+    int64_t r = _lseeki64(f->host, offset, whence);
+    if (r < 0) {
+        int e = errno;
+        DWORD werr = GetLastError();
+        fprintf(stderr, "Runtime ERROR: _lseeki64(fd %d, offset %lld, whence %d) failed: errno %d, Win32 error %lu\n",
+                fd, (long long)offset, whence, e, (unsigned long)werr);
+        return -e;
+    }
+    return r;
+#else
     off_t r=lseek(f->host,offset,whence);
     return r<0 ? -errno : r;
+#endif
 }
 static int64_t do_fstat(int fd,GuestStat *out) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     if (!out) return -EFAULT;
+#ifdef _WIN32
+    struct _stat64 s;
+    if (_fstat64(h,&s)) {
+        int e = errno;
+        DWORD werr = GetLastError();
+        fprintf(stderr, "Runtime ERROR: _fstat64(fd %d) failed: errno %d, Win32 error %lu\n", fd, e, (unsigned long)werr);
+        return -e;
+    }
+    convert_stat(&s,out); return 0;
+#else
     struct stat s;
     if (fstat(h,&s)) return -errno;
     convert_stat(&s,out); return 0;
+#endif
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
-    char path[1024]; struct stat s;
+    char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (!out) return -EFAULT;
+#ifdef _WIN32
+    struct _stat64 s;
+    if (_stat64(path,&s)) return -errno;
+    convert_stat(&s,out); return 0;
+#else
+    struct stat s;
     if (stat(path,&s)) return -errno;
     convert_stat(&s,out); return 0;
+#endif
 }
 static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
     pthread_mutex_lock(&lock);
@@ -317,6 +510,9 @@ static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
     return result;
 }
 static int64_t path_op(const char *guest,int op,int mode) {
+#ifdef _WIN32
+    (void)mode;
+#endif
     if (game_path(guest)) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
@@ -335,14 +531,26 @@ static int64_t do_rename(const char *from,const char *to) {
 static int64_t do_ftruncate(int fd,int64_t length) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+#ifdef _WIN32
+    return _chsize_s(h,length) ? -errno : 0;
+#else
     return ftruncate(h,length) ? -errno : 0;
+#endif
 }
 static int64_t do_truncate(const char *guest,int64_t length) {
     if (game_path(guest)) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
+#ifdef _WIN32
+    int h = open(path, O_RDWR | O_BINARY);
+    if (h < 0) return -errno;
+    int r = _chsize_s(h, length);
+    close(h);
+    return r ? -errno : 0;
+#else
     return truncate(path,length) ? -errno : 0;
+#endif
 }
 static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return fsync(h) ? -errno : 0; }
 static int64_t do_access(const char *guest,int mode) {
@@ -419,8 +627,3 @@ void runtime_file_report(void) {
     printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
            opens,reads,(unsigned long long)bytes_read,writes,missing);
 }
-#else
-uintptr_t runtime_file_resolve(const char *name) { (void)name; return 0; }
-void runtime_file_report(void) {}
-void runtime_file_configure(const char *a,const char *u) { (void)a; (void)u; }
-#endif

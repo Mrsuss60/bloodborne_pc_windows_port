@@ -21,6 +21,11 @@ namespace Libraries::Kernel {
 extern boost::asio::io_context io_context;
 extern void KernelSignalRequest();
 
+extern "C" {
+void runtime_thread_set_blocked(const char* what, uint64_t resource);
+void runtime_thread_clear_blocked(void);
+}
+
 static std::unordered_map<s32, EqueueInternal*> kqueues;
 static constexpr auto HrTimerSpinlockThresholdNs = 1200000u;
 
@@ -225,7 +230,7 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
             }
         }
     }
-    m_cond.notify_one();
+    m_cond.notify_all();
     return has_found;
 }
 
@@ -479,7 +484,9 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
+    runtime_thread_set_blocked("equeue", static_cast<uint64_t>(eq));
     *out = equeue->WaitForEvents(ev, num, timo);
+    runtime_thread_clear_blocked();
 
     if (*out == 0) {
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;
