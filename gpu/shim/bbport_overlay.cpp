@@ -42,6 +42,9 @@ extern "C" const unsigned char bb_font_ttf_end[];
 
 extern "C" void runtime_restart(void); // bb-probe (probe.c)
 
+#include "sdl_window.h"
+extern Frontend::WindowSDL* g_window;
+
 namespace BbOverlay {
 
 namespace {
@@ -585,7 +588,7 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || BbSettings::Get().show_fps);
+    return initialized && (menu_open || BbSettings::Get().show_fps || (g_window && g_window->IsTextInputActive()));
 }
 
 bool CapturesInput() {
@@ -623,6 +626,23 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (BbSettings::Get().show_fps && !menu_open) {
         FpsCounter();
+    }
+    if (g_window && g_window->IsTextInputActive()) {
+        const std::string prompt = g_window->GetTextInputPrompt();
+        const std::string current_val = g_window->GetTextInputValue();
+        ImGui::SetNextWindowPos(ImVec2(float(extent.width) * 0.5f, float(extent.height) * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(std::min(480.0f * scale, float(extent.width) * 0.9f), 0.0f));
+        if (ImGui::Begin("Name Input", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::Spacing();
+            ImGui::Text("%s", prompt.c_str());
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "> %s_", current_val.c_str());
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::TextDisabled("Press Enter to Confirm, Esc to Cancel");
+            ImGui::End();
+        }
     }
     ImGui::Render();
 

@@ -226,17 +226,24 @@ static size_t utf16_to_utf8(const uint16_t *in, size_t limit, char *out, size_t 
     out[n]=0; return n;
 }
 static void utf8_to_utf16(const char *in, uint16_t *out, uint32_t max) {
+    if (!out || !max) return;
     uint32_t n=0;
-    for (const unsigned char *p=(const unsigned char *)in; *p && n<max;) {
+    for (const unsigned char *p=(const unsigned char *)in; *p && n+1<max;) {
         uint32_t c; int extra;
         if (*p<0x80) { c=*p; extra=0; } else if ((*p&0xE0)==0xC0) { c=*p&31; extra=1; }
         else if ((*p&0xF0)==0xE0) { c=*p&15; extra=2; } else { c=*p&7; extra=3; }
         ++p;
         for (int k=0;k<extra && (*p&0xC0)==0x80;++k) c=(c<<6)|(*p++&63);
-        if (c>=0x10000) { if (n+2>max) break; c-=0x10000; out[n++]=(uint16_t)(0xD800+(c>>10)); out[n++]=(uint16_t)(0xDC00+(c&1023)); }
-        else out[n++]=(uint16_t)c;
+        if (c>=0x10000) {
+            if (n+2>=max) break;
+            c-=0x10000;
+            out[n++]=(uint16_t)(0xD800+(c>>10));
+            out[n++]=(uint16_t)(0xDC00+(c&1023));
+        } else {
+            out[n++]=(uint16_t)c;
+        }
     }
-    out[n<max ? n : max]=0;
+    out[n<max ? n : max-1]=0;
 }
 static void ime_complete(int end_status, const char *text) {
     if (!end_status && ime.buffer && ime.max_length) {

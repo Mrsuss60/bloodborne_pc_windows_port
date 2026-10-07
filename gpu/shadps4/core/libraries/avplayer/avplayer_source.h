@@ -48,12 +48,17 @@ public:
           m_data(is_texture ? AllocateTexture(memory_replacement, align, size)
                             : Allocate(memory_replacement, align, size)),
           m_size(size), m_is_texture(is_texture) {
-        ASSERT_MSG(m_data, "Could not allocate frame buffer.");
+        if (!m_data) {
+            m_data = reinterpret_cast<u8*>(std::malloc(size));
+            m_is_fallback = true;
+        }
     }
 
     ~GuestBuffer() {
         if (m_data != nullptr) {
-            if (m_is_texture) {
+            if (m_is_fallback) {
+                std::free(m_data);
+            } else if (m_is_texture) {
                 DeallocateTexture(m_memory_replacement, m_data);
             } else {
                 Deallocate(m_memory_replacement, m_data);
@@ -67,12 +72,15 @@ public:
 
     GuestBuffer(GuestBuffer&& r) noexcept
         : m_memory_replacement(r.m_memory_replacement), m_data(r.m_data), m_size(r.m_size),
-          m_is_texture(r.m_is_texture) {
+          m_is_texture(r.m_is_texture), m_is_fallback(r.m_is_fallback) {
         r.m_data = nullptr;
     };
 
     GuestBuffer& operator=(GuestBuffer&& r) noexcept {
         std::swap(m_data, r.m_data);
+        std::swap(m_size, r.m_size);
+        std::swap(m_is_texture, r.m_is_texture);
+        std::swap(m_is_fallback, r.m_is_fallback);
         return *this;
     }
 
@@ -86,28 +94,35 @@ public:
 
 private:
     static u8* Allocate(const AvPlayerMemAllocator& memory_replacement, u32 align, u32 size) {
+        if (!memory_replacement.allocate) return nullptr;
         return reinterpret_cast<u8*>(
             memory_replacement.allocate(memory_replacement.object_ptr, align, size));
     }
 
     static void Deallocate(const AvPlayerMemAllocator& memory_replacement, void* ptr) {
-        memory_replacement.deallocate(memory_replacement.object_ptr, ptr);
+        if (memory_replacement.deallocate && ptr) {
+            memory_replacement.deallocate(memory_replacement.object_ptr, ptr);
+        }
     }
 
     static u8* AllocateTexture(const AvPlayerMemAllocator& memory_replacement, u32 align,
                                u32 size) {
+        if (!memory_replacement.allocate_texture) return nullptr;
         return reinterpret_cast<u8*>(
             memory_replacement.allocate_texture(memory_replacement.object_ptr, align, size));
     }
 
     static void DeallocateTexture(const AvPlayerMemAllocator& memory_replacement, void* ptr) {
-        memory_replacement.deallocate_texture(memory_replacement.object_ptr, ptr);
+        if (memory_replacement.deallocate_texture && ptr) {
+            memory_replacement.deallocate_texture(memory_replacement.object_ptr, ptr);
+        }
     }
 
     const AvPlayerMemAllocator& m_memory_replacement;
     u8* m_data = nullptr;
     u64 m_size = 0;
     bool m_is_texture = false;
+    bool m_is_fallback = false;
 };
 
 struct Frame {

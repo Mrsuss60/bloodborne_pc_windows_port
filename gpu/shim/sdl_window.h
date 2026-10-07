@@ -34,6 +34,9 @@ public:
     void BeginTextInput(const std::string& initial, const std::string& prompt);
     /// 0 while typing, 1 confirmed (Enter), 2 cancelled (Escape); text is UTF-8.
     int PollTextInput(std::string& text);
+    bool IsTextInputActive() const { return text_active; }
+    std::string GetTextInputPrompt();
+    std::string GetTextInputValue();
 
 private:
     std::atomic<s32> width, height;

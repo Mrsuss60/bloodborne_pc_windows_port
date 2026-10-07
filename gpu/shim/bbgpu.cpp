@@ -403,3 +403,7 @@ extern "C" int bbgpu_text_input_poll(char* out, uint64_t size) {
     }
     return state;
 }
+
+extern "C" int bbgpu_text_input_is_active(void) {
+    return (g_window && g_window->IsTextInputActive()) ? 1 : 0;
+}

@@ -195,7 +195,13 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     host_lock(&lock);
     int slot=-1;
     for (int i=0;i<SLOTS;++i) {
-        if (slots[i].used && !strcmp(slots[i].host,host)) { host_unlock(&lock); return ERR_BAD_MOUNTED; }
+        if (slots[i].used && !strcmp(slots[i].host,host)) {
+            snprintf(result->point.data,sizeof(result->point.data),"/savedata%d",i);
+            result->required_blocks=0;
+            result->status=exists ? 0 : 1;
+            host_unlock(&lock);
+            return 0;
+        }
         if (!slots[i].used && slot<0) slot=i;
     }
     if (slot<0) { host_unlock(&lock); return ERR_MOUNT_FULL; }
@@ -250,11 +256,11 @@ static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const 
     if (slot<0) { host_unlock(&lock); return ERR_NOT_MOUNTED; }
     Param p; read_param(slots[slot].meta,&p);
     switch (type) {
-    case 0: if (size<sizeof(Param)) goto bad; memcpy(&p,buffer,sizeof(p)); break;     /* ALL */
-    case 1: if (size<sizeof(p.title)) goto bad; memcpy(p.title,buffer,size); break;
-    case 2: if (size<sizeof(p.subtitle)) goto bad; memcpy(p.subtitle,buffer,size); break;
-    case 3: if (size<sizeof(p.detail)) goto bad; memcpy(p.detail,buffer,size); break;
-    case 4: if (size<4) goto bad; memcpy(&p.user_param,buffer,4); break;
+    case 0: { size_t n = size < sizeof(Param) ? (size_t)size : sizeof(Param); memcpy(&p, buffer, n); break; }     /* ALL */
+    case 1: { size_t n = size < sizeof(p.title) ? (size_t)size : sizeof(p.title) - 1; memset(p.title, 0, sizeof(p.title)); memcpy(p.title, buffer, n); break; }
+    case 2: { size_t n = size < sizeof(p.subtitle) ? (size_t)size : sizeof(p.subtitle) - 1; memset(p.subtitle, 0, sizeof(p.subtitle)); memcpy(p.subtitle, buffer, n); break; }
+    case 3: { size_t n = size < sizeof(p.detail) ? (size_t)size : sizeof(p.detail) - 1; memset(p.detail, 0, sizeof(p.detail)); memcpy(p.detail, buffer, n); break; }
+    case 4: { if (size >= 4) memcpy(&p.user_param, buffer, 4); break; }
     default: goto bad;
     }
     write_param(slots[slot].meta,&p);
@@ -267,7 +273,7 @@ bad:
 
 static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
     if (!initialized) return ERR_NOT_INITIALIZED;
-    if (!icon || !icon->buffer) return ERR_PARAMETER;
+    if (!icon || !icon->buffer || !icon->data_size || IsBadReadPtr(icon->buffer, icon->data_size)) return ERR_PARAMETER;
     host_lock(&lock);
     int slot=slot_of(point);
     int32_t r=ERR_NOT_MOUNTED;

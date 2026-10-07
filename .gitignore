@@ -31,3 +31,4 @@ scratch/
 test_th.*
 .vscode/
 .idea/
+push_to_github.bat

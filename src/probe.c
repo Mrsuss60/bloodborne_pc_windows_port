@@ -883,9 +883,11 @@ static void write_crash_dump(EXCEPTION_POINTERS *ep, void *fault_addr, uintptr_t
     char crash_path[MAX_PATH];
     SYSTEMTIME st;
     GetLocalTime(&st);
+    CreateDirectoryA("out", NULL);
     snprintf(crash_path, sizeof(crash_path), "out/crash_%04d%02d%02d_%02d%02d%02d.log",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     FILE *f = fopen(crash_path, "w");
+    if (!f) f = fopen("crash.log", "w");
     if (!f) return;
 
     uintptr_t off = (rip >= (uintptr_t)image && rip < (uintptr_t)image + (image_size ? image_size : 0x20000000))
@@ -1002,7 +1004,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
         }
 
         unsigned char *ip = (unsigned char *)rip;
-        if (ip && ip[0] == 0x64) {
+        if (rip >= 0x10000 && !IsBadReadPtr((const void *)rip, 1) && ip[0] == 0x64) {
             void *tcb = runtime_thread_get_tcb();
             if (tcb) {
                 __asm__ __volatile__("wrfsbase %0" : : "r"(tcb));
@@ -1062,15 +1064,18 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
         veh_write(line);
         if (gpu_enabled) bbgpu_dump_guest_writes(ep);
         TerminateProcess(GetCurrentProcess(), 128 + 11);
-    } else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) {
+    } else if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_PRIV_INSTRUCTION ||
+               code == EXCEPTION_INT_DIVIDE_BY_ZERO || code == EXCEPTION_STACK_OVERFLOW ||
+               code == 0xC0000409 /* STATUS_STACK_BUFFER_OVERRUN */ ||
+               code == 0xC0000374 /* STATUS_HEAP_CORRUPTION */) {
         uintptr_t rip = ep->ContextRecord->Rip;
         write_crash_dump(ep, (void *)rip, rip, code);
         char line[512];
         if (rip - (uintptr_t)image < 0x10000000)
-            snprintf(line, sizeof(line), "Guest fault (signal 4) at guest offset 0x%llx, address %p\n",
-                     (unsigned long long)(rip - (uintptr_t)image), (void *)rip);
+            snprintf(line, sizeof(line), "Fatal exception 0x%08lx at guest offset 0x%llx, address %p\n",
+                     (unsigned long)code, (unsigned long long)(rip - (uintptr_t)image), (void *)rip);
         else
-            snprintf(line, sizeof(line), "Fault (signal 4) at RIP %p, address %p\n", (void *)rip, (void *)rip);
+            snprintf(line, sizeof(line), "Fatal exception 0x%08lx at RIP %p, address %p\n", (unsigned long)code, (void *)rip, (void *)rip);
         veh_write(line);
         TerminateProcess(GetCurrentProcess(), 128 + 4);
     }

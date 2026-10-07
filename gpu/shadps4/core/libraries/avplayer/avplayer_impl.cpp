@@ -11,28 +11,46 @@ void* PS4_SYSV_ABI AvPlayer::Allocate(void* handle, u32 alignment, u32 size) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return allocate(ptr, alignment, size);
+    void* res = allocate ? allocate(ptr, alignment, size) : nullptr;
+    if (!res && size) {
+        res = std::malloc(size);
+    }
+    return res;
 }
 
 void PS4_SYSV_ABI AvPlayer::Deallocate(void* handle, void* memory) {
+    if (!memory) return;
+    if (reinterpret_cast<uintptr_t>(memory) < 0x1000000000ULL) {
+        std::free(memory);
+        return;
+    }
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return deallocate(ptr, memory);
+    if (deallocate) deallocate(ptr, memory);
 }
 
 void* PS4_SYSV_ABI AvPlayer::AllocateTexture(void* handle, u32 alignment, u32 size) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return allocate(ptr, alignment, size);
+    void* res = allocate ? allocate(ptr, alignment, size) : nullptr;
+    if (!res && size) {
+        res = std::malloc(size);
+    }
+    return res;
 }
 
 void PS4_SYSV_ABI AvPlayer::DeallocateTexture(void* handle, void* memory) {
+    if (!memory) return;
+    if (reinterpret_cast<uintptr_t>(memory) < 0x1000000000ULL) {
+        std::free(memory);
+        return;
+    }
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return deallocate(ptr, memory);
+    if (deallocate) deallocate(ptr, memory);
 }
 
 int PS4_SYSV_ABI AvPlayer::OpenFile(void* handle, const char* filename) {

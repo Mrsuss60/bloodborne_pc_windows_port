@@ -72,6 +72,16 @@ int WindowSDL::PollTextInput(std::string& out) {
     return text_state;
 }
 
+std::string WindowSDL::GetTextInputPrompt() {
+    std::scoped_lock lock{text_mutex};
+    return text_prompt;
+}
+
+std::string WindowSDL::GetTextInputValue() {
+    std::scoped_lock lock{text_mutex};
+    return text;
+}
+
 void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
                                           : base_title;
