@@ -139,6 +139,13 @@ if "%live%"=="1" (
     echo Output %scaled_output%: scene %scaled_render%, direct memory %BB_DMEM_MB% MiB ^(live_resolution=1: live changes^)
 )
 
+REM Explicit launcher resolutions skip scaled_output above, but patches.py still adds
+REM Increased Graphics Heap Sizes above 1080p. Match that patch's direct-memory budget.
+set "render_pixels=0"
+if defined BB_RENDER_RES for /f "tokens=1,2 delims=xX" %%a in ("%BB_RENDER_RES%") do set /a "render_pixels=%%a*%%b" >nul 2>nul
+if %render_pixels% GTR 2073600 if not defined BB_DMEM_MB set "BB_DMEM_MB=9152"
+if %render_pixels% GTR 2073600 echo Render %BB_RENDER_RES%: direct memory %BB_DMEM_MB% MiB
+
 set "patches_dir=%BB_PATCHES_DIR%"
 if "%patches_dir%"=="" set "patches_dir=%BB_DATA_DIR%\patches"
 set "patches_config=%BB_PATCHES_CONFIG%"
