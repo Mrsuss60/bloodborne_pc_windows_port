@@ -119,6 +119,11 @@ echo Build complete: out\bbport.exe
 
 if "%~1"=="--test" (
     echo Running unit tests
+    gcc -std=c11 -O2 -g -Wall -Wextra -Werror -Isrc tests/test_win32_exception.c -o out/win32-exception-test.exe
+    if errorlevel 1 exit /b 1
+    out\win32-exception-test.exe
+    if errorlevel 1 exit /b 1
+
     set "SDL3_INC="
     if defined SDL3_DIR (
         set "SDL3_INC=-I%SDL3_DIR%/include"

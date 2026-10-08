@@ -13,6 +13,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <mmsystem.h>
+#include "win32_exception.h"
 #if defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
 #endif
@@ -1044,6 +1045,10 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
             runtime_fault_recover = NULL;
             RUNTIME_RECOVER_JUMP(*recover);
         }
+        /* Host window hooks (e.g. Fasoo DRM) use IsBadReadPtr during window
+         * creation. Its first-chance AV belongs to Windows' own SEH handler.
+         * Keep GPU page tracking and speculative guest recovery ahead of it. */
+        if (win_fault_is_read_probe(rip)) return EXCEPTION_CONTINUE_SEARCH;
         write_crash_dump(ep, fault_addr, rip, code);
         char line[512];
         if (rip - (uintptr_t)image < 0x10000000)
