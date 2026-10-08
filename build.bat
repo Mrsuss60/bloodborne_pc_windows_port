@@ -1,6 +1,31 @@
 @echo off
 setlocal
 
+set "CURRENT_DIR=%~dp0"
+if "%CURRENT_DIR:~-1%"=="\" set "CURRENT_DIR=%CURRENT_DIR:~0,-1%"
+
+rem Check if directory path is deep and could cause MAX_PATH errors (> 70 chars)
+rem If running directly from a deep path without a virtual root drive, mount and re-exec from X:
+if not "%BB_SUBST_ACTIVE%"=="1" (
+    set "BB_PATH_CHECK=%CURRENT_DIR%"
+    if defined CURRENT_DIR (
+        if "%CURRENT_DIR:~70,1%" neq "" (
+            subst X: /d >nul 2>nul
+            subst X: "%CURRENT_DIR%"
+            if not errorlevel 1 (
+                echo [INFO] Path length exceeds safe MAX_PATH threshold. Switching to virtual drive X:\
+                set "BB_SUBST_ACTIVE=1"
+                cd /d X:\
+                call X:\build.bat %*
+                set "BUILD_EXIT_CODE=%ERRORLEVEL%"
+                cd /d "%CURRENT_DIR%"
+                subst X: /d >nul 2>nul
+                exit /b %BUILD_EXIT_CODE%
+            )
+        )
+    )
+)
+
 cd /d "%~dp0"
 
 if not exist "out" mkdir out
