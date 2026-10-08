@@ -137,3 +137,4 @@ Special thanks to the original creators and open source projects that made this 
 - **Thealexbarney**: LibAtrac9 audio decoding library.
 - **ocornut**: Dear ImGui library for the in-game settings overlay.
 - **Community Patch Authors**: Kyo, Lance McDonald, illusion, emoose, auser1337, and contributors for the 60 FPS, camera, and engine patches.
+- **zackcage6**: testing and bug reporting.
