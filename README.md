@@ -67,7 +67,9 @@ git clone --recursive https://github.com/Mrsuss60/bloodborne_pc_windows_port.git
 cd bloodborne_pc_windows_port
 ```
 
-Ensure MinGW, CMake, and Ninja are accessible in your environment or PATH, then run:
+> **Windows Path Length Warning**: FidelityFX contains deeply nested shader files that can exceed Windows' default 260-character path limit (`MAX_PATH`). If your project folder is located deep in your directory structure, either enable long paths in Git via `git config --system core.longpaths true` (or clone close to a drive root like `C:\bbport`), or set up a mapped drive with `subst X: .`.
+
+Ensure MinGW, CMake, and Ninja are accessible in your environment or PATH (set `W64DEVKIT_DIR`, `SDL3_DIR`, `VULKAN_SDK` as needed), then run:
 ```cmd
 build.bat
 ```

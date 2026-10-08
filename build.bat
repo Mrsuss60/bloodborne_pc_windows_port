@@ -19,6 +19,19 @@ if exist "C:\Program Files\CMake\bin" (
     set "PATH=C:\Program Files\CMake\bin;%PATH%"
 )
 
+rem Ensure Git handles long paths on Windows without failing on FidelityFX headers
+git config --local core.longpaths true >nul 2>nul
+
+rem Automatically initialize and update submodules if missing
+if not exist "gpu\third_party\fsr-vulkan\CMakeLists.txt" (
+    echo Initializing submodules...
+    git submodule update --init --recursive
+    if errorlevel 1 (
+        echo Failed to update submodules. Please run: git submodule update --init --recursive
+        exit /b 1
+    )
+)
+
 if not exist "out\libatrac9.a" (
     echo Building LibAtrac9
     if not exist "out\atrac9" mkdir out\atrac9
@@ -29,7 +42,12 @@ if not exist "out\libatrac9.a" (
             exit /b 1
         )
     )
-    ar rcs out\libatrac9.a out\atrac9\*.o
+    pushd out\atrac9
+    del /f /q ..\libatrac9.a 2>nul
+    set "OBJS="
+    for %%o in (*.o) do call set "OBJS=%%OBJS%% %%o"
+    ar rcs ..\libatrac9.a %OBJS%
+    popd
     if errorlevel 1 (
         echo Failed to create out\libatrac9.a
         exit /b 1
