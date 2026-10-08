@@ -126,7 +126,10 @@ if "%~1"=="--test" (
     out\content-test.exe
     if errorlevel 1 exit /b 1
 
-    cmake --build out/gpu --target motion-history-test motion-shader-test ui-composition-test upscaler-support-test
+    cmake --build out/gpu --target shader-user-data-test motion-history-test motion-shader-test ui-composition-test upscaler-support-test
+    if errorlevel 1 exit /b 1
+
+    out\gpu\shader-user-data-test.exe
     if errorlevel 1 exit /b 1
 
     out\gpu\motion-history-test.exe
