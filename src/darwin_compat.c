@@ -21,6 +21,26 @@ void runtime_darwin_set_tcb(void *tcb) {
         fputs("STOP: pthread_setspecific failed\n", stderr); exit(21);
     }
 }
+uint64_t runtime_darwin_patch_tls_loads(unsigned char *code, size_t size) {
+    /* A segment prefix (0x64 FS, 0x65 GS), then these 8 bytes: mov rax, [disp32 0]. */
+    static const unsigned char load[] = {0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0};
+    const uint32_t disp = runtime_darwin_tls_slot() * 8;
+    uint64_t patched = 0;
+    if (size < 1 + sizeof(load)) return 0;
+    unsigned char *at = code, *last = code + size - (1 + sizeof(load));
+    while (at <= last) {
+        if ((at[0] == 0x65 || at[0] == 0x64) && !memcmp(at + 1, load, sizeof(load))) {
+            at[0] = 0x65;
+            memcpy(at + 5, &disp, 4);
+            ++patched;
+            at += 1 + sizeof(load);
+        } else {
+            ++at;
+        }
+    }
+    return patched;
+}
+
 #undef getrusage
 int darwin_getrusage(int who, struct rusage *r) {
     if (who != RUSAGE_THREAD) return getrusage(who, r);

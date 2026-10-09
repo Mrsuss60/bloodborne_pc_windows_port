@@ -336,10 +336,10 @@ static uint64_t run_tls_load(void) {
     if (!code) {
         code=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
         assert(code!=MAP_FAILED);
-        unsigned char load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0,0xc3}; /* ...; ret */
-        uint32_t disp=runtime_darwin_tls_slot()*8;
-        memcpy(load+5,&disp,4);
+        /* The eboot's original load, rewritten as the loader does. */
+        const unsigned char load[]={0x64,0x48,0x8b,0x04,0x25,0,0,0,0,0xc3}; /* ...; ret */
         memcpy(code,load,sizeof(load));
+        assert(runtime_darwin_patch_tls_loads(code,sizeof(load))==1 && code[0]==0x65);
         assert(!mprotect(code,4096,PROT_READ|PROT_EXEC));
     }
     return ((uint64_t (ABI *)(void))code)();
@@ -349,6 +349,35 @@ static void *tls_thread(void *out) {
     ((uint64_t *)out)[0]=run_tls_load();
     ((uint64_t *)out)[1]=(uint64_t)(uintptr_t)runtime_thread_get_tcb();
     return NULL;
+}
+/* The rewrite over an eboot-sized image: every load once, nothing else, in one pass. */
+static void darwin_tls_patch_scan(void) {
+    enum { SIZE=96*1024*1024, SITES=20000 };
+    unsigned char *code=calloc(SIZE,1);
+    assert(code);
+    static const unsigned char fs_load[]={0x64,0x48,0x8b,0x04,0x25,0,0,0,0};
+    static const unsigned char near_miss[]={0x64,0x48,0x8b,0x04,0x25,8,0,0,0}; /* fs:[8] */
+    for (uint32_t i=0;i<SITES;++i) {
+        unsigned char *at=code+(size_t)i*(SIZE/SITES);
+        memcpy(at,fs_load,sizeof(fs_load));
+        if (i%2) at[0]=0x65; /* already GS (link scripts) */
+        memcpy(at+16,near_miss,sizeof(near_miss));
+    }
+    struct timespec t0,t1;
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    uint64_t patched=runtime_darwin_patch_tls_loads(code,SIZE);
+    clock_gettime(CLOCK_MONOTONIC,&t1);
+    double seconds=(double)(t1.tv_sec-t0.tv_sec)+(double)(t1.tv_nsec-t0.tv_nsec)/1e9;
+    const uint32_t disp=runtime_darwin_tls_slot()*8;
+    for (uint32_t i=0;i<SITES;++i) {
+        const unsigned char *at=code+(size_t)i*(SIZE/SITES);
+        uint32_t got; memcpy(&got,at+5,4);
+        assert(at[0]==0x65 && got==disp);
+        assert(!memcmp(at+16,near_miss,sizeof(near_miss))); /* other displacements untouched */
+    }
+    printf("macOS thread pointer rewrite: %llu loads in 96 MiB, %.3f s\n",(unsigned long long)patched,seconds);
+    assert(patched==SITES && seconds<5.0);
+    free(code);
 }
 static void darwin_thread_pointer(void) {
     runtime_thread_current();
@@ -390,7 +419,8 @@ int main(int argc,char **argv) {
     rw_lifecycle(); rw_concurrency(); rw_timeouts();
 #ifdef __APPLE__
     darwin_thread_pointer();
-    puts("PASS: macOS guest thread pointer (TSD slot) on two threads");
+    darwin_tls_patch_scan();
+    puts("PASS: macOS guest thread pointer (TSD slot) on two threads, eboot-sized rewrite in one pass");
 #endif
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;

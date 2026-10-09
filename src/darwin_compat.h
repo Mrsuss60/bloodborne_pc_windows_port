@@ -140,5 +140,8 @@ int IsBadReadPtr(const void *address, size_t size);
  * rewrites the eboot's `mov rax, fs:[0]` to `mov rax, gs:[slot*8]` (darwin_compat.c). */
 unsigned runtime_darwin_tls_slot(void);
 void runtime_darwin_set_tcb(void *tcb);
+/* Rewrites every `mov rax, fs:[0]` / `mov rax, gs:[0]` in code to `mov rax, gs:[slot*8]` in
+ * one pass; returns how many. */
+uint64_t runtime_darwin_patch_tls_loads(unsigned char *code, size_t size);
 #endif
 #endif

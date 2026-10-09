@@ -1292,22 +1292,10 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
  * (Linux: GS base = guest TCB). macOS points GS at the pthread TSD array, so the
  * displacement becomes the TSD slot that holds the guest TCB (darwin_compat.c). */
 static void patch_tls_loads(const Segment *segments, uint64_t ns) {
-    static const unsigned char gs_load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
-    static const unsigned char fs_load[]={0x64,0x48,0x8b,0x04,0x25,0,0,0,0};
-    uint32_t disp=runtime_darwin_tls_slot()*8;
     uint64_t patched=0;
-    for (uint64_t i=0;i<ns;++i) {
-        if (!(segments[i].flags&1)) continue;
-        unsigned char *at=image+segments[i].address, *end=at+segments[i].size;
-        while (at+sizeof(gs_load)<=end) {
-            unsigned char *gs=memmem(at,(size_t)(end-at),gs_load,sizeof(gs_load));
-            unsigned char *fs=memmem(at,(size_t)(end-at),fs_load,sizeof(fs_load));
-            unsigned char *hit=!gs ? fs : !fs ? gs : gs<fs ? gs : fs;
-            if (!hit) break;
-            hit[0]=0x65; memcpy(hit+5,&disp,4);
-            ++patched; at=hit+sizeof(gs_load);
-        }
-    }
+    for (uint64_t i=0;i<ns;++i)
+        if (segments[i].flags&1) patched+=runtime_darwin_patch_tls_loads(image+segments[i].address,segments[i].size);
+    uint32_t disp=runtime_darwin_tls_slot()*8;
     printf("Thread pointer loads: %" PRIu64 " pointed at TSD slot %u\n",patched,(unsigned)(disp/8));
 }
 #endif
