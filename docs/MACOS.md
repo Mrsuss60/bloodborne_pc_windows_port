@@ -69,6 +69,22 @@ On the GPU side:
    next to `out/bb-probe`, or point the loader at the manifest:
    `export BB_MOLTENVK_ICD=/path/to/MoltenVK_icd.json` (`run.sh`; `VK_DRIVER_FILES` works too).
 
+## Launcher
+
+Double-click `launch_gui.command` in Finder (or run `python3 launcher.py`; Python 3.10+ with
+Tkinter, as in the python.org installer). It is the same launcher as on Windows, running
+`run.sh`; its **macOS Setup** box takes the vcpkg folder and `MoltenVK_icd.json` (filled in when
+they sit next to this repository, as in the steps above). **Verify Setup** checks Rosetta 2,
+the dependencies, MoltenVK (it asks the GPU through Vulkan) and the game folder (CUSA03173 with
+update 1.09). The first launch builds `bb-probe`.
+
+From a terminal instead:
+
+```bash
+BB_GAME_DIR=~/Games/CUSA03173 VCPKG_ROOT=~/Documents/GitHub/vcpkg \
+BB_MOLTENVK_ICD=/path/to/MoltenVK_icd.json bash run.sh
+```
+
 ## Build and test
 
 ```bash
