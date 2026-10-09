@@ -249,6 +249,11 @@ target_compile_options(shader-user-data-test PRIVATE -UNDEBUG)
 target_include_directories(shader-user-data-test PRIVATE shim shadps4 third_party/gcn/include)
 target_link_libraries(shader-user-data-test PRIVATE fmt::fmt Boost::headers)
 
+add_executable(arena-span-test EXCLUDE_FROM_ALL ../tests/test_arena_span.cpp)
+target_compile_options(arena-span-test PRIVATE -UNDEBUG)
+target_include_directories(arena-span-test PRIVATE shadps4)
+target_link_libraries(arena-span-test PRIVATE Boost::headers)
+
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(motion-history-test PRIVATE ..)

@@ -45,7 +45,8 @@ On the GPU side:
   arenas elsewhere. Here the arenas are dense buffers of `BB_ARENA_MB` (256 MiB by default;
   Metal commits a buffer whole on its first GPU use, so 4 GiB arenas would cost 4 GiB each).
   A binding that spans several arenas merges them into one (contents copied, the old ones
-  destroyed once the GPU is past them); `launcher.log` shows `GPU: merged … buffer arenas`.
+  destroyed once the GPU is past them; `arena-span-test` covers which arenas merge);
+  `launcher.log` shows `GPU: merged … buffer arenas`. With little memory, `BB_ARENA_MB=64`.
 - **`robustBufferAccess2`/`robustImageAccess2`** are enabled only where the driver has them
   (MoltenVK has no `robustBufferAccess2`; Metal bounds accesses itself).
 - **Portability**: the instance enables `VK_KHR_portability_enumeration`, the device
@@ -103,7 +104,7 @@ bash build.sh --test
 VK_DRIVER_FILES=/path/to/MoltenVK_icd.json out/bb-probe --vulkan-only
 ninja -C out/gpu shader-user-data-test motion-history-test ui-composition-test \
     upscaler-support-test motion-shader-test scene-resolution-test taa-shader-test \
-    camera-motion-test null-resources-test
+    camera-motion-test null-resources-test arena-span-test
 ninja -C out/gpu window-test && (cd out/gpu && ./window-test)   # opens a window for 3 s
 ```
 

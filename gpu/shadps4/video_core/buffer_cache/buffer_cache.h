@@ -129,7 +129,8 @@ private:
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
     /// bbport: GetArena without sparse residency: dense arenas, merged (contents copied) when a
-    /// request spans several of them; the replaced ones are destroyed once the GPU is past them.
+    /// request spans several of them (arena_span.h); the replaced ones are destroyed once the GPU
+    /// is past the work recorded so far.
     const Buffer* GetDenseArena(u64 first_block, u64 last_block);
 
     /// bbport: writes the BDA page table entries of resident blocks in [first_block, end_block)
@@ -176,10 +177,7 @@ private:
     std::unique_ptr<Buffer> bda_pagetable_buffer;
 
     std::vector<const Buffer*> address_space;
-    std::list<Buffer> arenas;
-    /// bbport: dense arenas replaced by a merge, with the GPU tick after which they are unused.
-    std::list<Buffer> retired_arenas;
-    std::deque<u64> retired_ticks;
+    std::list<Buffer> arenas; ///< bbport: a list, so merged dense arenas can be released
     bool dense_arenas{};
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;

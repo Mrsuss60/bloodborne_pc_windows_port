@@ -15,6 +15,7 @@
 #include "common/alignment.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/buffer_cache/arena_span.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -466,50 +467,42 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
-    u64 first_page = first_block >> blocks_per_arena_page_shift;
-    u64 last_page = last_block >> blocks_per_arena_page_shift;
+    const u64 first_page = first_block >> blocks_per_arena_page_shift;
+    const u64 last_page = last_block >> blocks_per_arena_page_shift;
     if (const auto* arena = address_space[first_page]; arena && arena == address_space[last_page]) {
         return arena; // arenas cover contiguous page spans
     }
-    // Replaced arenas still referenced by recorded or pipelined work are destroyed later.
-    while (!retired_ticks.empty() && scheduler.IsFree(retired_ticks.front())) {
-        retired_arenas.pop_front();
-        retired_ticks.pop_front();
+    const auto span = ComputeArenaSpan<Buffer>(address_space, first_page, last_page, arena_page_bits);
+    const VAddr base = span.first_page << arena_page_bits;
+    const u64 size = (span.last_page - span.first_page + 1) << arena_page_bits;
+    if (size > instance.GetMaxBufferSize()) {
+        std::printf("GPU: buffer request at %#llx needs a %llu MiB arena at %#llx\n",
+                    static_cast<unsigned long long>(first_block << block_shift),
+                    static_cast<unsigned long long>(size >> 20),
+                    static_cast<unsigned long long>(base));
     }
-    // The span grows to whole arenas it touches; arenas never overlap one another.
-    boost::container::small_vector<const Buffer*, 4> merged;
-    for (u64 page = first_page; page <= last_page; ++page) {
-        const auto* arena = address_space[page];
-        if (!arena || (!merged.empty() && merged.back() == arena)) {
-            continue;
-        }
-        merged.push_back(arena);
-        first_page = std::min<u64>(first_page, arena->cpu_addr >> arena_page_bits);
-        last_page = std::max<u64>(last_page, (arena->cpu_addr + arena->size_bytes - 1) >> arena_page_bits);
-    }
-    const VAddr base = first_page << arena_page_bits;
-    const u64 size = (last_page - first_page + 1) << arena_page_bits;
     ASSERT_MSG(size <= instance.GetMaxBufferSize(),
                "Dense arena of {:#x} bytes at {:#x} exceeds the device's buffer size", size, base);
     auto* arena = &arenas.emplace_back(instance, base, size, MemoryType::DeviceLocal);
-    if (!merged.empty()) {
-        std::printf("GPU: merged %zu buffer arenas into %#llx + %llu MiB\n", merged.size(),
+    if (!span.merged.empty()) {
+        std::printf("GPU: merged %zu buffer arenas into %#llx + %llu MiB\n", span.merged.size(),
                     static_cast<unsigned long long>(base),
                     static_cast<unsigned long long>(size >> 20));
-        for (const auto* old : merged) {
+        for (const auto* old : span.merged) {
             const vk::BufferCopy whole{0, old->cpu_addr - base, old->size_bytes};
             runtime.CopyBuffer(old, arena, std::span{&whole, 1});
         }
         WritePageTable(arena, base >> block_shift, (base + size) >> block_shift);
-        // Recording may run behind (the draw pipeline's second stage): keep two more ticks.
-        const u64 retire_tick = scheduler.CurrentTick() + 2;
-        for (const auto* old : merged) {
+        // The replaced arenas go once the GPU is past the work recorded so far (as images do).
+        std::list<Buffer> replaced;
+        for (const auto* old : span.merged) {
             const auto it = std::ranges::find_if(arenas, [old](const Buffer& b) { return &b == old; });
-            retired_arenas.splice(retired_arenas.end(), arenas, it);
-            retired_ticks.push_back(retire_tick);
+            replaced.splice(replaced.end(), arenas, it);
         }
+        scheduler.DeferOperation([replaced = std::move(replaced)] {});
     }
-    std::fill(address_space.begin() + first_page, address_space.begin() + last_page + 1, arena);
+    std::fill(address_space.begin() + span.first_page, address_space.begin() + span.last_page + 1,
+              arena);
     return arena;
 }
 
