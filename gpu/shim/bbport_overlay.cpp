@@ -89,7 +89,7 @@ uint64_t last_idle_time = 0;
 uint64_t last_kernel_time = 0;
 uint64_t last_user_time = 0;
 
-// Dynamic NVML loader for GPU utilization telemetry
+// Dynamic NVML loader for NVIDIA GPU utilization
 struct NvmlUtilizationRates {
     unsigned int gpu;
     unsigned int memory;
@@ -104,23 +104,74 @@ static NvmlDeviceGetUtilizationRates_t g_nvml_get_util = nullptr;
 static void* g_nvml_device = nullptr;
 static bool g_nvml_initialized = false;
 
+// Dynamic PDH loader for AMD / Intel / universal GPU 3D engine utilization
+struct PDH_ITEM_W {
+    const wchar_t* szName;
+    uint32_t CStatus;
+    uint32_t dummy;
+    double doubleValue;
+};
+typedef long (*PdhOpenQueryW_t)(const wchar_t*, uintptr_t, void**);
+typedef long (*PdhAddEnglishCounterW_t)(void*, const wchar_t*, uintptr_t, void**);
+typedef long (*PdhCollectQueryData_t)(void*);
+typedef long (*PdhGetFormattedCounterArrayW_t)(void*, uint32_t, uint32_t*, uint32_t*, void*);
+typedef long (*PdhCloseQuery_t)(void*);
+
+static HMODULE g_pdh_lib = nullptr;
+static PdhOpenQueryW_t g_pdh_open = nullptr;
+static PdhAddEnglishCounterW_t g_pdh_add = nullptr;
+static PdhCollectQueryData_t g_pdh_collect = nullptr;
+static PdhGetFormattedCounterArrayW_t g_pdh_get_array = nullptr;
+static PdhCloseQuery_t g_pdh_close = nullptr;
+static void* g_pdh_query = nullptr;
+static void* g_pdh_counter = nullptr;
+static bool g_pdh_initialized = false;
+static std::vector<char> g_pdh_buffer;
+
 void InitGpuTelemetry() {
     if (g_nvml_initialized) return;
     g_nvml_initialized = true;
+
+    // 1. Try NVIDIA Management Library (NVML)
     g_nvml_lib = LoadLibraryA("nvml.dll");
-    if (!g_nvml_lib) return;
-    auto nvml_init = reinterpret_cast<NvmlInit_t>(GetProcAddress(g_nvml_lib, "nvmlInit_v2"));
-    if (!nvml_init) {
-        nvml_init = reinterpret_cast<NvmlInit_t>(GetProcAddress(g_nvml_lib, "nvmlInit"));
+    if (g_nvml_lib) {
+        auto nvml_init = reinterpret_cast<NvmlInit_t>(GetProcAddress(g_nvml_lib, "nvmlInit_v2"));
+        if (!nvml_init) {
+            nvml_init = reinterpret_cast<NvmlInit_t>(GetProcAddress(g_nvml_lib, "nvmlInit"));
+        }
+        if (nvml_init && nvml_init() == 0) {
+            auto nvml_get_handle = reinterpret_cast<NvmlDeviceGetHandleByIndex_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetHandleByIndex_v2"));
+            if (!nvml_get_handle) {
+                nvml_get_handle = reinterpret_cast<NvmlDeviceGetHandleByIndex_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetHandleByIndex"));
+            }
+            g_nvml_get_util = reinterpret_cast<NvmlDeviceGetUtilizationRates_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetUtilizationRates"));
+            if (nvml_get_handle && g_nvml_get_util) {
+                nvml_get_handle(0, &g_nvml_device);
+                if (g_nvml_device) return; // NVML ready
+            }
+        }
     }
-    if (!nvml_init || nvml_init() != 0) return;
-    auto nvml_get_handle = reinterpret_cast<NvmlDeviceGetHandleByIndex_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetHandleByIndex_v2"));
-    if (!nvml_get_handle) {
-        nvml_get_handle = reinterpret_cast<NvmlDeviceGetHandleByIndex_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetHandleByIndex"));
-    }
-    g_nvml_get_util = reinterpret_cast<NvmlDeviceGetUtilizationRates_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetUtilizationRates"));
-    if (nvml_get_handle && g_nvml_get_util) {
-        nvml_get_handle(0, &g_nvml_device);
+
+    // 2. Fallback to Windows PDH (AMD Radeon, Intel Arc, or generic)
+    if (!g_pdh_initialized) {
+        g_pdh_initialized = true;
+        g_pdh_lib = LoadLibraryA("pdh.dll");
+        if (g_pdh_lib) {
+            g_pdh_open = reinterpret_cast<PdhOpenQueryW_t>(GetProcAddress(g_pdh_lib, "PdhOpenQueryW"));
+            g_pdh_add = reinterpret_cast<PdhAddEnglishCounterW_t>(GetProcAddress(g_pdh_lib, "PdhAddEnglishCounterW"));
+            g_pdh_collect = reinterpret_cast<PdhCollectQueryData_t>(GetProcAddress(g_pdh_lib, "PdhCollectQueryData"));
+            g_pdh_get_array = reinterpret_cast<PdhGetFormattedCounterArrayW_t>(GetProcAddress(g_pdh_lib, "PdhGetFormattedCounterArrayW"));
+            g_pdh_close = reinterpret_cast<PdhCloseQuery_t>(GetProcAddress(g_pdh_lib, "PdhCloseQuery"));
+            if (g_pdh_open && g_pdh_add && g_pdh_collect && g_pdh_get_array) {
+                if (g_pdh_open(nullptr, 0, &g_pdh_query) == 0 && g_pdh_query) {
+                    if (g_pdh_add(g_pdh_query, L"\\GPU Engine(*engtype_3D)\\Utilization Percentage", 0, &g_pdh_counter) == 0) {
+                        g_pdh_collect(g_pdh_query);
+                    } else if (g_pdh_add(g_pdh_query, L"\\GPU Engine(*engtype_3d)\\Utilization Percentage", 0, &g_pdh_counter) == 0) {
+                        g_pdh_collect(g_pdh_query);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -128,10 +179,35 @@ void QueryGpuTelemetry() {
     if (!g_nvml_initialized) {
         InitGpuTelemetry();
     }
+    // NVIDIA NVML path
     if (g_nvml_device && g_nvml_get_util) {
         NvmlUtilizationRates rates{};
         if (g_nvml_get_util(g_nvml_device, &rates) == 0) {
             cached_gpu_usage = float(rates.gpu);
+            return;
+        }
+    }
+    // AMD / Intel PDH fallback path
+    if (g_pdh_query && g_pdh_counter && g_pdh_collect && g_pdh_get_array) {
+        if (g_pdh_collect(g_pdh_query) == 0) {
+            uint32_t buf_size = 0;
+            uint32_t item_count = 0;
+            g_pdh_get_array(g_pdh_counter, 0x00000200 /* PDH_FMT_DOUBLE */, &buf_size, &item_count, nullptr);
+            if (buf_size > 0) {
+                if (g_pdh_buffer.size() < buf_size) {
+                    g_pdh_buffer.resize(buf_size);
+                }
+                if (g_pdh_get_array(g_pdh_counter, 0x00000200, &buf_size, &item_count, g_pdh_buffer.data()) == 0) {
+                    auto* items = reinterpret_cast<PDH_ITEM_W*>(g_pdh_buffer.data());
+                    double total_gpu = 0.0;
+                    for (uint32_t i = 0; i < item_count; ++i) {
+                        if (items[i].CStatus == 0 && items[i].doubleValue > 0.0) {
+                            total_gpu += items[i].doubleValue;
+                        }
+                    }
+                    cached_gpu_usage = std::clamp(float(total_gpu), 0.0f, 100.0f);
+                }
+            }
         }
     }
 }
