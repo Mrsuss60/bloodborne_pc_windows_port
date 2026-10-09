@@ -1342,6 +1342,51 @@ void runtime_restart(void) {
 #endif
 }
 
+/* The guest's start: module initializers in link order, then the eboot's entry on a stack
+ * below 1 TiB. The thread running it is the guest main thread. */
+typedef struct {
+    int native_libc;
+    const Segment *segments;
+    uint64_t ns, main_tls[4], procparam, nb, entry;
+} GuestStart;
+static void *run_guest(void *argument) {
+    const GuestStart *g=argument;
+    const Segment *segments=g->segments;
+    uint64_t ns=g->ns, procparam=g->procparam, nb=g->nb, entry=g->entry;
+    const uint64_t *main_tls=g->main_tls;
+    if (g->native_libc) {
+        for (uint64_t m=0;m<module_count;++m) {
+            int init_executable=0;
+            for (uint64_t i=0;i<ns;++i)
+                if ((segments[i].flags&1) && modules[m].init>=segments[i].address && modules[m].init-segments[i].address<segments[i].size) init_executable=1;
+            if (!init_executable) fail("module init is not executable");
+            if (modules[m].tls_module)
+                runtime_set_module_tls(modules[m].tls_module,image+modules[m].tls_address,modules[m].tls_filesz,modules[m].tls_memsz);
+        }
+        runtime_set_main_tls(image+main_tls[0],main_tls[1],main_tls[2],main_tls[3]);
+        runtime_thread_attach_main();
+        runtime_set_procparam(image+procparam);
+        /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
+        for (uint64_t m=0;m<module_count;++m) {
+            printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,nb);
+            typedef int (ABI *ModuleInit)(uint64_t,void *,void *);
+            int result=((ModuleInit)(image+modules[m].init))(0,NULL,NULL);
+            printf("Module %" PRIu64 " initializer returned %d\n",m,result);
+            if (result) fail("module initializer failed");
+        }
+    }
+    printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
+    entered_game=1;
+    struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
+    /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
+    enum { MAIN_STACK=8*1024*1024 };
+    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
+    if (!stack) fail("cannot allocate guest main stack");
+    start_watchdog();
+    enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
+    fail("entry unexpectedly returned");
+    return NULL;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef _WIN32
@@ -1636,35 +1681,22 @@ int main(int argc, char **argv) {
     }
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
-    if (native_libc) {
-        for (uint64_t m=0;m<module_count;++m) {
-            int init_executable=0;
-            for (uint64_t i=0;i<ns;++i)
-                if ((segments[i].flags&1) && modules[m].init>=segments[i].address && modules[m].init-segments[i].address<segments[i].size) init_executable=1;
-            if (!init_executable) fail("module init is not executable");
-            if (modules[m].tls_module)
-                runtime_set_module_tls(modules[m].tls_module,image+modules[m].tls_address,modules[m].tls_filesz,modules[m].tls_memsz);
-        }
-        runtime_set_main_tls(image+main_tls[0],main_tls[1],main_tls[2],main_tls[3]);
-        runtime_thread_attach_main();
-        runtime_set_procparam(image+procparam);
-        /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
-        for (uint64_t m=0;m<module_count;++m) {
-            printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,nb);
-            typedef int (ABI *ModuleInit)(uint64_t,void *,void *);
-            int result=((ModuleInit)(image+modules[m].init))(0,NULL,NULL);
-            printf("Module %" PRIu64 " initializer returned %d\n",m,result);
-            if (result) fail("module initializer failed");
-        }
+    static GuestStart start;
+    start=(GuestStart){native_libc,segments,ns,{main_tls[0],main_tls[1],main_tls[2],main_tls[3]},procparam,nb,entry};
+#ifdef __APPLE__
+    if (gpu_enabled) {
+        /* Cocoa runs windows on the process's main thread only: the window takes it over
+         * (bbgpu_run_window_loop) and the guest main thread is a thread of its own. */
+        pthread_attr_t attr;
+        pthread_t guest;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr,16*1024*1024);
+        if (pthread_create(&guest,&attr,run_guest,&start)) fail("cannot start the guest main thread");
+        pthread_attr_destroy(&attr);
+        bbgpu_run_window_loop();
+        fail("window loop unexpectedly returned");
     }
-    printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
-    entered_game=1;
-    struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
-    /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
-    enum { MAIN_STACK=8*1024*1024 };
-    unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
-    if (!stack) fail("cannot allocate guest main stack");
-    start_watchdog();
-    enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
-    fail("entry unexpectedly returned");
+#endif
+    run_guest(&start);
+    return 1;
 }

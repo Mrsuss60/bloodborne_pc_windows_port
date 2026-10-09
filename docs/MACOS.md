@@ -25,6 +25,12 @@ Rosetta executes AVX/AVX2; `run.sh` sets `ROSETTA_ADVERTISE_AVX=1` so CPUID repo
 The other Darwin shims (clocks, timed locks, per-thread rusage, barriers) are in
 `src/darwin_compat.h`.
 
+**Threads**: Cocoa runs windows on the process's main thread only. On Linux and Windows the
+game runs on the main thread and the window on a thread of its own; on macOS the loader starts
+the game on a thread of its own (`run_guest`) and the main thread keeps the window: `bbgpu_init`
+creates it there, as a Metal view (SDL needs no Vulkan support), and `bbgpu_run_window_loop`
+runs its events.
+
 On the GPU side:
 
 - **No `nullDescriptor` on MoltenVK.** `NullResources` (`vk_null_resources.h`) stand in: a
@@ -93,6 +99,7 @@ VK_DRIVER_FILES=/path/to/MoltenVK_icd.json out/bb-probe --vulkan-only
 ninja -C out/gpu shader-user-data-test motion-history-test ui-composition-test \
     upscaler-support-test motion-shader-test scene-resolution-test taa-shader-test \
     camera-motion-test null-resources-test
+ninja -C out/gpu window-test && (cd out/gpu && ./window-test)   # opens a window for 3 s
 ```
 
 Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):

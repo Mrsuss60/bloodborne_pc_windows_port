@@ -301,6 +301,16 @@ if (APPLE)
     foreach(test IN ITEMS scene-resolution-test taa-shader-test camera-motion-test null-resources-test)
         target_link_libraries(${test} PRIVATE Vulkan::Vulkan)
     endforeach()
+    # libbbgpu resolves the runtime stubs in these executables at load time; with LTO the
+    # linker would hide them unless they are exported explicitly.
+    # Window on the main thread (Cocoa), with the device, presenter and swapchain.
+    add_executable(window-test EXCLUDE_FROM_ALL ../tests/test_window.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(window-test PRIVATE .. shim shadps4 third_party/gcn/include)
+    target_link_libraries(window-test PRIVATE bbgpu)
+    foreach(test IN ITEMS motion-shader-test scene-resolution-test taa-shader-test camera-motion-test
+                          null-resources-test window-test)
+        target_link_options(${test} PRIVATE -Wl,-export_dynamic)
+    endforeach()
 endif()
 
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.

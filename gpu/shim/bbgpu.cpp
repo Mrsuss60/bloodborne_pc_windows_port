@@ -221,6 +221,11 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
+#ifdef __APPLE__
+    // Cocoa: the window on the main thread (this one); bbgpu_run_window_loop runs its events.
+    g_window = new Frontend::WindowSDL(width, height, title.c_str());
+    g_window_ready = true;
+#else
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());
@@ -242,12 +247,25 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         std::unique_lock lock{g_window_mutex};
         g_window_cv.wait(lock, [] { return g_window_ready; });
     }
+#endif
     Core::Loader::SymbolsResolver resolver;
     // GnmDriver creates the presenter that the VideoOut present thread uses.
     Libraries::GnmDriver::RegisterLib(&resolver);
     Libraries::VideoOut::RegisterLib(&resolver);
     return 0;
 }
+
+#ifdef __APPLE__
+extern "C" void bbgpu_run_window_loop(void) {
+    Common::SetCurrentThreadName("bb:window");
+    while (g_window->PollEvents()) {
+        SDL_Delay(2);
+    }
+    LOG_INFO(Frontend, "Window closed by user");
+    std::fflush(stdout);
+    std::_Exit(0);
+}
+#endif
 
 namespace Libraries::Kernel { void StartKernelService(); }
 extern "C" void bbgpu_register_kernel(void) {
