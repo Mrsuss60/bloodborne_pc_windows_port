@@ -9,7 +9,18 @@
 #include <mutex>
 
 #include <SDL3/SDL.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+#include <vk_mem_alloc.h>
 #include "bbport_settings.h"
+#include "bbport_toggles.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -56,9 +67,112 @@ bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
 float base_scale = 1.0f;
 
-// Present rate for the FPS counter.
+// Present rate for the FPS counter and HUD telemetry.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+VmaAllocator g_vma_allocator = nullptr;
+
+// Real-time frametime variance history buffer
+constexpr int FrametimeHistorySize = 120;
+float frametime_history[FrametimeHistorySize] = {};
+int frametime_history_idx = 0;
+
+// Host system CPU, RAM, and GPU telemetry
+float cached_cpu_usage = 0.0f;
+float cached_gpu_usage = -1.0f;
+float cached_ram_used_gb = 0.0f;
+float cached_ram_total_gb = 0.0f;
+std::chrono::steady_clock::time_point last_sys_query{};
+
+#ifdef _WIN32
+uint64_t last_idle_time = 0;
+uint64_t last_kernel_time = 0;
+uint64_t last_user_time = 0;
+
+// Dynamic NVML loader for GPU utilization telemetry
+struct NvmlUtilizationRates {
+    unsigned int gpu;
+    unsigned int memory;
+};
+typedef int (*NvmlInit_t)();
+typedef int (*NvmlShutdown_t)();
+typedef int (*NvmlDeviceGetHandleByIndex_t)(unsigned int, void**);
+typedef int (*NvmlDeviceGetUtilizationRates_t)(void*, NvmlUtilizationRates*);
+
+static HMODULE g_nvml_lib = nullptr;
+static NvmlDeviceGetUtilizationRates_t g_nvml_get_util = nullptr;
+static void* g_nvml_device = nullptr;
+static bool g_nvml_initialized = false;
+
+void InitGpuTelemetry() {
+    if (g_nvml_initialized) return;
+    g_nvml_initialized = true;
+    g_nvml_lib = LoadLibraryA("nvml.dll");
+    if (!g_nvml_lib) return;
+    auto nvml_init = reinterpret_cast<NvmlInit_t>(GetProcAddress(g_nvml_lib, "nvmlInit_v2"));
+    if (!nvml_init) {
+        nvml_init = reinterpret_cast<NvmlInit_t>(GetProcAddress(g_nvml_lib, "nvmlInit"));
+    }
+    if (!nvml_init || nvml_init() != 0) return;
+    auto nvml_get_handle = reinterpret_cast<NvmlDeviceGetHandleByIndex_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetHandleByIndex_v2"));
+    if (!nvml_get_handle) {
+        nvml_get_handle = reinterpret_cast<NvmlDeviceGetHandleByIndex_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetHandleByIndex"));
+    }
+    g_nvml_get_util = reinterpret_cast<NvmlDeviceGetUtilizationRates_t>(GetProcAddress(g_nvml_lib, "nvmlDeviceGetUtilizationRates"));
+    if (nvml_get_handle && g_nvml_get_util) {
+        nvml_get_handle(0, &g_nvml_device);
+    }
+}
+
+void QueryGpuTelemetry() {
+    if (!g_nvml_initialized) {
+        InitGpuTelemetry();
+    }
+    if (g_nvml_device && g_nvml_get_util) {
+        NvmlUtilizationRates rates{};
+        if (g_nvml_get_util(g_nvml_device, &rates) == 0) {
+            cached_gpu_usage = float(rates.gpu);
+        }
+    }
+}
+#endif
+
+void UpdateSystemTelemetry() {
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<float>(now - last_sys_query).count() < 0.5f) {
+        return;
+    }
+    last_sys_query = now;
+#ifdef _WIN32
+    QueryGpuTelemetry();
+    FILETIME idle, kernel, user;
+    if (GetSystemTimes(&idle, &kernel, &user)) {
+        ULARGE_INTEGER i, k, u;
+        i.LowPart = idle.dwLowDateTime; i.HighPart = idle.dwHighDateTime;
+        k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+        u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+        if (last_kernel_time != 0 && last_user_time != 0) {
+            uint64_t diff_idle = i.QuadPart - last_idle_time;
+            uint64_t diff_kernel = k.QuadPart - last_kernel_time;
+            uint64_t diff_user = u.QuadPart - last_user_time;
+            uint64_t total_sys = diff_kernel + diff_user;
+            if (total_sys > 0) {
+                float busy = total_sys > diff_idle ? float(total_sys - diff_idle) : 0.0f;
+                cached_cpu_usage = std::clamp((busy / float(total_sys)) * 100.0f, 0.0f, 100.0f);
+            }
+        }
+        last_idle_time = i.QuadPart;
+        last_kernel_time = k.QuadPart;
+        last_user_time = u.QuadPart;
+    }
+    MEMORYSTATUSEX mem;
+    mem.dwLength = sizeof(mem);
+    if (GlobalMemoryStatusEx(&mem)) {
+        cached_ram_total_gb = float(mem.ullTotalPhys) / (1024.0f * 1024.0f * 1024.0f);
+        cached_ram_used_gb = float(mem.ullTotalPhys - mem.ullAvailPhys) / (1024.0f * 1024.0f * 1024.0f);
+    }
+#endif
+}
 
 void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
@@ -379,6 +493,22 @@ void Menu() {
 
     ImGui::SeparatorText("Прочее");
     Checkbox("Счётчик FPS в углу", s.show_fps);
+    Checkbox("Нативный оверлей производительности (HUD)", s.show_hud);
+    Hint("Внутриигровой оверлей телеметрии (F11 / Shift+Tab): FPS, график фреймтайма, VRAM, CPU, RAM и метрики рендера");
+    if (s.show_hud) {
+        static const char* quadrants[] = {"Сверху слева", "Сверху справа", "Снизу слева", "Снизу справа"};
+        int quad = s.hud_quadrant.load();
+        if (ImGui::BeginCombo("Расположение HUD", quadrants[quad])) {
+            for (int q = 0; q < BbSettings::HudQuadrantCount; ++q) {
+                if (ImGui::Selectable(quadrants[q], q == quad)) {
+                    Store(s.hud_quadrant, q, true);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        Slider("Прозрачность HUD", s.hud_opacity, 0.1f, 1.0f);
+        Slider("Масштаб HUD", s.hud_scale, 0.5f, 2.0f);
+    }
 
     ImGui::Spacing();
     if (ImGui::Button("Закрыть")) {
@@ -412,6 +542,108 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
                                                          : "");
     ImGui::End();
+}
+
+void HudOverlay() {
+    const auto& s = BbSettings::Get();
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 14.0f * base_scale;
+    const float hud_scale_val = std::clamp(s.hud_scale.load(), 0.5f, 2.5f);
+    const float alpha = std::clamp(s.hud_opacity.load(), 0.1f, 1.0f);
+
+    ImVec2 pos, pivot;
+    switch (s.hud_quadrant.load()) {
+    case BbSettings::HudTopLeft:
+        pos = ImVec2(viewport->WorkPos.x + pad, viewport->WorkPos.y + pad);
+        pivot = ImVec2(0.0f, 0.0f);
+        break;
+    case BbSettings::HudTopRight:
+        pos = ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, viewport->WorkPos.y + pad);
+        pivot = ImVec2(1.0f, 0.0f);
+        break;
+    case BbSettings::HudBottomLeft:
+        pos = ImVec2(viewport->WorkPos.x + pad, viewport->WorkPos.y + viewport->WorkSize.y - pad);
+        pivot = ImVec2(0.0f, 1.0f);
+        break;
+    case BbSettings::HudBottomRight:
+    default:
+        pos = ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad,
+                     viewport->WorkPos.y + viewport->WorkSize.y - pad);
+        pivot = ImVec2(1.0f, 1.0f);
+        break;
+    }
+
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, pivot);
+    ImGui::SetNextWindowBgAlpha(alpha);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                                   ImGuiWindowFlags_AlwaysAutoResize |
+                                   ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoFocusOnAppearing |
+                                   ImGuiWindowFlags_NoNav;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f * base_scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * base_scale * hud_scale_val, 8.0f * base_scale * hud_scale_val));
+
+    if (ImGui::Begin("##bb_hud", nullptr, flags)) {
+        // Update host telemetry (CPU, RAM)
+        UpdateSystemTelemetry();
+
+        // 1. Performance: FPS & Frametime
+        const float cur_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
+        const char* upscaler_label = s.upscaler == BbSettings::UpscalerFsr3   ? " [FSR 3.1]"
+                                   : s.upscaler == BbSettings::UpscalerFsr4 ? " [FSR 4]"
+                                   : s.upscaler == BbSettings::UpscalerFsr411 ? " [FSR 4.1.1]"
+                                   : s.upscaler == BbSettings::UpscalerTaa ? " [TAA]"
+                                   : "";
+
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "FPS: %.1f", cur_fps);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "(%.2f ms)%s", frame_ms_avg, upscaler_label);
+
+        // Frametime variance graph
+        char overlay_text[32];
+        std::snprintf(overlay_text, sizeof(overlay_text), "%.1f ms", frame_ms_avg);
+        ImGui::PlotLines("##frametime_plot", frametime_history, FrametimeHistorySize,
+                         frametime_history_idx, overlay_text, 0.0f, 50.0f,
+                         ImVec2(190.0f * base_scale * hud_scale_val, 36.0f * base_scale * hud_scale_val));
+
+        ImGui::Separator();
+
+        // 2. Vulkan VRAM telemetry
+        if (g_vma_allocator) {
+            VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+            vmaGetHeapBudgets(g_vma_allocator, budgets);
+            VkDeviceSize total_vram_alloc = 0;
+            VkDeviceSize total_vram_budget = 0;
+            for (u32 h = 0; h < VK_MAX_MEMORY_HEAPS; ++h) {
+                total_vram_alloc += budgets[h].statistics.allocationBytes;
+                if (budgets[h].budget > 0) {
+                    total_vram_budget += budgets[h].budget;
+                }
+            }
+            const float alloc_mb = float(total_vram_alloc) / (1024.0f * 1024.0f);
+            const float budget_mb = float(total_vram_budget) / (1024.0f * 1024.0f);
+            if (budget_mb > 0.0f) {
+                ImGui::Text("VRAM: %.0f / %.0f MB (%.0f%%)", alloc_mb, budget_mb, (alloc_mb / budget_mb) * 100.0f);
+            } else {
+                ImGui::Text("VRAM: %.0f MB", alloc_mb);
+            }
+        }
+
+        ImGui::Separator();
+
+        // 3. System metrics: GPU, CPU, and RAM
+        if (cached_gpu_usage >= 0.0f) {
+            ImGui::Text("GPU: %.0f%%", cached_gpu_usage);
+        }
+        ImGui::Text("CPU: %.1f%%", cached_cpu_usage);
+        if (cached_ram_total_gb > 0.0f) {
+            ImGui::Text("RAM: %.2f / %.2f GB", cached_ram_used_gb, cached_ram_total_gb);
+        }
+
+        ImGui::End();
+    }
+    ImGui::PopStyleVar(2);
 }
 
 } // namespace
@@ -479,6 +711,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         return;
     }
     initialized = true;
+    g_vma_allocator = instance.GetAllocator();
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
 }
 
@@ -508,10 +741,19 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && !event.key.repeat &&
-            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
-            SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
-            return true;
+        if (down && !event.key.repeat) {
+            if (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE)) {
+                SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
+                return true;
+            }
+            // HUD overlay hotkeys: F11 or Shift + Tab
+            const bool shift = (event.key.mod & SDL_KMOD_SHIFT) != 0;
+            if (event.key.key == SDLK_F11 || (shift && event.key.key == SDLK_TAB)) {
+                auto& s = BbSettings::Get();
+                s.show_hud = !s.show_hud.load();
+                BbSettings::Save();
+                return true;
+            }
         }
         if (!is_open) {
             return false;
@@ -588,7 +830,7 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || BbSettings::Get().show_fps || (g_window && g_window->IsTextInputActive()));
+    return initialized && (menu_open || BbSettings::Get().show_fps || BbSettings::Get().show_hud || (g_window && g_window->IsTextInputActive()));
 }
 
 bool CapturesInput() {
@@ -596,12 +838,14 @@ bool CapturesInput() {
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
-    // Present interval for the FPS readout (measured also while nothing is drawn).
+    // Present interval for the FPS readout and HUD telemetry.
     const auto now = std::chrono::steady_clock::now();
     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
     last_present = now;
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+        frametime_history[frametime_history_idx] = ms;
+        frametime_history_idx = (frametime_history_idx + 1) % FrametimeHistorySize;
     }
     if (!Visible()) {
         return;
@@ -624,7 +868,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (menu_open) {
         Menu();
     }
-    if (BbSettings::Get().show_fps && !menu_open) {
+    if (BbSettings::Get().show_hud && !menu_open) {
+        HudOverlay();
+    } else if (BbSettings::Get().show_fps && !menu_open) {
         FpsCounter();
     }
     if (g_window && g_window->IsTextInputActive()) {

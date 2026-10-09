@@ -52,6 +52,14 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "show_hud") {
+        v.show_hud = i != 0;
+    } else if (key == "hud_quadrant") {
+        v.hud_quadrant = std::clamp(i, 0, HudQuadrantCount - 1);
+    } else if (key == "hud_opacity") {
+        v.hud_opacity = Clamp(f, 0.1f, 1.0f);
+    } else if (key == "hud_scale") {
+        v.hud_scale = Clamp(f, 0.5f, 2.5f);
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
@@ -113,6 +121,8 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_HUD", "show_hud"},                     {"BB_HUD_QUADRANT", "hud_quadrant"},
+        {"BB_HUD_OPACITY", "hud_opacity"},          {"BB_HUD_SCALE", "hud_scale"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -175,12 +185,15 @@ void Save() {
                  "# bbport settings (in-game menu: Insert / L3+R3)\n"
                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
-                 "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
+                 "debug_view=%d\nshow_fps=%d\nshow_hud=%d\nhud_quadrant=%d\nhud_opacity=%.2f\nhud_scale=%.2f\n"
+                 "fsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
                  UpscalerName(v.upscaler), v.preset.load(), int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                  int(v.object_motion.load()),
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
                  v.debug_view.load(), int(v.show_fps.load()),
+                 int(v.show_hud.load()), v.hud_quadrant.load(),
+                 v.hud_opacity.load(), v.hud_scale.load(),
                  int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
     // Read by patches.py at start.
     for (int e = 0; e < EffectCount; ++e) {

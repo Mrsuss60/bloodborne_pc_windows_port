@@ -51,6 +51,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
     height = h;
+    last_mouse_motion_ms = SDL_GetTicks();
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
 }
 
@@ -119,6 +120,15 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
+        bool event_handled = false;
+        if (event.type == SDL_EVENT_MOUSE_MOTION || event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+            event.type == SDL_EVENT_MOUSE_BUTTON_UP || event.type == SDL_EVENT_MOUSE_WHEEL) {
+            last_mouse_motion_ms = SDL_GetTicks();
+            if (mouse_cursor_hidden) {
+                SDL_ShowCursor();
+                mouse_cursor_hidden = false;
+            }
+        }
         if (BbOverlay::HandleEvent(event)) {
             continue;
         }
@@ -139,6 +149,19 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+
+    // Auto-hide cursor after 3 seconds of mouse idle when not in overlay menu
+    if (!BbOverlay::CapturesInput()) {
+        const uint64_t now_ms = SDL_GetTicks();
+        if (!mouse_cursor_hidden && (now_ms - last_mouse_motion_ms >= 3000)) {
+            SDL_HideCursor();
+            mouse_cursor_hidden = true;
+        }
+    } else if (mouse_cursor_hidden) {
+        SDL_ShowCursor();
+        mouse_cursor_hidden = false;
+    }
+
     return is_open;
 }
 

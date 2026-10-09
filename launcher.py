@@ -287,16 +287,12 @@ class BloodborneLauncher(tk.Tk):
         ttk.Button(feat_header, text="Everything on", style="Secondary.TButton",
                    command=self.set_everything_on).pack(side="right")
 
-        # Feature Checkbox variables
         self.feat_upscaler = tk.BooleanVar(value=self.settings.get("feat_upscaler", True))
-        self.feat_object_motion = tk.BooleanVar(value=self.settings.get("feat_object_motion", True))
         self.feat_overlay = tk.BooleanVar(value=self.settings.get("feat_overlay", True))
+        self.feat_hud = tk.BooleanVar(value=self.settings.get("feat_hud", False))
         self.feat_fps_patch = tk.BooleanVar(value=self.settings.get("feat_fps_patch", True))
         self.feat_mods = tk.BooleanVar(value=self.settings.get("mods", True))
         self.feat_res_scaling = tk.BooleanVar(value=self.settings.get("feat_res_scaling", True))
-        self.feat_tracing = tk.BooleanVar(value=self.settings.get("feat_tracing", True))
-        self.feat_watchdog = tk.BooleanVar(value=self.settings.get("feat_watchdog", True))
-        self.feat_draw_prep = tk.BooleanVar(value=self.settings.get("feat_draw_prep", True))
 
         grid_f = ttk.Frame(feat_card, style="Card.TFrame")
         grid_f.pack(fill="x")
@@ -304,41 +300,29 @@ class BloodborneLauncher(tk.Tk):
         # Row 0
         ttk.Checkbutton(grid_f, text="Upscaler (FSR 3.1)", variable=self.feat_upscaler,
                         style="Card.TCheckbutton").grid(row=0, column=0, sticky="w", pady=2, padx=(0, 15))
-        ttk.Checkbutton(grid_f, text="Object motion vectors", variable=self.feat_object_motion,
+        ttk.Checkbutton(grid_f, text="FPS patch (Uncap / 60 / 90)", variable=self.feat_fps_patch,
                         style="Card.TCheckbutton").grid(row=0, column=1, sticky="w", pady=2, padx=(0, 15))
-        ttk.Checkbutton(grid_f, text="In-game overlay menu", variable=self.feat_overlay,
-                        style="Card.TCheckbutton").grid(row=0, column=2, sticky="w", pady=2)
+        ov_box = ttk.Frame(grid_f, style="Card.TFrame")
+        ov_box.grid(row=0, column=2, sticky="w", pady=2)
+        ttk.Checkbutton(ov_box, text="Overlay menu", variable=self.feat_overlay,
+                        style="Card.TCheckbutton").pack(side="left")
+        ttk.Checkbutton(ov_box, text="HUD stats", variable=self.feat_hud,
+                        style="Card.TCheckbutton").pack(side="left", padx=(10, 0))
 
         # Row 1
-        ttk.Checkbutton(grid_f, text="FPS patch (Uncap / 60 / 90)", variable=self.feat_fps_patch,
-                        style="Card.TCheckbutton").grid(row=1, column=0, sticky="w", pady=2, padx=(0, 15))
         ttk.Checkbutton(grid_f, text="Enable mods folder (mods/)", variable=self.feat_mods,
-                        style="Card.TCheckbutton").grid(row=1, column=1, sticky="w", pady=2, padx=(0, 15))
+                        style="Card.TCheckbutton").grid(row=1, column=0, sticky="w", pady=2, padx=(0, 15))
         cb_res = ttk.Checkbutton(grid_f, text="Resolution scaling", variable=self.feat_res_scaling,
                                  style="Card.TCheckbutton", command=self.update_res_scaling_state)
-        cb_res.grid(row=1, column=2, sticky="w", pady=2)
+        cb_res.grid(row=1, column=1, sticky="w", pady=2, padx=(0, 15))
 
-        # Row 2
-        ttk.Checkbutton(grid_f, text="Debug tracing (heartbeat/hang dump)", variable=self.feat_tracing,
-                        style="Card.TCheckbutton").grid(row=2, column=0, sticky="w", pady=2, padx=(0, 15))
-        wd_box = ttk.Frame(grid_f, style="Card.TFrame")
-        wd_box.grid(row=2, column=1, sticky="w", pady=2, padx=(0, 15))
-        ttk.Checkbutton(wd_box, text="Watchdog", variable=self.feat_watchdog,
-                        style="Card.TCheckbutton").pack(side="left")
-        ttk.Label(wd_box, text="Timeout (s):", style="Card.TLabel", font=("Segoe UI", 9)).pack(side="left", padx=(8, 4))
-        ttk.Combobox(wd_box, textvariable=self.timeout_var, values=TIMEOUT_CHOICES,
-                     state="readonly", width=11).pack(side="left")
-
-        ttk.Checkbutton(grid_f, text="GPU draw prep workers", variable=self.feat_draw_prep,
-                        style="Card.TCheckbutton").grid(row=2, column=2, sticky="w", pady=2)
-
-        # Row 3 (Popular XML Patches)
+        # Row 2 (Popular XML Patches)
         ttk.Checkbutton(grid_f, text="Skip Intro & Logos", variable=self.feat_skip_intro,
-                        style="Card.TCheckbutton", command=self.on_quick_patch_toggle).grid(row=3, column=0, sticky="w", pady=2, padx=(0, 15))
+                        style="Card.TCheckbutton", command=self.on_quick_patch_toggle).grid(row=2, column=0, sticky="w", pady=2, padx=(0, 15))
         ttk.Checkbutton(grid_f, text="Performance Patch (Kyo)", variable=self.feat_perf_patch,
-                        style="Card.TCheckbutton", command=self.on_quick_patch_toggle).grid(row=3, column=1, sticky="w", pady=2, padx=(0, 15))
+                        style="Card.TCheckbutton", command=self.on_quick_patch_toggle).grid(row=2, column=1, sticky="w", pady=2, padx=(0, 15))
         ttk.Checkbutton(grid_f, text="Disable Motion Blur", variable=self.feat_no_blur,
-                        style="Card.TCheckbutton", command=self.on_quick_patch_toggle).grid(row=3, column=2, sticky="w", pady=2)
+                        style="Card.TCheckbutton", command=self.on_quick_patch_toggle).grid(row=2, column=2, sticky="w", pady=2)
 
         self.update_res_scaling_state()
 
@@ -393,14 +377,11 @@ class BloodborneLauncher(tk.Tk):
 
     def set_vanilla_mode(self):
         self.feat_upscaler.set(False)
-        self.feat_object_motion.set(False)
         self.feat_overlay.set(False)
+        self.feat_hud.set(False)
         self.feat_fps_patch.set(False)
         self.feat_mods.set(False)
         self.feat_res_scaling.set(False)
-        self.feat_tracing.set(False)
-        self.feat_watchdog.set(False)
-        self.feat_draw_prep.set(False)
         self.fps_var.set("30")
         self.aniso_var.set("Off")
         self.enabled_patches.clear()
@@ -412,14 +393,11 @@ class BloodborneLauncher(tk.Tk):
 
     def set_everything_on(self):
         self.feat_upscaler.set(True)
-        self.feat_object_motion.set(True)
         self.feat_overlay.set(True)
+        self.feat_hud.set(True)
         self.feat_fps_patch.set(True)
         self.feat_mods.set(True)
         self.feat_res_scaling.set(True)
-        self.feat_tracing.set(True)
-        self.feat_watchdog.set(True)
-        self.feat_draw_prep.set(True)
         self.fps_var.set("uncap")
         self.aniso_var.set("16x")
         self.enabled_patches = {"Skip Intro", "Performance Patch (perf increase)", "Disable Motion Blur (perf increase)"}
@@ -653,17 +631,13 @@ class BloodborneLauncher(tk.Tk):
             "fps": self.fps_var.get(),
             "res": self.res_var.get(),
             "aniso": self.aniso_var.get(),
-            "timeout": self.timeout_var.get().split()[0],
             "mods": self.feat_mods.get(),
             "hide_vk": self.hide_vk_var.get(),
             "feat_upscaler": self.feat_upscaler.get(),
-            "feat_object_motion": self.feat_object_motion.get(),
             "feat_overlay": self.feat_overlay.get(),
+            "feat_hud": self.feat_hud.get(),
             "feat_fps_patch": self.feat_fps_patch.get(),
             "feat_res_scaling": self.feat_res_scaling.get(),
-            "feat_tracing": self.feat_tracing.get(),
-            "feat_watchdog": self.feat_watchdog.get(),
-            "feat_draw_prep": self.feat_draw_prep.get(),
             "fullscreen": self.fullscreen.get(),
             "enabled_patches": sorted(list(self.enabled_patches)),
         }
@@ -724,8 +698,6 @@ class BloodborneLauncher(tk.Tk):
     def check_feature_warnings(self, line: str):
         if not self.feat_upscaler.get() and "Upscaler: FSR" in line and "available (on)" in line:
             self.log(f"[WARNING] Feature switch discrepancy: Upscaler is toggled OFF but startup reported: {line.strip()}")
-        if not self.feat_object_motion.get() and "Object motion: on" in line:
-            self.log(f"[WARNING] Feature switch discrepancy: Object motion is toggled OFF but startup reported: {line.strip()}")
         if not self.feat_overlay.get() and "Overlay: menu ready" in line:
             self.log(f"[WARNING] Feature switch discrepancy: Overlay menu is toggled OFF but startup reported: {line.strip()}")
         if not self.feat_fps_patch.get() and "writes from ['" in line and "FPS++" in line:
@@ -919,17 +891,16 @@ class BloodborneLauncher(tk.Tk):
         else:
             env.pop("BB_UPSCALER", None)
 
-        # Object motion
-        if not self.feat_object_motion.get():
-            env["BB_OBJECT_MOTION"] = "0"
-        else:
-            env.pop("BB_OBJECT_MOTION", None)
-
-        # Overlay menu
+        # Overlay menu & HUD stats
         if not self.feat_overlay.get():
             env["BB_OVERLAY"] = "0"
         else:
             env.pop("BB_OVERLAY", None)
+
+        if self.feat_hud.get():
+            env["BB_HUD"] = "1"
+        else:
+            env.pop("BB_HUD", None)
 
         # FPS patch
         if not self.feat_fps_patch.get():
@@ -945,26 +916,6 @@ class BloodborneLauncher(tk.Tk):
                 env["BB_RENDER_RES"] = res_choice
         else:
             res_choice = "Native (1080p, scaling off)"
-
-        # Debug tracing
-        if self.feat_tracing.get():
-            env["BB_TRACE"] = "1"
-        else:
-            env["BB_TRACE"] = "0"
-
-        # Watchdog & Timeout
-        timeout_sec = self.timeout_var.get().split()[0]
-        env["BB_TIMEOUT"] = timeout_sec
-        if not self.feat_watchdog.get():
-            env["BB_WATCHDOG"] = "0"
-        else:
-            env.pop("BB_WATCHDOG", None)
-
-        # GPU draw prep workers
-        if not self.feat_draw_prep.get():
-            env["BB_PREP_WORKERS"] = "0"
-        else:
-            env.pop("BB_PREP_WORKERS", None)
 
         # Fullscreen window (read by gpu/shim/window.cpp)
         env["BB_FULLSCREEN"] = "1" if self.fullscreen.get() else "0"
@@ -991,14 +942,11 @@ class BloodborneLauncher(tk.Tk):
 
         features_str = (
             f"Features: FSR={'on' if self.feat_upscaler.get() else 'off'}, "
-            f"ObjectMotion={'on' if self.feat_object_motion.get() else 'off'}, "
             f"Overlay={'on' if self.feat_overlay.get() else 'off'}, "
+            f"HUD={'on' if self.feat_hud.get() else 'off'}, "
             f"FPSPatch={'on' if self.feat_fps_patch.get() else 'off'}, "
             f"Mods={'on' if self.feat_mods.get() else 'off'}, "
             f"ResScaling={'on' if self.feat_res_scaling.get() else 'off'}, "
-            f"Tracing={'on' if self.feat_tracing.get() else 'off'}, "
-            f"Watchdog={'on' if self.feat_watchdog.get() else 'off'}, "
-            f"DrawPrep={'on' if self.feat_draw_prep.get() else 'off'}, "
             f"Fullscreen={'on' if self.fullscreen.get() else 'off'}"
         )
 

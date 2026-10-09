@@ -48,6 +48,8 @@ private:
     void UpdateTextTitle();
     SDL_Window* window{};
     WindowSystemInfo window_info{};
+    uint64_t last_mouse_motion_ms = 0;
+    bool mouse_cursor_hidden = false;
 };
 
 } // namespace Frontend
