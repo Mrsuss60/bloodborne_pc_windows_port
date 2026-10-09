@@ -149,6 +149,16 @@ static ABI int32_t attr_destroy(GuestAttr **attr) {
     if (!attr || !*attr) return orbis_error(EINVAL);
     runtime_low_free(*attr); *attr = NULL; return 0;
 }
+/* bbport: a host error handed to the guest, logged with the call, handle and thread: the game
+ * stops on most of them (Dantelion2 "Invalid mutex"), and import tracing logs few calls. */
+static int32_t host_failure(const char *call, const void *handle, int e) {
+    if (e) {
+        const GuestThread *t = runtime_thread_current();
+        fprintf(stderr, "Runtime: %s(%p) -> host error %d (%s), thread '%s'\n", call, handle, e,
+                strerror(e), t ? t->name : "?");
+    }
+    return orbis_error(e);
+}
 static ABI int32_t mutex_init(GuestMutex **out, GuestAttr **attr, const char *name) {
     (void)name;
     if (!out || (attr && !*attr)) return orbis_error(EINVAL);
@@ -163,9 +173,9 @@ static ABI int32_t mutex_init(GuestMutex **out, GuestAttr **attr, const char *na
 }
 static HostMutex static_init = HOST_MUTEX_INIT;
 static int32_t ensure_mutex(GuestMutex **mutex) {
-    if (!mutex) return orbis_error(EINVAL);
+    if (!mutex) return host_failure("mutex (null handle)", mutex, EINVAL);
     uintptr_t value = __atomic_load_n((uintptr_t *)mutex, __ATOMIC_ACQUIRE);
-    if (value == 2) return orbis_error(EINVAL);
+    if (value == 2) return host_failure("mutex (destroyed)", mutex, EINVAL);
     if (value >= 2) return 0;
     host_mutex_lock(&static_init);
     int32_t e = 0;
@@ -181,7 +191,7 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     runtime_thread_set_blocked("mutex", (uintptr_t)mutex);
-    e = orbis_error(native_lock(&(*mutex)->native));
+    e = host_failure("scePthreadMutexLock", mutex, native_lock(&(*mutex)->native));
     runtime_thread_clear_blocked();
     if (!e) ++locks;
     restore_guest_fs();
@@ -190,25 +200,26 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
-    e = orbis_error(native_trylock(&(*mutex)->native));
+    const int trylock = native_trylock(&(*mutex)->native);
+    e = trylock == EBUSY ? orbis_error(trylock) : host_failure("scePthreadMutexTrylock", mutex, trylock);
     if (!e) ++locks;
     restore_guest_fs();
     return e;
 }
 static ABI int32_t mutex_unlock(GuestMutex **mutex) {
-    if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
+    if (!mutex || (uintptr_t)*mutex == 2) return host_failure("scePthreadMutexUnlock (destroyed)", mutex, EINVAL);
     if ((uintptr_t)*mutex < 2) return orbis_error(EPERM);
-    int32_t e = orbis_error(native_unlock(&(*mutex)->native));
+    int32_t e = host_failure("scePthreadMutexUnlock", mutex, native_unlock(&(*mutex)->native));
     if (!e) ++unlocks;
     restore_guest_fs();
     return e;
 }
 static ABI int32_t mutex_destroy(GuestMutex **mutex) {
-    if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
+    if (!mutex || (uintptr_t)*mutex == 2) return host_failure("scePthreadMutexDestroy (destroyed)", mutex, EINVAL);
     if ((uintptr_t)*mutex < 2) return 0;
     int e = native_destroy(&(*mutex)->native);
     if (!e) { runtime_low_free(*mutex); *mutex = (GuestMutex *)(uintptr_t)2; }
-    return orbis_error(e);
+    return host_failure("scePthreadMutexDestroy", mutex, e);
 }
 static uint64_t deadline_after(uint64_t usec) { return host_realtime_ns() + usec * 1000; }
 static int32_t timed_error(int e) { return e == ETIMEDOUT ? (int32_t)UINT32_C(0x8002003c) : orbis_error(e); }
@@ -216,7 +227,8 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     runtime_thread_set_blocked("mutex_timed", (uintptr_t)mutex);
-    e = timed_error(native_timedlock(&(*mutex)->native, deadline_after(usec)));
+    const int timed = native_timedlock(&(*mutex)->native, deadline_after(usec));
+    e = timed == ETIMEDOUT ? timed_error(timed) : host_failure("scePthreadMutexTimedlock", mutex, timed);
     runtime_thread_clear_blocked();
     if (!e) ++locks;
     restore_guest_fs();
@@ -252,15 +264,15 @@ static ABI int32_t cond_destroy(GuestCond **cond) {
     if ((uintptr_t)*cond < 2) return 0;
     int e = native_cond_destroy(&(*cond)->native);
     if (!e) { runtime_low_free(*cond); *cond = NULL; }
-    return orbis_error(e);
+    return host_failure("scePthreadCondDestroy", cond, e);
 }
 static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
+    if (!mutex || (uintptr_t)*mutex < 3) return host_failure("scePthreadCondWait (mutex not initialized)", mutex, EINVAL);
     ++waits;
     runtime_thread_set_blocked("condvar", (uintptr_t)cond);
-    int32_t res = orbis_error(native_cond_wait(&(*cond)->native, &(*mutex)->native, 0));
+    int32_t res = host_failure("scePthreadCondWait", cond, native_cond_wait(&(*cond)->native, &(*mutex)->native, 0));
     runtime_thread_clear_blocked();
     restore_guest_fs();
     return res;
@@ -268,10 +280,11 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, uint64_t deadline) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
+    if (!mutex || (uintptr_t)*mutex < 3) return host_failure("scePthreadCondTimedwait (mutex not initialized)", mutex, EINVAL);
     ++waits;
     runtime_thread_set_blocked("condvar_timed", (uintptr_t)cond);
-    int32_t res = timed_error(native_cond_wait(&(*cond)->native, &(*mutex)->native, deadline ? deadline : 1));
+    const int waited = native_cond_wait(&(*cond)->native, &(*mutex)->native, deadline ? deadline : 1);
+    int32_t res = waited == ETIMEDOUT ? timed_error(waited) : host_failure("scePthreadCondTimedwait", cond, waited);
     runtime_thread_clear_blocked();
     restore_guest_fs();
     return res;
@@ -282,12 +295,12 @@ static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    ++wakeups; return orbis_error(native_cond_signal(&(*cond)->native));
+    ++wakeups; return host_failure("scePthreadCondSignal", cond, native_cond_signal(&(*cond)->native));
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
-    ++wakeups; return orbis_error(native_cond_broadcast(&(*cond)->native));
+    ++wakeups; return host_failure("scePthreadCondBroadcast", cond, native_cond_broadcast(&(*cond)->native));
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;
