@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 #include "bbport_copy.h"
@@ -60,33 +61,49 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
-    const vk::BufferCreateInfo probe_ci = {
-        .flags =
-            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
-        .size = ARENA_PAGE_SIZE,
-        .usage = ARENA_USAGE,
-        .sharingMode = vk::SharingMode::eExclusive,
-    };
-    const vk::DeviceBufferMemoryRequirements req_info = {
-        .pCreateInfo = &probe_ci,
-    };
-    const auto device = instance.GetDevice();
-    const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
-    block_size = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
-    ASSERT_MSG(std::popcount(block_size) == 1, "Sparse block size {} is not a power of 2",
+    dense_arenas = !instance.IsSparseBufferSupported();
+    if (dense_arenas) {
+        // bbport: no sparse residency (MoltenVK): dense arenas of BB_ARENA_MB, a power of two.
+        const char* env = std::getenv("BB_ARENA_MB");
+        const u64 mb = std::bit_ceil(std::clamp<u64>(env ? std::strtoull(env, nullptr, 10) : 256,
+                                                     16, 4096));
+        arena_page_bits = std::bit_width(mb << 20) - 1;
+        block_size = MIN_BLOCK_SIZE;
+        std::printf("GPU: no sparse residency, dense %llu MiB buffer arenas\n",
+                    static_cast<unsigned long long>(mb));
+    } else {
+        arena_page_bits = SPARSE_ARENA_PAGE_BITS;
+        const vk::BufferCreateInfo probe_ci = {
+            .flags = vk::BufferCreateFlagBits::eSparseBinding |
+                     vk::BufferCreateFlagBits::eSparseResidency,
+            .size = u64{1} << arena_page_bits,
+            .usage = ARENA_USAGE,
+            .sharingMode = vk::SharingMode::eExclusive,
+        };
+        const vk::DeviceBufferMemoryRequirements req_info = {
+            .pCreateInfo = &probe_ci,
+        };
+        const auto device = instance.GetDevice();
+        const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
+        block_size =
+            Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
+        arena_memory_type_index =
+            FindMemoryType(instance.GetMemoryProperties(),
+                           vk::MemoryPropertyFlagBits::eDeviceLocal, reqs.memoryTypeBits)
+                .value();
+    }
+    ASSERT_MSG(std::popcount(block_size) == 1, "Arena block size {} is not a power of 2",
                block_size);
+    arena_page_size = u64{1} << arena_page_bits;
     block_shift = std::bit_width(block_size) - 1;
-    blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
-    blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
-    arena_memory_type_index =
-        FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
-                       reqs.memoryTypeBits)
-            .value();
+    blocks_per_arena_page = arena_page_size / block_size;
+    blocks_per_arena_page_shift = arena_page_bits - block_shift;
+    address_space.assign(u64{1} << (ADDRESS_SPACE_BITS - arena_page_bits), nullptr);
 
-    const u64 bda_pagetable_size =
-        (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
-    fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
-                                                   blocks_per_arena_page * NUM_ARENA_PAGES);
+    const u64 total_blocks = u64{1} << (ADDRESS_SPACE_BITS - block_shift);
+    const u64 bda_pagetable_size = total_blocks * sizeof(vk::DeviceAddress);
+    fault_manager =
+        std::make_unique<FaultManager>(instance, scheduler, *this, block_shift, total_blocks);
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
@@ -384,7 +401,7 @@ void BufferCache::ProcessFaultBuffer() {
 
 void BufferCache::SynchronizeDmaBuffers() {
     for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
+        const u64 page = range.start >> blocks_per_arena_page_shift;
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
         SynchronizeMemory(address_space[page], device_addr, size, false, false);
@@ -392,6 +409,9 @@ void BufferCache::SynchronizeDmaBuffers() {
 }
 
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
+    if (dense_arenas) {
+        return GetDenseArena(first_block, last_block);
+    }
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     ASSERT_MSG(last_page - first_page <= 1,
@@ -405,7 +425,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             const u64 num_pages = last_page - first_page + 1;
             const auto* new_arena =
                 &arenas.emplace_back(instance, base_block << block_shift,
-                                     num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
+                                     num_pages << arena_page_bits, MemoryType::Sparse);
             address_space[first_page] = new_arena;
             address_space[last_page] = new_arena;
         }
@@ -414,9 +434,9 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 
     LOG_WARNING(Render, "Migrating arena");
 
-    const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << ARENA_PAGE_BITS);
-    const u64 first_size = first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE;
-    const u64 last_size = last_arena ? last_arena->size_bytes : ARENA_PAGE_SIZE;
+    const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << arena_page_bits);
+    const u64 first_size = first_arena ? first_arena->size_bytes : arena_page_size;
+    const u64 last_size = last_arena ? last_arena->size_bytes : arena_page_size;
 
     const u64 base_block = first_addr >> block_shift;
     const u64 total_size = first_size + last_size;
@@ -434,15 +454,92 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         });
     });
 
-    u64 base_page = first_addr >> ARENA_PAGE_BITS;
-    for (u32 page = 0; page < (first_size >> ARENA_PAGE_BITS); ++page) {
+    u64 base_page = first_addr >> arena_page_bits;
+    for (u32 page = 0; page < (first_size >> arena_page_bits); ++page) {
         address_space[base_page + page] = new_arena;
     }
     base_page = last_page;
-    for (u32 page = 0; page < (last_size >> ARENA_PAGE_BITS); ++page) {
+    for (u32 page = 0; page < (last_size >> arena_page_bits); ++page) {
         address_space[base_page + page] = new_arena;
     }
     return new_arena;
+}
+
+const Buffer* BufferCache::GetDenseArena(u64 first_block, u64 last_block) {
+    u64 first_page = first_block >> blocks_per_arena_page_shift;
+    u64 last_page = last_block >> blocks_per_arena_page_shift;
+    if (const auto* arena = address_space[first_page]; arena && arena == address_space[last_page]) {
+        return arena; // arenas cover contiguous page spans
+    }
+    // Replaced arenas still referenced by recorded or pipelined work are destroyed later.
+    while (!retired_ticks.empty() && scheduler.IsFree(retired_ticks.front())) {
+        retired_arenas.pop_front();
+        retired_ticks.pop_front();
+    }
+    // The span grows to whole arenas it touches; arenas never overlap one another.
+    boost::container::small_vector<const Buffer*, 4> merged;
+    for (u64 page = first_page; page <= last_page; ++page) {
+        const auto* arena = address_space[page];
+        if (!arena || (!merged.empty() && merged.back() == arena)) {
+            continue;
+        }
+        merged.push_back(arena);
+        first_page = std::min<u64>(first_page, arena->cpu_addr >> arena_page_bits);
+        last_page = std::max<u64>(last_page, (arena->cpu_addr + arena->size_bytes - 1) >> arena_page_bits);
+    }
+    const VAddr base = first_page << arena_page_bits;
+    const u64 size = (last_page - first_page + 1) << arena_page_bits;
+    ASSERT_MSG(size <= instance.GetMaxBufferSize(),
+               "Dense arena of {:#x} bytes at {:#x} exceeds the device's buffer size", size, base);
+    auto* arena = &arenas.emplace_back(instance, base, size, MemoryType::DeviceLocal);
+    if (!merged.empty()) {
+        std::printf("GPU: merged %zu buffer arenas into %#llx + %llu MiB\n", merged.size(),
+                    static_cast<unsigned long long>(base),
+                    static_cast<unsigned long long>(size >> 20));
+        for (const auto* old : merged) {
+            const vk::BufferCopy whole{0, old->cpu_addr - base, old->size_bytes};
+            runtime.CopyBuffer(old, arena, std::span{&whole, 1});
+        }
+        WritePageTable(arena, base >> block_shift, (base + size) >> block_shift);
+        // Recording may run behind (the draw pipeline's second stage): keep two more ticks.
+        const u64 retire_tick = scheduler.CurrentTick() + 2;
+        for (const auto* old : merged) {
+            const auto it = std::ranges::find_if(arenas, [old](const Buffer& b) { return &b == old; });
+            retired_arenas.splice(retired_arenas.end(), arenas, it);
+            retired_ticks.push_back(retire_tick);
+        }
+    }
+    std::fill(address_space.begin() + first_page, address_space.begin() + last_page + 1, arena);
+    return arena;
+}
+
+void BufferCache::WritePageTable(const Buffer* arena, u64 first_block, u64 end_block) {
+    boost::container::small_vector<std::pair<u64, u64>, 8> ranges;
+    u64 blocks = 0;
+    resident_ranges.ForEachInRange(first_block, end_block, [&](const Backing& backing) {
+        const u64 start = std::max(first_block, backing.start);
+        const u64 end = std::min(end_block, backing.end);
+        ranges.emplace_back(start, end);
+        blocks += end - start;
+    });
+    if (!blocks) {
+        return;
+    }
+    const auto staging = staging_pool.Request(blocks * sizeof(vk::DeviceAddress),
+                                              MemoryType::HostUncached);
+    auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+    boost::container::small_vector<vk::BufferCopy, 8> copies;
+    u64 offset = staging.offset;
+    for (const auto& [start, end] : ranges) {
+        for (u64 block = start; block < end; ++block) {
+            *(bda_addrs++) = arena->BufferDeviceAddress() + ((block << block_shift) - arena->cpu_addr);
+        }
+        const u64 copy_size = (end - start) * sizeof(vk::DeviceAddress);
+        copies.emplace_back(offset, start * sizeof(vk::DeviceAddress), copy_size);
+        offset += copy_size;
+    }
+    staging.Flush();
+    runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
@@ -457,6 +554,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
     BbStats::Timer timer{BbStats::t_resident};
+
+    if (dense_arenas) {
+        // The arena's own memory backs every block: record them and point the page table there.
+        for (const auto& range : bind_ranges) {
+            Backing backing;
+            backing.start = range.start;
+            backing.end = range.end;
+            backing.memory = vk::DeviceMemory{};
+            backing.offset = range.start << block_shift;
+            resident_ranges.Add(backing);
+        }
+        WritePageTable(arena, first_block, last_block + 1);
+        return;
+    }
 
     const vk::MemoryAllocateInfo alloc_info = {
         .allocationSize = resident_blocks << block_shift,

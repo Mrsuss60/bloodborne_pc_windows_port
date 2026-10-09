@@ -41,6 +41,11 @@ On the GPU side:
   validates each binding's texture type. The rasterizer binds them
   where it would write null buffers, vertex buffers or image views. Elsewhere `nullDescriptor`
   stays required.
+- **No sparse residency on MoltenVK.** The buffer cache keeps guest memory in sparse 4 GiB
+  arenas elsewhere. Here the arenas are dense buffers of `BB_ARENA_MB` (256 MiB by default;
+  Metal commits a buffer whole on its first GPU use, so 4 GiB arenas would cost 4 GiB each).
+  A binding that spans several arenas merges them into one (contents copied, the old ones
+  destroyed once the GPU is past them); `launcher.log` shows `GPU: merged … buffer arenas`.
 - **`robustBufferAccess2`/`robustImageAccess2`** are enabled only where the driver has them
   (MoltenVK has no `robustBufferAccess2`; Metal bounds accesses itself).
 - **Portability**: the instance enables `VK_KHR_portability_enumeration`, the device

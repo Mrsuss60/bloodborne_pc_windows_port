@@ -274,6 +274,16 @@ public:
         return amd_mixed_attachment_samples;
     }
 
+    /// bbport: sparse residency buffers (the buffer cache's arenas); none on MoltenVK
+    bool IsSparseBufferSupported() const {
+        return features.sparseBinding && features.sparseResidencyBuffer;
+    }
+
+    /// bbport: the largest buffer the device creates (Vulkan 1.3 maxBufferSize)
+    u64 GetMaxBufferSize() const {
+        return vk13_props.maxBufferSize;
+    }
+
     /// Returns true when shaders may write multisampled images (no on Metal/MoltenVK)
     bool IsStorageImageMultisampleSupported() const {
         return features.shaderStorageImageMultisample;
