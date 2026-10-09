@@ -17,6 +17,14 @@ constexpr vk::ImageUsageFlags Usage = vk::ImageUsageFlagBits::eSampled |
                                       vk::ImageUsageFlagBits::eTransferDst;
 constexpr vk::ImageUsageFlags DepthUsage =
     vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+// Vulkan guarantees 4 samples for sampled images. Attachment usage: Metal clears multisampled
+// textures through a render pass.
+constexpr vk::SampleCountFlagBits MsaaSamples = vk::SampleCountFlagBits::e4;
+constexpr vk::ImageUsageFlags MsaaUsage = vk::ImageUsageFlagBits::eSampled |
+                                          vk::ImageUsageFlagBits::eTransferDst |
+                                          vk::ImageUsageFlagBits::eColorAttachment;
+constexpr vk::ImageUsageFlags DepthMsaaUsage = DepthUsage |
+                                               vk::ImageUsageFlagBits::eDepthStencilAttachment;
 } // namespace
 
 NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
@@ -26,7 +34,8 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
 
     const auto make_image = [&](VideoCore::UniqueImage& image, vk::ImageType type, u32 layers,
                                 vk::ImageCreateFlags flags, vk::Format format = Format,
-                                vk::ImageUsageFlags usage = Usage) {
+                                vk::ImageUsageFlags usage = Usage,
+                                vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
         image = VideoCore::UniqueImage(device, instance.GetAllocator());
         image.Create(vk::ImageCreateInfo{
             .flags = flags,
@@ -35,7 +44,7 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
             .extent = {1, 1, 1},
             .mipLevels = 1,
             .arrayLayers = layers,
-            .samples = vk::SampleCountFlagBits::e1,
+            .samples = samples,
             .tiling = vk::ImageTiling::eOptimal,
             .usage = usage,
             .initialLayout = vk::ImageLayout::eUndefined,
@@ -46,6 +55,9 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
     make_image(image_3d, vk::ImageType::e3D, 1, {});
     make_image(image_depth, vk::ImageType::e2D, 6, vk::ImageCreateFlagBits::eCubeCompatible,
                DepthFormat, DepthUsage);
+    make_image(image_msaa, vk::ImageType::e2D, 1, {}, Format, MsaaUsage, MsaaSamples);
+    make_image(image_depth_msaa, vk::ImageType::e2D, 1, {}, DepthFormat, DepthMsaaUsage,
+               MsaaSamples);
 
     const auto make_view = [&](const VideoCore::UniqueImage& image, vk::ImageViewType type,
                                u32 layers, vk::Format format = Format,
@@ -67,27 +79,36 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
     views[Depth2D] = make_view(image_depth, vk::ImageViewType::e2D, 1, DepthFormat, depth);
     views[Depth2DArray] = make_view(image_depth, vk::ImageViewType::e2DArray, 6, DepthFormat, depth);
     views[DepthCube] = make_view(image_depth, vk::ImageViewType::eCube, 6, DepthFormat, depth);
+    views[ViewMsaa] = make_view(image_msaa, vk::ImageViewType::e2D, 1);
+    views[ViewMsaaArray] = make_view(image_msaa, vk::ImageViewType::e2DArray, 1);
+    views[DepthMsaa] = make_view(image_depth_msaa, vk::ImageViewType::e2D, 1, DepthFormat, depth);
+    views[DepthMsaaArray] =
+        make_view(image_depth_msaa, vk::ImageViewType::e2DArray, 1, DepthFormat, depth);
 
     // Zero everything once and leave the images in the general layout for good.
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.fillBuffer(buffer->Handle(), 0, VK_WHOLE_SIZE, 0);
-    const std::array<vk::Image, 3> images = {vk::Image(image_1d), vk::Image(image_2d),
-                                             vk::Image(image_3d)};
+    const std::array<vk::Image, 4> images = {vk::Image(image_1d), vk::Image(image_2d),
+                                             vk::Image(image_3d), vk::Image(image_msaa)};
     const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eColor, 0, 1, 0,
                                         VK_REMAINING_ARRAY_LAYERS};
     const vk::ImageSubresourceRange all_depth{vk::ImageAspectFlagBits::eDepth, 0, 1, 0,
                                               VK_REMAINING_ARRAY_LAYERS};
-    std::array<vk::ImageMemoryBarrier2, 4> to_general{};
-    to_general[3] = vk::ImageMemoryBarrier2{
-        .srcStageMask = vk::PipelineStageFlagBits2::eNone,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eGeneral,
-        .image = vk::Image(image_depth),
-        .subresourceRange = all_depth,
-    };
+    const std::array<vk::Image, 2> depth_images = {vk::Image(image_depth),
+                                                   vk::Image(image_depth_msaa)};
+    std::array<vk::ImageMemoryBarrier2, images.size() + depth_images.size()> to_general{};
+    for (size_t i = 0; i < depth_images.size(); ++i) {
+        to_general[images.size() + i] = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = depth_images[i],
+            .subresourceRange = all_depth,
+        };
+    }
     for (size_t i = 0; i < images.size(); ++i) {
         to_general[i] = vk::ImageMemoryBarrier2{
             .srcStageMask = vk::PipelineStageFlagBits2::eNone,
@@ -106,8 +127,10 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
     for (const auto image : images) {
         cmdbuf.clearColorImage(image, vk::ImageLayout::eGeneral, vk::ClearColorValue{}, all);
     }
-    cmdbuf.clearDepthStencilImage(vk::Image(image_depth), vk::ImageLayout::eGeneral,
-                                  vk::ClearDepthStencilValue{0.f, 0}, all_depth);
+    for (const auto image : depth_images) {
+        cmdbuf.clearDepthStencilImage(image, vk::ImageLayout::eGeneral,
+                                      vk::ClearDepthStencilValue{0.f, 0}, all_depth);
+    }
     const vk::MemoryBarrier2 visible{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -130,9 +153,12 @@ vk::Buffer NullResources::Buffer() const noexcept {
 vk::ImageView NullResources::View(AmdGpu::ImageType type, bool is_depth) const noexcept {
     if (is_depth) {
         switch (type) {
+        case AmdGpu::ImageType::Color2DMsaa:
+            return *views[DepthMsaa];
+        case AmdGpu::ImageType::Color2DMsaaArray:
+            return *views[DepthMsaaArray];
         case AmdGpu::ImageType::Color1DArray:
         case AmdGpu::ImageType::Color2DArray:
-        case AmdGpu::ImageType::Color2DMsaaArray:
             return *views[Depth2DArray];
         case AmdGpu::ImageType::Cube:
             return *views[DepthCube];
@@ -146,13 +172,16 @@ vk::ImageView NullResources::View(AmdGpu::ImageType type, bool is_depth) const n
     case AmdGpu::ImageType::Color1DArray:
         return *views[View1DArray];
     case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Color2DMsaaArray:
         return *views[View2DArray];
+    case AmdGpu::ImageType::Color2DMsaa:
+        return *views[ViewMsaa];
+    case AmdGpu::ImageType::Color2DMsaaArray:
+        return *views[ViewMsaaArray];
     case AmdGpu::ImageType::Color3D:
         return *views[View3D];
     case AmdGpu::ImageType::Cube:
         return *views[ViewCube];
-    default: // Color2D; MSAA reads of an unbound image use a single-sample view
+    default: // Color2D
         return *views[View2D];
     }
 }

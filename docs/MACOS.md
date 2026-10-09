@@ -29,7 +29,10 @@ On the GPU side:
 
 - **No `nullDescriptor` on MoltenVK.** `NullResources` (`vk_null_resources.h`) stand in: a
   zeroed buffer, and zeroed 1×1 images with a view for each image type (RGBA8; D32 for depth
-  slots, which comparison sampling turns into Metal depth textures). The rasterizer binds them
+  slots, which comparison sampling turns into Metal depth textures; 4-sample images for
+  multisampled slots, which Metal declares as `texture2d_ms`). `null-resources-test` reads
+  every stand-in through the type a shader declares; with `MTL_DEBUG_LAYER=1` Metal also
+  validates each binding's texture type. The rasterizer binds them
   where it would write null buffers, vertex buffers or image views. Elsewhere `nullDescriptor`
   stays required.
 - **`robustBufferAccess2`/`robustImageAccess2`** are enabled only where the driver has them
@@ -82,7 +85,8 @@ Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):
   file-mods, semaphore and content tests pass.
 - `--vulkan-only`: command submission and readback on the Apple GPU pass.
 - GPU tests: all nine above pass on the Apple GPU (scene targets, TAA and camera motion
-  shaders, null descriptor stand-ins).
+  shaders, null descriptor stand-ins sampled by a compute shader, also under
+  `MTL_DEBUG_LAYER=1`).
 
 ## Known limits
 
@@ -96,7 +100,7 @@ Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):
   total is printed at exit (`GPU: N draws skipped for geometry stages`). Whether Bloodborne
   uses them, and so whether emulation (ES/GS run as compute, the output drawn from a buffer)
   is worth writing, is unknown until the game runs.
-- Unbound multisampled image slots get a single-sample stand-in view (a type mismatch on
-  Metal; rare).
+- Unbound multisampled slots written as storage images get a sampled-only stand-in (Metal
+  has no multisampled storage textures; not expected in practice).
 - FSR 4 and other features that depend on specific GPU vendors are not expected to work on
   Apple GPUs.

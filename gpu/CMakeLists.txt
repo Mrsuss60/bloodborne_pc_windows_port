@@ -280,8 +280,17 @@ target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCL
 target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
-add_executable(null-resources-test EXCLUDE_FROM_ALL ../tests/test_null_resources.cpp ../tests/test_gpu_runtime_stubs.cpp)
-target_include_directories(null-resources-test PRIVATE shim shadps4 third_party/gcn/include)
+set(TEST_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/test_shaders)
+add_custom_command(OUTPUT ${TEST_SHADER_DIR}/null_resources_sample_comp.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${TEST_SHADER_DIR}
+    COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${TEST_SHADER_DIR}/null_resources_sample_comp.h
+        --vn NULL_RESOURCES_SAMPLE_COMP ${CMAKE_CURRENT_SOURCE_DIR}/../tests/null_resources_sample.comp
+    COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${TEST_SHADER_DIR}/null_resources_sample_comp.h"
+        -P ${SHADER_SRC}/AddShaderHeaderInclude.cmake
+    DEPENDS ../tests/null_resources_sample.comp VERBATIM)
+add_executable(null-resources-test EXCLUDE_FROM_ALL ../tests/test_null_resources.cpp ../tests/test_gpu_runtime_stubs.cpp
+    ${TEST_SHADER_DIR}/null_resources_sample_comp.h)
+target_include_directories(null-resources-test PRIVATE shim shadps4 third_party/gcn/include ${TEST_SHADER_DIR})
 target_compile_options(null-resources-test PRIVATE -UNDEBUG -fPIC)
 set_source_files_properties(../tests/test_null_resources.cpp PROPERTIES
     COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")

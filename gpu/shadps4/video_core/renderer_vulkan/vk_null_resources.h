@@ -2,7 +2,8 @@
 // bbport: stand-ins for null descriptors on drivers without VK_EXT_robustness2's nullDescriptor
 // (MoltenVK). Unbound buffers read a zeroed buffer, unbound images a zeroed 1x1 image whose
 // view type matches the shader's declaration (Metal checks texture types). Depth slots get a
-// depth image: comparison sampling makes them Metal depth textures.
+// depth image: comparison sampling makes them Metal depth textures. Multisampled slots get
+// 4-sample images (texture2d_ms).
 
 #pragma once
 
@@ -37,7 +38,8 @@ public:
     vk::Buffer Buffer() const noexcept;
 
     /// Zeroed 1x1 view of the given type in the general layout: RGBA8 (sampled or storage), or
-    /// D32 for depth slots (sampled; 1D and 3D types fall back to 2D).
+    /// D32 for depth slots (sampled; 1D and 3D types fall back to 2D). MSAA types get 4-sample
+    /// views (sampled only).
     vk::ImageView View(AmdGpu::ImageType type, bool is_depth = false) const noexcept;
 
 private:
@@ -51,6 +53,10 @@ private:
         Depth2D,
         Depth2DArray,
         DepthCube,
+        ViewMsaa,
+        ViewMsaaArray,
+        DepthMsaa,
+        DepthMsaaArray,
         NumViews
     };
 
@@ -59,6 +65,8 @@ private:
     VideoCore::UniqueImage image_2d; ///< 6 layers, cube compatible
     VideoCore::UniqueImage image_3d;
     VideoCore::UniqueImage image_depth; ///< D32, 6 layers, cube compatible
+    VideoCore::UniqueImage image_msaa;  ///< RGBA8, 4 samples
+    VideoCore::UniqueImage image_depth_msaa; ///< D32, 4 samples
     std::array<vk::UniqueImageView, NumViews> views;
 };
 
