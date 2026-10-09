@@ -241,6 +241,7 @@ class BloodborneLauncher(tk.Tk):
 
         self.fps_var = tk.StringVar(value=fps if fps in FPS_CHOICES else "uncap")
         self.res_var = tk.StringVar(value=res if res in RES_CHOICES else RES_CHOICES[0])
+        self.fullscreen = tk.BooleanVar(value=self.settings.get("fullscreen", False))
         self.timeout_var = tk.StringVar(value=matching_choice)
         self.aniso_var = tk.StringVar(value=aniso)
         self.aniso_desc_var = tk.StringVar()
@@ -253,6 +254,8 @@ class BloodborneLauncher(tk.Tk):
         self.res_combo = ttk.Combobox(opts, textvariable=self.res_var, values=RES_CHOICES,
                                       state="readonly", width=16)
         self.res_combo.grid(row=1, column=3, sticky="w", pady=3, padx=(6, 0))
+        ttk.Checkbutton(opts, text="Fullscreen", variable=self.fullscreen,
+                        style="Card.TCheckbutton").grid(row=1, column=4, sticky="w", pady=3, padx=(12, 0))
 
         ttk.Label(opts, text="Anisotropic Filtering:", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=3)
         self.aniso_combo = ttk.Combobox(opts, textvariable=self.aniso_var,
@@ -661,6 +664,7 @@ class BloodborneLauncher(tk.Tk):
             "feat_tracing": self.feat_tracing.get(),
             "feat_watchdog": self.feat_watchdog.get(),
             "feat_draw_prep": self.feat_draw_prep.get(),
+            "fullscreen": self.fullscreen.get(),
             "enabled_patches": sorted(list(self.enabled_patches)),
         }
         try:
@@ -962,6 +966,9 @@ class BloodborneLauncher(tk.Tk):
         else:
             env.pop("BB_PREP_WORKERS", None)
 
+        # Fullscreen window (read by gpu/shim/window.cpp)
+        env["BB_FULLSCREEN"] = "1" if self.fullscreen.get() else "0"
+
         # Frame ahead queue (smooth frametimes & bound queue latency: 2 = balanced)
         env.setdefault("BB_FRAMES_AHEAD", "2")
 
@@ -991,7 +998,8 @@ class BloodborneLauncher(tk.Tk):
             f"ResScaling={'on' if self.feat_res_scaling.get() else 'off'}, "
             f"Tracing={'on' if self.feat_tracing.get() else 'off'}, "
             f"Watchdog={'on' if self.feat_watchdog.get() else 'off'}, "
-            f"DrawPrep={'on' if self.feat_draw_prep.get() else 'off'}"
+            f"DrawPrep={'on' if self.feat_draw_prep.get() else 'off'}, "
+            f"Fullscreen={'on' if self.fullscreen.get() else 'off'}"
         )
 
         self.hidden_count = 0
