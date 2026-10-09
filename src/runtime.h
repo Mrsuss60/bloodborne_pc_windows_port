@@ -5,6 +5,9 @@
 #ifdef _WIN32
 #include "win32_compat.h"
 #endif
+#ifdef __APPLE__
+#include "darwin_compat.h"
+#endif
 #include "host_sync.h"
 
 #ifdef _WIN32
@@ -27,6 +30,12 @@ extern __thread RuntimeRecoverBuf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
 #define ABI __attribute__((sysv_abi))
+/* Functions that top-level asm calls or defines by plain name (Darwin prefixes C symbols with '_'). */
+#ifdef __APPLE__
+#define ASM_NAME(name) __asm__(#name)
+#else
+#define ASM_NAME(name)
+#endif
 typedef void (ABI *GuestCallback)(void);
 
 #define CHECK_LOW_ADDR(ptr) do { \
@@ -61,7 +70,7 @@ void runtime_thread_report(void);
 void runtime_set_main_tls(const void *data, uint64_t filesz, uint64_t memsz, uint64_t align);
 void runtime_thread_attach_main(void);
 void *runtime_thread_get_tcb(void);
-ABI void restore_guest_fs(void);
+ABI void restore_guest_fs(void) ASM_NAME(restore_guest_fs);
 int32_t *runtime_errno(void);
 uintptr_t runtime_sema_resolve(const char *name);
 void runtime_sema_report(void);

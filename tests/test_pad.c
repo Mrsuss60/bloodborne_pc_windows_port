@@ -26,12 +26,14 @@ int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert
     if (smoothing) { *smoothing = 0.2f; }
     return 1;
 }
+#ifdef _WIN32 /* build.sh links runtime_host.c, which defines it */
 uint64_t host_monotonic_ns(void) {
     LARGE_INTEGER freq, counter;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&counter);
     return (uint64_t)((counter.QuadPart * 1000000000ULL) / freq.QuadPart);
 }
+#endif
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;

@@ -8,7 +8,14 @@
 
 int vulkan_smoke(void) {
     VkApplicationInfo app = {.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName="Bloodborne native probe", .apiVersion=VK_API_VERSION_1_0};
+#ifdef __APPLE__
+    /* MoltenVK is a portability driver: the loader lists it only when asked to. */
+    const char *portability = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    VkInstanceCreateInfo ici = {.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .flags=VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
+                                .pApplicationInfo=&app, .enabledExtensionCount=1, .ppEnabledExtensionNames=&portability};
+#else
     VkInstanceCreateInfo ici = {.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo=&app};
+#endif
     VkInstance instance; CHECK(vkCreateInstance(&ici, NULL, &instance));
     uint32_t count = 0; CHECK(vkEnumeratePhysicalDevices(instance, &count, NULL));
     if (!count) { fprintf(stderr, "Vulkan: no physical devices\n"); vkDestroyInstance(instance, NULL); return 1; }
@@ -27,7 +34,13 @@ int vulkan_smoke(void) {
     if (family == nq) { fprintf(stderr, "Vulkan: no graphics queue\n"); vkDestroyInstance(instance, NULL); return 1; }
     float priority = 1;
     VkDeviceQueueCreateInfo qci = {.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex=family, .queueCount=1, .pQueuePriorities=&priority};
+#ifdef __APPLE__
+    const char *subset = "VK_KHR_portability_subset"; /* required on a portability driver */
+    VkDeviceCreateInfo dci = {.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount=1, .pQueueCreateInfos=&qci,
+                              .enabledExtensionCount=1, .ppEnabledExtensionNames=&subset};
+#else
     VkDeviceCreateInfo dci = {.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount=1, .pQueueCreateInfos=&qci};
+#endif
     VkDevice device; CHECK(vkCreateDevice(physical, &dci, NULL, &device));
     VkQueue queue; vkGetDeviceQueue(device, family, 0, &queue);
     VkBufferCreateInfo bci = {.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size=4096, .usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode=VK_SHARING_MODE_EXCLUSIVE};

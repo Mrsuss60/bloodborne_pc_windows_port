@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "runtime.h"
+/* The loader (probe.c) restores the guest thread pointer after host calls; not linked here. */
+ABI void restore_guest_fs(void) {}
 #include <stdlib.h>
 
 /* The settings menu of the GPU library restarts through probe.c, which tests do not link. */

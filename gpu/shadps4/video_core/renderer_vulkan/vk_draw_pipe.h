@@ -161,6 +161,10 @@ private:
         on_stage_b = true;
 #ifdef _WIN32
         stage_b_tid.store(static_cast<u32>(GetCurrentThreadId()), std::memory_order_release);
+#elif defined(__APPLE__)
+        u64 tid = 0;
+        pthread_threadid_np(nullptr, &tid);
+        stage_b_tid.store(static_cast<u32>(tid), std::memory_order_release);
 #else
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
 #endif

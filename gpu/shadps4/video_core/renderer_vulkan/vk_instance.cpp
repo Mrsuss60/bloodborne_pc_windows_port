@@ -253,6 +253,10 @@ bool Instance::CreateDevice() {
     };
 
     // Required
+#ifdef __APPLE__
+    // bbport: required whenever a portability driver (MoltenVK) exposes it.
+    add_extension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+#endif
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
@@ -264,10 +268,18 @@ bool Instance::CreateDevice() {
                "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
     const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
+#ifdef __APPLE__
+    // bbport: MoltenVK (Metal) has no robustBufferAccess2; Metal itself bounds buffer and
+    // texture accesses, so robust*Access2 are enabled only where the driver has them.
+    if (!robustness2_features.robustBufferAccess2 || !robustness2_features.robustImageAccess2) {
+        LOG_WARNING(Render_Vulkan, "robustBufferAccess2/robustImageAccess2 unavailable (MoltenVK)");
+    }
+#else
     ASSERT_MSG(robustness2_features.robustBufferAccess2,
                "Required Vulkan feature unavailable: robustBufferAccess2");
     ASSERT_MSG(robustness2_features.robustImageAccess2,
                "Required Vulkan feature unavailable: robustImageAccess2");
+#endif
     ASSERT_MSG(robustness2_features.nullDescriptor,
                "Required Vulkan feature unavailable: nullDescriptor");
 
@@ -489,8 +501,8 @@ bool Instance::CreateDevice() {
             .depthClipEnable = true,
         },
         vk::PhysicalDeviceRobustness2FeaturesEXT{
-            .robustBufferAccess2 = true,
-            .robustImageAccess2 = true,
+            .robustBufferAccess2 = robustness2_features.robustBufferAccess2,
+            .robustImageAccess2 = robustness2_features.robustImageAccess2,
             .nullDescriptor = true,
         },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{

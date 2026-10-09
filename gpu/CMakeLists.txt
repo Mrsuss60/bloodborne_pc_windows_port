@@ -100,6 +100,8 @@ if (WIN32)
             pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
         endif()
     endif()
+elseif (APPLE)
+    pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 else()
     pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
@@ -183,6 +185,14 @@ set(COMMON
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+if (APPLE)
+    # pkg_check_modules folds repeated "-framework X" flags into one "-framework X Y Z";
+    # the frameworks of a static FFmpeg are linked explicitly instead.
+    set_property(TARGET PkgConfig::FFMPEG PROPERTY INTERFACE_LINK_OPTIONS "")
+    target_link_libraries(PkgConfig::FFMPEG INTERFACE "-framework AudioToolbox" "-framework VideoToolbox"
+        "-framework CoreFoundation" "-framework CoreMedia" "-framework CoreVideo" "-framework CoreServices"
+        "-framework Security")
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 if (WIN32)
     add_library(bbgpu STATIC ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
@@ -212,9 +222,14 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_pa
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 if (WIN32)
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+elseif (APPLE)
+    target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_METAL_EXT)
 endif()
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
-if (NOT WIN32)
+if (APPLE)
+    # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe at load time.
+    target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
+elseif (NOT WIN32)
     # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
@@ -222,6 +237,9 @@ target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vu
 if (WIN32)
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit ws2_32)
+elseif (APPLE)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+        tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 else()
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
@@ -282,6 +300,8 @@ if (WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/../src/win32_compat.c"
         "${CMAKE_CURRENT_SOURCE_DIR}/../src/win32_memory.c"
     )
+elseif (APPLE)
+    list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../src/darwin_compat.c")
 endif()
 add_executable(bbport
     ../src/probe.c

@@ -72,7 +72,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
            PS4 priority scheduler, host threads run at equal priority. */
         if (getenv("BB_TRACE_SEMA")) fprintf(stderr,"Runtime: blocking wait on semaphore %u (need %d, count %d)\n",id,need,s->count);
         Waiter w={.need=need};
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         host_cond_init(&w.event);
 #else
         pthread_condattr_t attr;
@@ -87,7 +87,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
         uint64_t deadline=timeout ? now_ns()+(uint64_t)*timeout*1000 : 0;
         runtime_thread_set_blocked("semaphore", id);
         while (!w.done) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
             int e=0;
             if (timeout) {
                 uint64_t now=now_ns();
@@ -111,7 +111,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
             *timeout=result ? 0 : (uint32_t)(now>=deadline ? 0 : (deadline-now)/1000);
         }
 #ifndef _WIN32
-        host_check(pthread_cond_destroy(&w.event));
+        host_check(pthread_cond_destroy(&w.event)); /* host_cond_init on Darwin: a plain pthread cond */
 #endif
         if (!--s->active && s->deleted) free(s);
     }

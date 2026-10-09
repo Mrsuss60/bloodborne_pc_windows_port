@@ -19,15 +19,27 @@
 #endif
 #else
 #include <sys/mman.h>
-#include <malloc.h>
 #include <unistd.h>
 #include <signal.h>
-#include <ucontext.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <execinfo.h>
-#include <sys/syscall.h>
 #include <sys/uio.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#include <mach/mach.h>
+/* Darwin's machine context: the x86-64 thread state (also under Rosetta 2). */
+#define CONTEXT_RIP(uc) ((uc)->uc_mcontext->__ss.__rip)
+#define CONTEXT_RBP(uc) ((uc)->uc_mcontext->__ss.__rbp)
+#define CONTEXT_RDI(uc) ((uc)->uc_mcontext->__ss.__rdi)
+#else
+#include <malloc.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
+#define CONTEXT_RIP(uc) ((uc)->uc_mcontext.gregs[REG_RIP])
+#define CONTEXT_RBP(uc) ((uc)->uc_mcontext.gregs[REG_RBP])
+#define CONTEXT_RDI(uc) ((uc)->uc_mcontext.gregs[REG_RDI])
+#endif
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -120,7 +132,7 @@ static uint64_t read64(FILE *f) {
     for (int i = 7; i >= 0; --i) n = (n << 8) | b[i];
     return n;
 }
-static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
+static size_t round_to_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) {
@@ -154,8 +166,10 @@ static void protect(void *p, size_t size, unsigned flags) {
     if (mprotect(p, size, mode)) fail("mprotect failed");
 #endif
 }
+#ifdef _WIN32
 static volatile uint64_t g_last_progress_tick = 0;
 static volatile int g_watchdog_running = 1;
+#endif
 
 void runtime_notify_progress(void) {
 #ifdef _WIN32
@@ -185,6 +199,8 @@ static inline int check_noisy_import(const char *sym) {
             !strcmp(sym, "scePthreadSelf") || !strcmp(sym, "_Getpctype"));
 }
 
+ABI void *pre_import_hook(uint32_t index, uint64_t *args, void *caller) ASM_NAME(pre_import_hook);
+ABI void post_import_hook(uint32_t index, uint64_t ret_val) ASM_NAME(post_import_hook);
 ABI void *pre_import_hook(uint32_t index, uint64_t *args, void *caller) {
     runtime_notify_progress();
     if (index >= import_count) return NULL;
@@ -266,7 +282,7 @@ ABI void post_import_hook(uint32_t index, uint64_t ret_val) {
     }
 }
 
-void common_dispatch(void);
+void common_dispatch(void) ASM_NAME(common_dispatch);
 __asm__(
 ".text\n"
 ".globl common_dispatch\n"
@@ -355,6 +371,8 @@ __asm__(
 "   ret\n"
 );
 
+static char g_run_timestamp[32];
+#ifdef _WIN32 /* the watchdog thread below */
 static void print_code_loc(const char *prefix, uintptr_t addr) {
     if (addr >= (uintptr_t)image && addr < (uintptr_t)image + (image_size ? image_size : 0x20000000)) {
         uintptr_t off = addr - (uintptr_t)image;
@@ -499,7 +517,6 @@ static void dump_watchdog(void) {
     fflush(stdout);
 }
 
-static char g_run_timestamp[32];
 
 static void dump_hang_snapshot(const char *path, uint64_t elapsed_s, uint64_t cur_flips, uint64_t cur_submits, uint64_t now) {
     FILE *f = fopen(path, "w");
@@ -648,6 +665,7 @@ static void dump_hang_snapshot(const char *path, uint64_t elapsed_s, uint64_t cu
     printf("\n[WATCHDOG] Flips stalled for 5s: snapshot written to %s\n\n", path);
     fflush(stdout);
 }
+#endif
 
 #ifdef _WIN32
 static DWORD WINAPI watchdog_worker(LPVOID param) {
@@ -1088,7 +1106,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
 }
 #else
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
-void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
+void enter_on_stack(void *entry, void *arg0, void *arg1, void *top) ASM_NAME(enter_on_stack);
 __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
         " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
@@ -1114,7 +1132,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    uintptr_t rip = (uintptr_t)CONTEXT_RIP(uc);
     char line[512];
     Dl_info where;
     if (rip - (uintptr_t)image < 0x10000000)
@@ -1151,18 +1169,22 @@ static void write_hex(char *out, uint64_t v) {
 }
 static void dump_frames(ucontext_t *uc) {
     char line[] = "  tid=0000000000000000 rip=0000000000000000 image-relative=0000000000000000 host-relative=0000000000000000\n";
-    uintptr_t rip=(uintptr_t)uc->uc_mcontext.gregs[REG_RIP], rbp=(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+    uintptr_t rip=(uintptr_t)CONTEXT_RIP(uc), rbp=(uintptr_t)CONTEXT_RBP(uc);
     uint64_t tid=(uint64_t)gettid();
     /* First argument register: the lock address when a thread waits on a futex. */
     char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
-    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
+    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)CONTEXT_RDI(uc));
     { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
     for (int depth=0; depth<24; ++depth) {
         write_hex(line+6,tid); write_hex(line+27,rip); write_hex(line+59,rip-(uintptr_t)image); write_hex(line+90,rip-exe_base);
         { ssize_t written_=write(2,line,sizeof(line)-1); (void)written_; }
         uintptr_t frame[2];
+#ifdef __APPLE__
+        if (!rbp || darwin_read_memory(frame,(void *)rbp,sizeof(frame))!=(ssize_t)sizeof(frame)) break;
+#else
         struct iovec local={frame,sizeof(frame)}, remote={(void *)rbp,sizeof(frame)};
         if (!rbp || process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(frame)) break;
+#endif
         if (frame[0]<=rbp) break;
         rbp=frame[0]; rip=frame[1];
     }
@@ -1173,6 +1195,17 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     const char head[]="STOP: watchdog timeout; thread stacks:\n";
     { ssize_t written_=write(2,head,sizeof(head)-1); (void)written_; }
     dump_frames(context);
+#ifdef __APPLE__
+    /* Every other thread dumps its own frames (SIGUSR2). */
+    thread_act_array_t list; mach_msg_type_number_t count=0;
+    mach_port_t self_port=mach_thread_self();
+    if (task_threads(mach_task_self(),&list,&count)==KERN_SUCCESS) {
+        for (mach_msg_type_number_t i=0;i<count;++i) {
+            pthread_t other=list[i]!=self_port ? pthread_from_mach_thread_np(list[i]) : NULL;
+            if (other) { pthread_kill(other,SIGUSR2); usleep(20000); }
+        }
+    }
+#else
     int dir=open("/proc/self/task",O_RDONLY|O_DIRECTORY);
     char buffer[4096];
     long n;
@@ -1184,6 +1217,7 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
             if (tid>0 && tid!=self) { syscall(SYS_tgkill,getpid(),tid,SIGUSR2); usleep(20000); }
             at+=d->reclen;
         }
+#endif
     usleep(100000);
     _exit(128 + sig);
 }
@@ -1253,6 +1287,30 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased\n",count,bytes,rebased);
 }
+#ifdef __APPLE__
+/* link_libc.py/link_modules.py rewrite the eboot's `mov rax, fs:[0]` to `mov rax, gs:[0]`
+ * (Linux: GS base = guest TCB). macOS points GS at the pthread TSD array, so the
+ * displacement becomes the TSD slot that holds the guest TCB (darwin_compat.c). */
+static void patch_tls_loads(const Segment *segments, uint64_t ns) {
+    static const unsigned char gs_load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
+    static const unsigned char fs_load[]={0x64,0x48,0x8b,0x04,0x25,0,0,0,0};
+    uint32_t disp=runtime_darwin_tls_slot()*8;
+    uint64_t patched=0;
+    for (uint64_t i=0;i<ns;++i) {
+        if (!(segments[i].flags&1)) continue;
+        unsigned char *at=image+segments[i].address, *end=at+segments[i].size;
+        while (at+sizeof(gs_load)<=end) {
+            unsigned char *gs=memmem(at,(size_t)(end-at),gs_load,sizeof(gs_load));
+            unsigned char *fs=memmem(at,(size_t)(end-at),fs_load,sizeof(fs_load));
+            unsigned char *hit=!gs ? fs : !fs ? gs : gs<fs ? gs : fs;
+            if (!hit) break;
+            hit[0]=0x65; memcpy(hit+5,&disp,4);
+            ++patched; at=hit+sizeof(gs_load);
+        }
+    }
+    printf("Thread pointer loads: %" PRIu64 " pointed at TSD slot %u\n",patched,(unsigned)(disp/8));
+}
+#endif
 /* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
  * applied at start). Descriptors are closed first so the old GPU device and its memory are
  * released before the new process opens its own. */
@@ -1260,7 +1318,11 @@ void runtime_restart(void) {
     fflush(NULL);
 #ifndef _WIN32
     puts("Runtime: restarting through run.sh");
+#ifdef __APPLE__
+    for (int fd=getdtablesize()-1; fd>=3; --fd) close(fd);
+#else
     syscall(SYS_close_range, 3u, ~0u, 0u);
+#endif
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
@@ -1327,9 +1389,10 @@ int main(int argc, char **argv) {
         printf("[FAST PATH] Tracing disabled (BB_TRACE=0): direct import dispatch active.\n");
     }
     atexit(print_exit_summary);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
-       non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
+       non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits.
+       Windows and macOS have no such heap; those objects come from runtime_low_*. */
     mallopt(M_ARENA_MAX,1);
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
@@ -1479,7 +1542,7 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
-    image = allocate(round_page(size));
+    image = allocate(round_to_page(size));
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -1516,7 +1579,7 @@ int main(int argc, char **argv) {
             is_unbound[i] = 1;
         }
     }
-    unsigned char *thunks = allocate(round_page((import_count + 1) * 32));
+    unsigned char *thunks = allocate(round_to_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
@@ -1560,11 +1623,14 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
-    protect(thunks, round_page((import_count + 1) * 32), 5);
-    protect(image, round_page(size), 0);
+#ifdef __APPLE__
+    patch_tls_loads(segments, ns);
+#endif
+    protect(thunks, round_to_page((import_count + 1) * 32), 5);
+    protect(image, round_to_page(size), 0);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {
-        protect(image + segments[i].address, round_page(segments[i].size), (unsigned)segments[i].flags);
+        protect(image + segments[i].address, round_to_page(segments[i].size), (unsigned)segments[i].flags);
         if ((segments[i].flags & 1) && entry >= segments[i].address && entry - segments[i].address < segments[i].size)
             executable_entry = 1;
     }
