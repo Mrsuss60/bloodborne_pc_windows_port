@@ -1150,6 +1150,19 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    /* Each guest thread's last imports (recorded while BB_TRACE is on): what the other threads
+     * were doing, e.g. which one released an object another thread still uses. */
+    for (GuestThread *t=runtime_thread_get_all(); t; t=t->next) {
+        if (t->finished || !t->recent_import_count) continue;
+        uint32_t count=t->recent_import_count<32 ? t->recent_import_count : 32;
+        fprintf(stderr,"Thread '%s': last %u of %u imports:",t->name,count,t->recent_import_count);
+        for (uint32_t i=0;i<count;++i) {
+            uint32_t idx=t->recent_imports[(t->recent_import_count-count+i)&31];
+            const char *sym=idx<import_count ? runtime_import_name(names[idx]) : NULL;
+            fprintf(stderr," %s",sym ? sym : idx<import_count ? names[idx] : "?");
+        }
+        fputc('\n',stderr);
+    }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
