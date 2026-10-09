@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstring>
+#include <type_traits>
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/types.h"

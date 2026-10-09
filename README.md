@@ -25,6 +25,8 @@ This repository adapts the original Linux codebase specifically for Windows syst
 - **AT9 Audio Playback**: Bundles LibAtrac9 compilation to decode AT9 game audio natively on Windows.
 - **Windows Build System**: Standalone `build.bat` script that compiles the complete project with MinGW-w64 (GCC), CMake, and Ninja.
 
+> **macOS (Apple Silicon):** an experimental x86-64 build under Rosetta 2 with MoltenVK compiles and passes the runtime tests, but does not run the game yet. See [docs/MACOS.md](docs/MACOS.md).
+
 ---
 
 ## Technical Highlights

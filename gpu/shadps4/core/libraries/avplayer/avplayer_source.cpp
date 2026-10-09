@@ -679,7 +679,7 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     const auto width = Common::AlignUp<u32>(frame.width, 16);
     const auto pitch = Common::AlignUp<u32>(frame.width, 64);
     const auto height = Common::AlignUp<u32>(frame.height, 16);
-    if (Core::Memory::Instance() && reinterpret_cast<uintptr_t>(p_buffer) >= 0x1000000000ULL) {
+    if (Core::Memory::Instance() && !IsHostMemory(p_buffer)) {
         Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(p_buffer),
                                                    (width * height * 3) / 2);
     }
