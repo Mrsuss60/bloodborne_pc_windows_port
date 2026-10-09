@@ -15,6 +15,23 @@ static inline int setenv(const char *name, const char *value, int overwrite) {
 
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
+int bbgpu_text_input_is_active(void) { return 0; }
+void bbgpu_consume_mouse_delta(float *dx, float *dy) { if (dx) *dx = 0.0f; if (dy) *dy = 0.0f; }
+int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert_y, float *deadzone, float *smoothing) {
+    if (sens_x) { *sens_x = 1.0f; }
+    if (sens_y) { *sens_y = 1.0f; }
+    if (invert_x) { *invert_x = 0; }
+    if (invert_y) { *invert_y = 0; }
+    if (deadzone) { *deadzone = 0.05f; }
+    if (smoothing) { *smoothing = 0.2f; }
+    return 1;
+}
+uint64_t host_monotonic_ns(void) {
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (uint64_t)((counter.QuadPart * 1000000000ULL) / freq.QuadPart);
+}
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;

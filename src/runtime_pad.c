@@ -133,30 +133,131 @@ static void sample_host(PadData *d) {
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
     }
     if (!k) return;
-    static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
-        {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_RETURN,BTN_CROSS}, {SDL_SCANCODE_KP_ENTER,BTN_CROSS},
-        {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_ESCAPE,BTN_CIRCLE},
-        {SDL_SCANCODE_E,BTN_SQUARE}, {SDL_SCANCODE_Q,BTN_TRIANGLE},
-        {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
-        {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2},
-        {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
-        {SDL_SCANCODE_F1,BTN_OPTIONS}, {SDL_SCANCODE_O,BTN_OPTIONS},
-        {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN},
-        {SDL_SCANCODE_LEFT,BTN_LEFT}, {SDL_SCANCODE_RIGHT,BTN_RIGHT},
-    };
-    for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
-    if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
-    if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
-    if (d->buttons & BTN_L2) if (d->l2 < 255) d->l2=255;
-    if (d->buttons & BTN_R2) if (d->r2 < 255) d->r2=255;
-    if (k[SDL_SCANCODE_A]) d->left_x = 0;
-    else if (k[SDL_SCANCODE_D]) d->left_x = 255;
-    if (k[SDL_SCANCODE_W]) d->left_y = 0;
-    else if (k[SDL_SCANCODE_S]) d->left_y = 255;
+
+    // Souls PC Mouse & Keyboard integration
+    float mouse_dx = 0.0f, mouse_dy = 0.0f;
+    bbgpu_consume_mouse_delta(&mouse_dx, &mouse_dy);
+
+    float sens_x = 1.0f, sens_y = 1.0f, deadzone = 0.05f, smoothing = 0.2f;
+    int inv_x = 0, inv_y = 0;
+    const int mk_enabled = bbgpu_get_mk_config(&sens_x, &sens_y, &inv_x, &inv_y, &deadzone, &smoothing);
+
+    // Mouse Buttons
+    float mouse_x_pos = 0.0f, mouse_y_pos = 0.0f;
+    const SDL_MouseButtonFlags mouse_buttons = SDL_GetMouseState(&mouse_x_pos, &mouse_y_pos);
+    const bool lmb = (mouse_buttons & SDL_BUTTON_LMASK) != 0;
+    const bool rmb = (mouse_buttons & SDL_BUTTON_RMASK) != 0;
+    const bool mmb = (mouse_buttons & SDL_BUTTON_MMASK) != 0;
+
+    const bool lshift = k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT];
+
+    if (mk_enabled) {
+        // Combat bindings (Souls PC pattern):
+        // LMB: Light Attack / Trick weapon normal attack (R1)
+        // Shift + LMB or R key: Heavy Attack (R2)
+        if (lshift && lmb) {
+            d->buttons |= BTN_R2;
+        } else if (lmb) {
+            d->buttons |= BTN_R1;
+        }
+
+        // RMB: Left hand weapon / Fire firearm (L2)
+        // Shift + RMB or Tab: Weapon Trick transform (L1)
+        if (lshift && rmb) {
+            d->buttons |= BTN_L1;
+        } else if (rmb) {
+            d->buttons |= BTN_L2;
+        }
+
+        // Middle Mouse Button or Q: Lock-on / Reset Camera (R3)
+        if (mmb || k[SDL_SCANCODE_Q]) {
+            d->buttons |= BTN_R3;
+        }
+
+        // Keyboard Actions (Souls PC pattern):
+        // Space: Roll / Backstep / Dash (Circle)
+        if (k[SDL_SCANCODE_SPACE]) d->buttons |= BTN_CIRCLE;
+        // E: Action / Interact / Pick up / Talk (Cross)
+        if (k[SDL_SCANCODE_E] || k[SDL_SCANCODE_RETURN] || k[SDL_SCANCODE_KP_ENTER]) d->buttons |= BTN_CROSS;
+        // R: Use Quick Item (Blood Vial / Consumable) (Square)
+        if (k[SDL_SCANCODE_R]) d->buttons |= BTN_SQUARE;
+        // X: Switch weapon mode / 2-hand mode (Triangle)
+        if (k[SDL_SCANCODE_X]) d->buttons |= BTN_TRIANGLE;
+        // C: Crouching / Gestures / L3
+        if (k[SDL_SCANCODE_C] || k[SDL_SCANCODE_Z]) d->buttons |= BTN_L3;
+        // Tab / G / Backspace: Personal Effects / Gestures (Touchpad)
+        if (k[SDL_SCANCODE_TAB] || k[SDL_SCANCODE_G]) touch_click(d, 0);
+        if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d, 1);
+        // Esc: Menu / Options (Options)
+        if (k[SDL_SCANCODE_ESCAPE]) d->buttons |= BTN_OPTIONS;
+
+        // D-Pad Quick Item / Weapon selection (Arrow keys or 1,2,3,4)
+        if (k[SDL_SCANCODE_UP] || k[SDL_SCANCODE_1]) d->buttons |= BTN_UP;
+        if (k[SDL_SCANCODE_DOWN] || k[SDL_SCANCODE_2]) d->buttons |= BTN_DOWN;
+        if (k[SDL_SCANCODE_LEFT] || k[SDL_SCANCODE_3]) d->buttons |= BTN_LEFT;
+        if (k[SDL_SCANCODE_RIGHT] || k[SDL_SCANCODE_4]) d->buttons |= BTN_RIGHT;
+
+        // Movement (WASD -> Left Stick)
+        if (k[SDL_SCANCODE_A]) d->left_x = 0;
+        else if (k[SDL_SCANCODE_D]) d->left_x = 255;
+        if (k[SDL_SCANCODE_W]) d->left_y = 0;
+        else if (k[SDL_SCANCODE_S]) d->left_y = 255;
+
+        // Camera Look (Mouse Delta -> Right Stick)
+        static float filtered_dx = 0.0f;
+        static float filtered_dy = 0.0f;
+        filtered_dx = filtered_dx * smoothing + mouse_dx * (1.0f - smoothing);
+        filtered_dy = filtered_dy * smoothing + mouse_dy * (1.0f - smoothing);
+
+        float aim_x = filtered_dx * sens_x * 8.0f;
+        float aim_y = filtered_dy * sens_y * 8.0f;
+
+        if (inv_x) aim_x = -aim_x;
+        if (inv_y) aim_y = -aim_y;
+
+        // Deadzone check
+        if (aim_x > -deadzone * 128.0f && aim_x < deadzone * 128.0f) aim_x = 0.0f;
+        if (aim_y > -deadzone * 128.0f && aim_y < deadzone * 128.0f) aim_y = 0.0f;
+
+        int stick_rx = 128 + (int)aim_x;
+        int stick_ry = 128 + (int)aim_y;
+        if (stick_rx < 0) stick_rx = 0; else if (stick_rx > 255) stick_rx = 255;
+        if (stick_ry < 0) stick_ry = 0; else if (stick_ry > 255) stick_ry = 255;
+
+        // Only override right stick if mouse delta was observed, allowing IJKL / arrow fallback
+        if (mouse_dx != 0.0f || mouse_dy != 0.0f || filtered_dx > 0.1f || filtered_dx < -0.1f || filtered_dy > 0.1f || filtered_dy < -0.1f) {
+            d->right_x = (uint8_t)stick_rx;
+            d->right_y = (uint8_t)stick_ry;
+        }
+    } else {
+        // Fallback layout when M&K mode is disabled
+        static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
+            {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_RETURN,BTN_CROSS}, {SDL_SCANCODE_KP_ENTER,BTN_CROSS},
+            {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_ESCAPE,BTN_CIRCLE},
+            {SDL_SCANCODE_E,BTN_SQUARE}, {SDL_SCANCODE_Q,BTN_TRIANGLE},
+            {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
+            {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2},
+            {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
+            {SDL_SCANCODE_F1,BTN_OPTIONS}, {SDL_SCANCODE_O,BTN_OPTIONS},
+            {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN},
+            {SDL_SCANCODE_LEFT,BTN_LEFT}, {SDL_SCANCODE_RIGHT,BTN_RIGHT},
+        };
+        for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
+        if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
+        if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
+        if (k[SDL_SCANCODE_A]) d->left_x = 0;
+        else if (k[SDL_SCANCODE_D]) d->left_x = 255;
+        if (k[SDL_SCANCODE_W]) d->left_y = 0;
+        else if (k[SDL_SCANCODE_S]) d->left_y = 255;
+    }
+
     if (k[SDL_SCANCODE_I]) d->right_y = 0;
     else if (k[SDL_SCANCODE_K]) d->right_y = 255;
     if (k[SDL_SCANCODE_J]) d->right_x = 0;
     else if (k[SDL_SCANCODE_L]) d->right_x = 255;
+
+    if (d->buttons & BTN_L2) if (d->l2 < 255) d->l2=255;
+    if (d->buttons & BTN_R2) if (d->r2 < 255) d->r2=255;
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated

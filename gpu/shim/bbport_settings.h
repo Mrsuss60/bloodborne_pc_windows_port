@@ -66,6 +66,14 @@ struct Values {
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
+    /// Mouse & Keyboard controls settings
+    std::atomic<bool> mk_enabled{true};
+    std::atomic<float> mk_sens_x{1.0f};
+    std::atomic<float> mk_sens_y{1.0f};
+    std::atomic<bool> mk_invert_x{false};
+    std::atomic<bool> mk_invert_y{false};
+    std::atomic<float> mk_deadzone{0.05f};
+    std::atomic<float> mk_smoothing{0.2f};
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
@@ -91,6 +99,8 @@ Values& Get();
 
 /// Reads the file, then the environment overrides. Called once at start.
 void Load();
+/// Re-reads the ini file at run time to apply external changes in real time.
+void Reload();
 /// Checks the loaded choice before the first frame; unsupported FSR 4 uses FSR 3.1.
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.

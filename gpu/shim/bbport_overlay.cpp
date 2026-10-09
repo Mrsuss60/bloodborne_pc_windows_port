@@ -586,6 +586,18 @@ void Menu() {
         Slider("Масштаб HUD", s.hud_scale, 0.5f, 2.0f);
     }
 
+    ImGui::SeparatorText("Управление мышью и клавиатурой (M&K)");
+    Checkbox("Включить управление мышью и клавиатурой", s.mk_enabled);
+    Hint("Схема управления в стиле Souls PC: обзор мышью (захват курсора), ЛКМ - обычная атака (R1), Shift+ЛКМ - сильная (R2), ПКМ - выстрел/левая рука (L2), СКМ - захват цели (R3), Tab - трансформация оружия (L1)");
+    if (s.mk_enabled) {
+        Slider("Чувствительность по горизонтали (X)", s.mk_sens_x, 0.1f, 5.0f);
+        Slider("Чувствительность по вертикали (Y)", s.mk_sens_y, 0.1f, 5.0f);
+        Checkbox("Инвертировать обзор по горизонтали (X)", s.mk_invert_x);
+        Checkbox("Инвертировать обзор по вертикали (Y)", s.mk_invert_y);
+        Slider("Мёртвая зона мыши", s.mk_deadzone, 0.0f, 0.2f);
+        Slider("Сглаживание движений мыши", s.mk_smoothing, 0.0f, 0.8f);
+    }
+
     ImGui::Spacing();
     if (ImGui::Button("Закрыть")) {
         keep_open = false;

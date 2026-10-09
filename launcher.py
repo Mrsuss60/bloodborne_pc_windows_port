@@ -21,7 +21,7 @@ PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
 
 FPS_CHOICES = ["uncap", "60", "90", "30"]
-RES_CHOICES = ["Default (1080p)", "1280x720", "1920x1080", "2560x1440", "3840x2160"]
+RES_CHOICES = ["1920x1080 (Native)", "1280x720", "2560x1440", "3840x2160"]
 TIMEOUT_CHOICES = ["0 (no limit)", "10", "30", "60", "120", "300", "600"]
 ANISO_CHOICES = [
     ("16x", "16", "16x anisotropic filtering of scene textures (recommended)"),
@@ -229,6 +229,8 @@ class BloodborneLauncher(tk.Tk):
 
         fps = self.settings.get("fps", "uncap")
         res = self.settings.get("res", RES_CHOICES[0])
+        if res in ("Default (1080p)", "1920x1080"):
+            res = RES_CHOICES[0]
         timeout_val = str(self.settings.get("timeout", "0"))
         if timeout_val not in [c.split()[0] for c in TIMEOUT_CHOICES]:
             matching_choice = "0 (no limit)"
@@ -281,6 +283,8 @@ class BloodborneLauncher(tk.Tk):
 
         ttk.Button(feat_header, text="⚙  All XML Patches...", style="Secondary.TButton",
                    command=self.open_patches_dialog).pack(side="left", padx=(12, 0))
+        ttk.Button(feat_header, text="⌨  Mouse & Keyboard...", style="Secondary.TButton",
+                   command=self.open_mk_dialog).pack(side="left", padx=(6, 0))
 
         ttk.Button(feat_header, text="Vanilla mode", style="Secondary.TButton",
                    command=self.set_vanilla_mode).pack(side="right", padx=(6, 0))
@@ -617,6 +621,211 @@ class BloodborneLauncher(tk.Tk):
         ttk.Button(bottom_bar, text="Cancel", style="Secondary.TButton",
                    command=on_cancel).pack(side="right", ipady=4)
 
+    def open_mk_dialog(self):
+        """Mouse & Keyboard Settings Dialog with real-time bbport.ini synchronization."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Mouse & Keyboard Settings")
+        dlg.geometry("640x620")
+        dlg.minsize(560, 520)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg="#1a1a1a")
+
+        ini_path = APP_DIR / "bbport.ini"
+
+        # Load current values from bbport.ini or fallback to defaults
+        ini_values = {}
+        if ini_path.is_file():
+            try:
+                for line in ini_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        ini_values[k.strip()] = v.strip()
+            except OSError:
+                pass
+
+        mk_enabled_var = tk.BooleanVar(value=ini_values.get("mk_enabled", "1") != "0")
+        mk_invert_x_var = tk.BooleanVar(value=ini_values.get("mk_invert_x", "0") != "0")
+        mk_invert_y_var = tk.BooleanVar(value=ini_values.get("mk_invert_y", "0") != "0")
+
+        try:
+            sens_x_val = float(ini_values.get("mk_sens_x", "1.0"))
+        except ValueError:
+            sens_x_val = 1.0
+
+        try:
+            sens_y_val = float(ini_values.get("mk_sens_y", "1.0"))
+        except ValueError:
+            sens_y_val = 1.0
+
+        try:
+            deadzone_val = float(ini_values.get("mk_deadzone", "0.05"))
+        except ValueError:
+            deadzone_val = 0.05
+
+        try:
+            smoothing_val = float(ini_values.get("mk_smoothing", "0.2"))
+        except ValueError:
+            smoothing_val = 0.2
+
+        sens_x_var = tk.DoubleVar(value=sens_x_val)
+        sens_y_var = tk.DoubleVar(value=sens_y_val)
+        deadzone_var = tk.DoubleVar(value=deadzone_val)
+        smoothing_var = tk.DoubleVar(value=smoothing_val)
+
+        main_frame = ttk.Frame(dlg, style="Card.TFrame", padding=14)
+        main_frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        ttk.Label(main_frame, text="Mouse & Keyboard Controls", style="Card.TLabel",
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 4))
+        ttk.Label(main_frame, text="Configurable mouse and keyboard controls with real-time in-game synchronization.",
+                  style="Card.TLabel", font=("Segoe UI", 9), foreground="#aaaaaa").pack(anchor="w", pady=(0, 10))
+
+        ttk.Checkbutton(main_frame, text="Enable Mouse & Keyboard Mode",
+                        variable=mk_enabled_var, style="Card.TCheckbutton").pack(anchor="w", pady=(0, 10))
+
+        # Camera & Sensitivity card
+        cam_card = ttk.Frame(main_frame, style="Card.TFrame", padding=10)
+        cam_card.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(cam_card, text="Camera & Sensitivity Options", style="Card.TLabel",
+                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        # Sens X
+        ttk.Label(cam_card, text="Horizontal Sensitivity (X):", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=4)
+        lbl_sx = ttk.Label(cam_card, text=f"{sens_x_var.get():.2f}", style="Card.TLabel", width=6)
+        scale_sx = ttk.Scale(cam_card, from_=0.1, to=5.0, variable=sens_x_var,
+                             command=lambda v: lbl_sx.config(text=f"{float(v):.2f}"))
+        scale_sx.grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+        lbl_sx.grid(row=1, column=2, sticky="w", pady=4)
+
+        # Sens Y
+        ttk.Label(cam_card, text="Vertical Sensitivity (Y):", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=4)
+        lbl_sy = ttk.Label(cam_card, text=f"{sens_y_var.get():.2f}", style="Card.TLabel", width=6)
+        scale_sy = ttk.Scale(cam_card, from_=0.1, to=5.0, variable=sens_y_var,
+                             command=lambda v: lbl_sy.config(text=f"{float(v):.2f}"))
+        scale_sy.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+        lbl_sy.grid(row=2, column=2, sticky="w", pady=4)
+
+        # Deadzone
+        ttk.Label(cam_card, text="Mouse Deadzone:", style="Card.TLabel").grid(row=3, column=0, sticky="w", pady=4)
+        lbl_dz = ttk.Label(cam_card, text=f"{deadzone_var.get():.2f}", style="Card.TLabel", width=6)
+        scale_dz = ttk.Scale(cam_card, from_=0.0, to=0.2, variable=deadzone_var,
+                             command=lambda v: lbl_dz.config(text=f"{float(v):.2f}"))
+        scale_dz.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
+        lbl_dz.grid(row=3, column=2, sticky="w", pady=4)
+
+        # Smoothing
+        ttk.Label(cam_card, text="Mouse Smoothing:", style="Card.TLabel").grid(row=4, column=0, sticky="w", pady=4)
+        lbl_sm = ttk.Label(cam_card, text=f"{smoothing_var.get():.2f}", style="Card.TLabel", width=6)
+        scale_sm = ttk.Scale(cam_card, from_=0.0, to=0.8, variable=smoothing_var,
+                             command=lambda v: lbl_sm.config(text=f"{float(v):.2f}"))
+        scale_sm.grid(row=4, column=1, sticky="ew", padx=8, pady=4)
+        lbl_sm.grid(row=4, column=2, sticky="w", pady=4)
+
+        # Invert checkboxes
+        inv_frame = ttk.Frame(cam_card, style="Card.TFrame")
+        inv_frame.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(inv_frame, text="Invert Horizontal Camera (X)",
+                        variable=mk_invert_x_var, style="Card.TCheckbutton").pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(inv_frame, text="Invert Vertical Camera (Y)",
+                        variable=mk_invert_y_var, style="Card.TCheckbutton").pack(side="left")
+
+        cam_card.columnconfigure(1, weight=1)
+
+        # Keybinds Reference Card
+        bind_card = ttk.Frame(main_frame, style="Card.TFrame", padding=10)
+        bind_card.pack(fill="both", expand=True, pady=(0, 10))
+
+        ttk.Label(bind_card, text="Control Bindings", style="Card.TLabel",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+
+        bindings = [
+            ("Left Click (LMB)", "Right Hand Attack (R1) / Trick Normal Attack"),
+            ("Shift + Left Click", "Strong / Heavy Attack (R2)"),
+            ("Right Click (RMB)", "Left Hand Weapon (L2) / Fire Firearm"),
+            ("Shift + Right Click", "Trick Weapon Transform (L1)"),
+            ("Middle Click / Q", "Lock-On Target / Reset Camera (R3)"),
+            ("W / A / S / D", "Character Movement (Left Stick)"),
+            ("Space", "Roll / Backstep / Sprint (Circle)"),
+            ("E", "Action / Interact / Talk (Cross)"),
+            ("R", "Use Quick Item / Blood Vial (Square)"),
+            ("X", "Switch Weapon Mode / Two-Hand (Triangle)"),
+            ("C / Z", "Crouch / Gestures (L3)"),
+            ("Tab / G", "Gestures & Personal Effects (Touchpad Left)"),
+            ("Esc", "Game Menu / Options (Options)"),
+            ("Arrow Keys / 1,2,3,4", "Switch Consumables & Weapons (D-Pad)"),
+        ]
+
+        bind_container = ttk.Frame(bind_card, style="Card.TFrame")
+        bind_container.pack(fill="both", expand=True)
+
+        for idx, (k_name, k_act) in enumerate(bindings):
+            row = idx % 7
+            col = (idx // 7) * 2
+            ttk.Label(bind_container, text=f"{k_name}:", style="Card.TLabel",
+                      font=("Segoe UI", 8, "bold"), foreground="#c5a059").grid(row=row, column=col, sticky="w", padx=(0, 4), pady=2)
+            ttk.Label(bind_container, text=k_act, style="Card.TLabel",
+                      font=("Segoe UI", 8), foreground="#cccccc").grid(row=row, column=col+1, sticky="w", padx=(0, 16), pady=2)
+
+        # Bottom actions
+        action_bar = ttk.Frame(dlg, style="Card.TFrame", padding=10)
+        action_bar.pack(fill="x", padx=12, pady=(0, 12))
+
+        def write_mk_settings():
+            # Update bbport.ini directly so game detects change in real time
+            lines = []
+            keys_to_update = {
+                "mk_enabled": "1" if mk_enabled_var.get() else "0",
+                "mk_sens_x": f"{sens_x_var.get():.2f}",
+                "mk_sens_y": f"{sens_y_var.get():.2f}",
+                "mk_invert_x": "1" if mk_invert_x_var.get() else "0",
+                "mk_invert_y": "1" if mk_invert_y_var.get() else "0",
+                "mk_deadzone": f"{deadzone_var.get():.2f}",
+                "mk_smoothing": f"{smoothing_var.get():.2f}",
+            }
+            written_keys = set()
+            if ini_path.is_file():
+                try:
+                    for line in ini_path.read_text(encoding="utf-8").splitlines():
+                        trimmed = line.strip()
+                        if trimmed and not trimmed.startswith("#") and "=" in trimmed:
+                            k, _ = trimmed.split("=", 1)
+                            k = k.strip()
+                            if k in keys_to_update:
+                                lines.append(f"{k}={keys_to_update[k]}")
+                                written_keys.add(k)
+                                continue
+                        lines.append(line)
+                except OSError:
+                    pass
+
+            for k, v in keys_to_update.items():
+                if k not in written_keys:
+                    lines.append(f"{k}={v}")
+
+            try:
+                ini_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                self.log(f"[M&K] Settings updated: sens=({sens_x_var.get():.2f}, {sens_y_var.get():.2f}), "
+                         f"inv=({int(mk_invert_x_var.get())}, {int(mk_invert_y_var.get())}), enabled={mk_enabled_var.get()}")
+            except OSError as ex:
+                self.log(f"[ERROR] Could not save {ini_path}: {ex}")
+
+        def on_save_close():
+            write_mk_settings()
+            dlg.destroy()
+
+        def on_close():
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+
+        ttk.Button(action_bar, text="Save & Close", style="Action.TButton",
+                   command=on_save_close).pack(side="right", padx=(8, 0), ipady=4)
+        ttk.Button(action_bar, text="Cancel", style="Secondary.TButton",
+                   command=on_close).pack(side="right", ipady=4)
+
     # ------------------------------------------------------------ settings
     def load_settings(self) -> dict:
         try:
@@ -912,8 +1121,10 @@ class BloodborneLauncher(tk.Tk):
         env.pop("BB_RENDER_RES", None)
         res_choice = self.res_var.get()
         if self.feat_res_scaling.get():
-            if res_choice != RES_CHOICES[0]:
+            if res_choice not in ("1920x1080 (Native)", "Default (1080p)", "1920x1080"):
                 env["BB_RENDER_RES"] = res_choice
+            else:
+                res_choice = "1920x1080 (Native, no scaling patch)"
         else:
             res_choice = "Native (1080p, scaling off)"
 

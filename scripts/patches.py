@@ -316,13 +316,15 @@ def main():
     # it into the output-size image with a viewport scaled by output / 1920
     # (UiComposition::NativeViewport), so it is rasterized at the output resolution.
     ui=OUTPUT_SIZE
-    if size:
+    if size and size != OUTPUT_SIZE:
         writes+=resolution_writes(a.xml,size,a.app_version,segments,ui)
         if size[0]*size[1]>OUTPUT_SIZE[0]*OUTPUT_SIZE[1]:
             heap='Increased Graphics Heap Sizes'
             writes+=compile_patches(a.xml,[heap],a.app_version,segments)
             names.append(heap)
         print(f'Patches: scene {size[0]}x{size[1]}; UI {ui[0]}x{ui[1]}')
+    elif size == OUTPUT_SIZE:
+        print(f'Patches: native 1080p selected (scene 1920x1080; UI 1920x1080, native executable layout)')
     if a.patches_dir:
         # After the built-in ones: an external patch of the same bytes wins.
         writes+=compile_external(external_selection(external_patches(a.patches_dir,a.app_version,a.xml),

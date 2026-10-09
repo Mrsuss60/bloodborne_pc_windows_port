@@ -181,9 +181,6 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
             target_height = h;
         }
     }
-    // Explicit resolution overrides retain the old compatibility path. Normal presets
-    // keep guest allocations/UI native and change only host raster targets at frame boundaries.
-    scaled_session = std::getenv("BB_RENDER_RES") && std::getenv("BB_RENDER_RES")[0];
     render_width = 1920;
     render_height = 1080;
     if (const char* res = std::getenv("BB_RENDER_RES")) {
@@ -193,6 +190,11 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
             render_height = h;
         }
     }
+    // Explicit resolution overrides retain the old compatibility path. Normal presets
+    // keep guest allocations/UI native and change only host raster targets at frame boundaries.
+    // 1920x1080 is the native PS4 resolution; a session rendering at 1080p is not a scaled session.
+    scaled_session = std::getenv("BB_RENDER_RES") && std::getenv("BB_RENDER_RES")[0] &&
+                     (render_width != 1920 || render_height != 1080);
     // Scene depth copied into the output-size UI depth by a blit (depth aspect).
     const auto features = instance.GetPhysicalDevice()
                               .getFormatProperties(vk::Format::eD32SfloatS8Uint)
@@ -1270,7 +1272,8 @@ float TemporalUpscaler::SceneMipBias() const {
 }
 
 bool TemporalUpscaler::Scaled() const {
-    return scaled_session || target_width != 1920 || target_height != 1080;
+    return (scaled_session && (render_width != 1920 || render_height != 1080)) ||
+           target_width != 1920 || target_height != 1080;
 }
 
 void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
@@ -1304,7 +1307,7 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
     }
     const auto& image = texture_cache.GetImage(color);
     const bool movie = vs_hash == ui_trigger_vs || UiComposition::MovieShader(vs_hash) ||
-                       (scaled_session && native_viewport);
+                       (scaled_session && (render_width != 1920 || render_height != 1080) && native_viewport);
     const bool ui_draw = movie &&
         (image.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
          image.info.pixel_format == vk::Format::eR8G8B8A8Srgb) &&
@@ -1390,8 +1393,13 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
     const auto aspect = vk::ImageAspectFlagBits::eDepth |
         (ui_depth_format == vk::Format::eD32SfloatS8Uint ? vk::ImageAspectFlagBits::eStencil
                                                       : vk::ImageAspectFlags{});
-    // Copy depth if blit is supported; otherwise just clear it (UI depth test still works).
-    const bool copy = depth_id && depth_blit &&
+    // UI composition draws Scaleform HUD/text elements at output resolution.
+    // Copying 3D scene depth causes world geometry (e.g. fences, terrain) to occlude HUD bars
+    // when resolutions are scaled. Clearing depth (to 1.0f) ensures all 2D HUD elements
+    // pass depth tests cleanly while preserving internal stencil masking.
+    static const bool copy_scene_depth = (std::getenv("BB_UI_DEPTH_COPY") != nullptr &&
+                                          std::strcmp(std::getenv("BB_UI_DEPTH_COPY"), "1") == 0);
+    const bool copy = copy_scene_depth && depth_id && depth_blit &&
         texture_cache.GetImage(depth_id).info.pixel_format == ui_depth_format;
     if (copy) {
         runtime.Transit(&texture_cache.GetImage(depth_id), vk::ImageLayout::eTransferSrcOptimal,

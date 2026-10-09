@@ -37,10 +37,15 @@ public:
     bool IsTextInputActive() const { return text_active; }
     std::string GetTextInputPrompt();
     std::string GetTextInputValue();
+    void ConsumeMouseDelta(float* dx, float* dy);
 
 private:
     std::atomic<s32> width, height;
     std::atomic<bool> is_open{true};
+    std::mutex mouse_delta_mutex;
+    float accumulated_mouse_dx = 0.0f;
+    float accumulated_mouse_dy = 0.0f;
+    bool relative_mouse_active = false;
     std::mutex text_mutex;
     bool text_requested{}, text_active{};
     int text_state{};

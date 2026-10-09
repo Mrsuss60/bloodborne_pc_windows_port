@@ -4,6 +4,10 @@ setlocal
 set "CURRENT_DIR=%~dp0"
 if "%CURRENT_DIR:~-1%"=="\" set "CURRENT_DIR=%CURRENT_DIR:~0,-1%"
 
+if not defined W64DEVKIT_DIR if exist "D:\DEV_CPP\w64devkit" set "W64DEVKIT_DIR=D:\DEV_CPP\w64devkit"
+if not defined SDL3_DIR if exist "D:\DEV_CPP\SDL3-3.4.12\x86_64-w64-mingw32" set "SDL3_DIR=D:\DEV_CPP\SDL3-3.4.12\x86_64-w64-mingw32"
+if not defined VULKAN_SDK if exist "D:\DEV_CPP\Vulkan-Headers" set "VULKAN_SDK=D:\DEV_CPP\Vulkan-Headers"
+
 rem Check if directory path is deep and could cause MAX_PATH errors (> 70 chars)
 rem If running directly from a deep path without a virtual root drive, mount and re-exec from X:
 if not "%BB_SUBST_ACTIVE%"=="1" (
@@ -30,6 +34,10 @@ cd /d "%~dp0"
 
 if not exist "out" mkdir out
 if not exist "out\gpu" mkdir out\gpu
+
+if not defined W64DEVKIT_DIR if exist "D:\DEV_CPP\w64devkit" set "W64DEVKIT_DIR=D:\DEV_CPP\w64devkit"
+if not defined SDL3_DIR if exist "D:\DEV_CPP\SDL3-3.4.12\x86_64-w64-mingw32" set "SDL3_DIR=D:\DEV_CPP\SDL3-3.4.12\x86_64-w64-mingw32"
+if not defined VULKAN_SDK if exist "D:\DEV_CPP\Vulkan-Headers" set "VULKAN_SDK=D:\DEV_CPP\Vulkan-Headers"
 
 if defined W64DEVKIT_DIR (
     set "PATH=%W64DEVKIT_DIR%\bin;%PATH%"
@@ -149,13 +157,8 @@ if "%~1"=="--test" (
     out\win32-exception-test.exe
     if errorlevel 1 exit /b 1
 
-    set "SDL3_INC="
-    if defined SDL3_DIR (
-        set "SDL3_INC=-I%SDL3_DIR%/include"
-    ) else if exist "C:\msys64\mingw64\include\SDL3" (
-        set "SDL3_INC=-IC:/msys64/mingw64/include"
-    )
-    gcc -std=c11 -O2 -g -Wall -Wextra -Werror -I. -Isrc %SDL3_INC% tests/test_pad.c out/SDL3.dll -o out/pad-test.exe
+    set "SDL3_INC=-ID:/DEV_CPP/SDL3-3.4.12/x86_64-w64-mingw32/include"
+    gcc -std=c11 -O2 -g -Wall -Wextra -Werror -I. -Isrc -ID:/DEV_CPP/SDL3-3.4.12/x86_64-w64-mingw32/include tests/test_pad.c out/SDL3.dll -o out/pad-test.exe
     if errorlevel 1 exit /b 1
     out\pad-test.exe
     if errorlevel 1 exit /b 1

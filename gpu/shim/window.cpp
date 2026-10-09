@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "sdl_window.h"
 #include "bbport_overlay.h"
+#include "bbport_settings.h"
 
 namespace Frontend {
 
@@ -132,6 +133,11 @@ bool WindowSDL::PollEvents() {
         if (BbOverlay::HandleEvent(event)) {
             continue;
         }
+        if (event.type == SDL_EVENT_MOUSE_MOTION) {
+            std::scoped_lock lock{mouse_delta_mutex};
+            accumulated_mouse_dx += event.motion.xrel;
+            accumulated_mouse_dy += event.motion.yrel;
+        }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
         case SDL_EVENT_WINDOW_RESIZED: {
@@ -149,20 +155,54 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+ 
+    // Periodically reload bbport.ini so external edits (launcher dialog) apply in real time
+    static uint64_t last_ini_check_ms = 0;
+    const uint64_t current_ticks = SDL_GetTicks();
+    if (current_ticks - last_ini_check_ms >= 500) {
+        last_ini_check_ms = current_ticks;
+        BbSettings::Reload();
+    }
 
-    // Auto-hide cursor after 3 seconds of mouse idle when not in overlay menu
-    if (!BbOverlay::CapturesInput()) {
-        const uint64_t now_ms = SDL_GetTicks();
-        if (!mouse_cursor_hidden && (now_ms - last_mouse_motion_ms >= 3000)) {
+    const bool overlay_capturing = BbOverlay::CapturesInput() || text_active;
+    const bool mk_active = BbSettings::Get().mk_enabled.load();
+    const bool want_relative = mk_active && !overlay_capturing;
+
+    if (want_relative != relative_mouse_active) {
+        relative_mouse_active = want_relative;
+        SDL_SetWindowRelativeMouseMode(window, want_relative);
+        if (want_relative) {
             SDL_HideCursor();
             mouse_cursor_hidden = true;
+        } else {
+            SDL_ShowCursor();
+            mouse_cursor_hidden = false;
         }
-    } else if (mouse_cursor_hidden) {
-        SDL_ShowCursor();
-        mouse_cursor_hidden = false;
+    }
+
+    if (!relative_mouse_active) {
+        // Auto-hide cursor after 3 seconds of mouse idle when not in overlay menu
+        if (!BbOverlay::CapturesInput()) {
+            const uint64_t now_ms = SDL_GetTicks();
+            if (!mouse_cursor_hidden && (now_ms - last_mouse_motion_ms >= 3000)) {
+                SDL_HideCursor();
+                mouse_cursor_hidden = true;
+            }
+        } else if (mouse_cursor_hidden) {
+            SDL_ShowCursor();
+            mouse_cursor_hidden = false;
+        }
     }
 
     return is_open;
+}
+
+void WindowSDL::ConsumeMouseDelta(float* dx, float* dy) {
+    std::scoped_lock lock{mouse_delta_mutex};
+    if (dx) *dx = accumulated_mouse_dx;
+    if (dy) *dy = accumulated_mouse_dy;
+    accumulated_mouse_dx = 0.0f;
+    accumulated_mouse_dy = 0.0f;
 }
 
 } // namespace Frontend

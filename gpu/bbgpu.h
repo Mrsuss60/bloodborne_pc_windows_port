@@ -42,6 +42,10 @@ void bbgpu_dump_host_threads_hang(void *file_handle);
 void bbgpu_get_frametime_percentiles(double *avg_fps, double *p95_ms, double *p99_ms);
 /* Dumps GPU breadcrumbs state to log/crash files. */
 void bbgpu_dump_breadcrumbs(void *file_handle);
+/* Consumes accumulated mouse motion delta (pixels) since last call. */
+void bbgpu_consume_mouse_delta(float *dx, float *dy);
+/* Returns 1 if M&K is enabled, and retrieves sensitivity and invert flags. */
+int bbgpu_get_mk_config(float *sens_x, float *sens_y, int *invert_x, int *invert_y, float *deadzone, float *smoothing);
 #ifdef __cplusplus
 }
 #endif
