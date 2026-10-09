@@ -663,43 +663,78 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 }
 
 namespace {
-// bbport: draws skipped for a geometry stage the device cannot run (Metal has no geometry
-// shaders; on-chip GS and stream-out are unsupported everywhere). Each ES/GS pair is reported
-// once and the totals at exit, to tell whether a game needs geometry stage emulation.
-struct GeometrySkips {
-    std::mutex mutex;
-    std::unordered_map<u64, u64> draws; ///< per ES/GS pair
-    u64 total = 0;
+// bbport: work skipped because the device cannot run it: geometry stages (Metal has no
+// geometry shaders; on-chip GS and stream-out are unsupported everywhere) and shaders writing
+// multisampled images (Metal cannot write texture2d_ms). Each program is reported once and the
+// totals at exit, to tell whether a game needs emulation of either.
+class SkippedPrograms {
+public:
+    explicit SkippedPrograms(const char* what_, const char* unit_) : what{what_}, unit{unit_} {}
 
-    static u64 ProgramHash(const AmdGpu::Regs& regs, HwStage stage) {
-        const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage));
-        return pgm && pgm->Address<u32*>() ? AmdGpu::GetParams(*pgm).hash : 0;
-    }
-
-    void Note(const AmdGpu::Regs& regs, const char* why) {
-        const u64 es = ProgramHash(regs, HwStage::Export);
-        const u64 gs = ProgramHash(regs, HwStage::Geometry);
+    /// Counts one skipped draw or dispatch; describe() names the program the first time.
+    template <typename Describe>
+    void Note(u64 program, Describe&& describe) {
         std::scoped_lock lock{mutex};
         if (!total++) {
-            std::atexit([] { Instance().Report(); });
+            static std::once_flag registered;
+            std::call_once(registered, [] { std::atexit(ReportAll); });
         }
-        if (draws[gs ^ std::rotl(es, 1)]++ == 0) {
-            LOG_WARNING(Render_Vulkan, "Geometry stage {}: skipping draws of ES {:#x} GS {:#x}",
-                        why, es, gs);
+        if (counts[program]++ == 0) {
+            LOG_WARNING(Render_Vulkan, "{}", describe());
         }
+    }
+
+    static SkippedPrograms& Geometry() {
+        static SkippedPrograms skips{"geometry stages", "ES/GS programs"};
+        return skips;
+    }
+
+    static SkippedPrograms& MultisampledStorage() {
+        static SkippedPrograms skips{"multisampled storage images", "programs"};
+        return skips;
+    }
+
+private:
+    static void ReportAll() {
+        Geometry().Report();
+        MultisampledStorage().Report();
     }
 
     void Report() {
         std::scoped_lock lock{mutex};
-        std::printf("GPU: %llu draws skipped for geometry stages (%zu ES/GS programs)\n",
-                    static_cast<unsigned long long>(total), draws.size());
+        if (total) {
+            std::printf("GPU: %llu draws/dispatches skipped for %s (%zu %s)\n",
+                        static_cast<unsigned long long>(total), what, counts.size(), unit);
+        }
     }
 
-    static GeometrySkips& Instance() {
-        static GeometrySkips skips;
-        return skips;
-    }
+    const char* what;
+    const char* unit;
+    std::mutex mutex;
+    std::unordered_map<u64, u64> counts;
+    u64 total = 0;
 };
+
+u64 ProgramHash(const AmdGpu::Regs& regs, HwStage stage) {
+    const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage));
+    return pgm && pgm->Address<u32*>() ? AmdGpu::GetParams(*pgm).hash : 0;
+}
+
+void NoteGeometrySkip(const AmdGpu::Regs& regs, const char* why) {
+    const u64 es = ProgramHash(regs, HwStage::Export);
+    const u64 gs = ProgramHash(regs, HwStage::Geometry);
+    SkippedPrograms::Geometry().Note(gs ^ std::rotl(es, 1), [&] {
+        return fmt::format("Geometry stage {}: skipping draws of ES {:#x} GS {:#x}", why, es, gs);
+    });
+}
+
+void NoteMultisampledStorageSkip(const Shader::Info& info) {
+    SkippedPrograms::MultisampledStorage().Note(info.pgm_hash, [&] {
+        return fmt::format("Multisampled storage image unsupported by the device: skipping {} "
+                           "shader {:#x}",
+                           info.hw_stage, info.pgm_hash);
+    });
+}
 } // namespace
 
 bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
@@ -747,11 +782,11 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
-            if (!sel.worker) GeometrySkips::Instance().Note(regs, "unsupported by the device");
+            if (!sel.worker) NoteGeometrySkip(regs, "unsupported by the device");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            if (!sel.worker) GeometrySkips::Instance().Note(regs, "features unsupported");
+            if (!sel.worker) NoteGeometrySkip(regs, "features unsupported");
             return false;
         }
         if (!bind_stage(HwStage::Export, SwStage::Vertex)) {
@@ -780,11 +815,11 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             return false;
         }
         if (!instance.IsGeometryStageSupported()) {
-            if (!sel.worker) GeometrySkips::Instance().Note(regs, "unsupported by the device");
+            if (!sel.worker) NoteGeometrySkip(regs, "unsupported by the device");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            if (!sel.worker) GeometrySkips::Instance().Note(regs, "features unsupported");
+            if (!sel.worker) NoteGeometrySkip(regs, "features unsupported");
             return false;
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
@@ -806,6 +841,15 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     default:
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
         return false;
+    }
+
+    if (!instance.IsStorageImageMultisampleSupported()) {
+        for (const auto* info : sel.infos) {
+            if (info && info->WritesMultisampledImage()) {
+                if (!sel.worker) NoteMultisampledStorageSkip(*info);
+                return false;
+            }
+        }
     }
 
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
@@ -832,6 +876,10 @@ bool PipelineCache::RefreshComputeKey() {
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
     std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
+    if (!instance.IsStorageImageMultisampleSupported() && sel.infos[0]->WritesMultisampledImage()) {
+        NoteMultisampledStorageSkip(*sel.infos[0]);
+        return false;
+    }
     return true;
 }
 

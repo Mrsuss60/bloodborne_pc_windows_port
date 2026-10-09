@@ -97,10 +97,15 @@ Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):
 - **Geometry shaders**: Metal has none, and the renderer does not emulate them: draws with an
   ES/GS stage are skipped (nothing they draw appears). Each skipped ES/GS program is logged
   once (`Geometry stage unsupported by the device: skipping draws of ES … GS …`) and the
-  total is printed at exit (`GPU: N draws skipped for geometry stages`). Whether Bloodborne
+  total is printed at exit (`GPU: N draws/dispatches skipped for geometry stages`). Whether Bloodborne
   uses them, and so whether emulation (ES/GS run as compute, the output drawn from a buffer)
   is worth writing, is unknown until the game runs.
-- Unbound multisampled slots written as storage images get a sampled-only stand-in (Metal
-  has no multisampled storage textures; not expected in practice).
+- **Shaders that write multisampled images** (stores or atomics on an MSAA image): Metal cannot
+  write `texture2d_ms` (MoltenVK: `shaderStorageImageMultisample` = 0), so MoltenVK fails to
+  build such a pipeline and the renderer would assert. Those draws and dispatches are skipped
+  instead, logged once per shader (`Multisampled storage image unsupported by the device:
+  skipping …`) and counted at exit (`GPU: N draws/dispatches skipped for multisampled storage
+  images`). Reading MSAA images works. Emulating the writes would mean storing MSAA images
+  differently in the texture cache; worth it only if the game turns out to need it.
 - FSR 4 and other features that depend on specific GPU vendors are not expected to work on
   Apple GPUs.

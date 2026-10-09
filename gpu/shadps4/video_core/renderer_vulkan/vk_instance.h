@@ -274,6 +274,11 @@ public:
         return amd_mixed_attachment_samples;
     }
 
+    /// Returns true when shaders may write multisampled images (no on Metal/MoltenVK)
+    bool IsStorageImageMultisampleSupported() const {
+        return features.shaderStorageImageMultisample;
+    }
+
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
         return features.geometryShader;

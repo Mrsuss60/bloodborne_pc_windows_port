@@ -188,6 +188,22 @@ struct Info : InfoPersistent {
         }
         return user_data;
     }
+    /// bbport: stores or atomics on a multisampled image (a multisampled storage image), which
+    /// needs shaderStorageImageMultisample (Metal cannot write texture2d_ms).
+    bool WritesMultisampledImage() const {
+        for (const auto& image : images) {
+            if (!image.is_written) {
+                continue;
+            }
+            const auto type = image.GetSharp(*this).GetViewType(image.is_array);
+            if (type == AmdGpu::ImageType::Color2DMsaa ||
+                type == AmdGpu::ImageType::Color2DMsaaArray) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::span<const u32> FlatUserData() const noexcept {
         if (const auto* snapshot = Snapshot()) [[unlikely]] {
             return {snapshot->flat, snapshot->flat_size};
