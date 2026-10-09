@@ -1,7 +1,7 @@
 # macOS (Apple Silicon) build
 
-**Status: builds and passes the runtime tests; the game does not run yet** (see
-[Known blockers](#known-blockers)).
+**Status: builds, creates its Vulkan device on MoltenVK and passes every test; not yet run
+with the game** (see [Known limits](#known-limits)).
 
 ## Why an x86-64 build under Rosetta 2
 
@@ -24,6 +24,24 @@ Rosetta executes AVX/AVX2; `run.sh` sets `ROSETTA_ADVERTISE_AVX=1` so CPUID repo
 
 The other Darwin shims (clocks, timed locks, per-thread rusage, barriers) are in
 `src/darwin_compat.h`.
+
+On the GPU side:
+
+- **No `nullDescriptor` on MoltenVK.** `NullResources` (`vk_null_resources.h`) stand in: a
+  zeroed buffer, and zeroed 1×1 images with a view for each image type (RGBA8; D32 for depth
+  slots, which comparison sampling turns into Metal depth textures). The rasterizer binds them
+  where it would write null buffers, vertex buffers or image views. Elsewhere `nullDescriptor`
+  stays required.
+- **`robustBufferAccess2`/`robustImageAccess2`** are enabled only where the driver has them
+  (MoltenVK has no `robustBufferAccess2`; Metal bounds accesses itself).
+- **Portability**: the instance enables `VK_KHR_portability_enumeration`, the device
+  `VK_KHR_portability_subset`.
+- **The dispatcher starts from the Vulkan loader `libbbgpu` links** (`vkGetInstanceProcAddr`
+  bound at link time). Vulkan-Hpp's `DynamicLoader` may find MoltenVK itself, which also
+  exports `vkGetInstanceProcAddr` but cannot take the loader's handles.
+- Code built with other Vulkan platform macros than `vk_platform.cpp` (the GPU tests) must not
+  read fields of `VULKAN_HPP_DEFAULT_DISPATCHER`: its layout differs between them. The tests
+  call the loader's `vkGetInstanceProcAddr` instead.
 
 ## Dependencies
 
@@ -54,7 +72,8 @@ The other Darwin shims (clocks, timed locks, per-thread rusage, barriers) are in
 bash build.sh --test
 VK_DRIVER_FILES=/path/to/MoltenVK_icd.json out/bb-probe --vulkan-only
 ninja -C out/gpu shader-user-data-test motion-history-test ui-composition-test \
-    upscaler-support-test motion-shader-test
+    upscaler-support-test motion-shader-test scene-resolution-test taa-shader-test \
+    camera-motion-test null-resources-test
 ```
 
 Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):
@@ -62,19 +81,17 @@ Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):
 - `build.sh --test`: pad, runtime (including the TSD thread pointer on two threads),
   file-mods, semaphore and content tests pass.
 - `--vulkan-only`: command submission and readback on the Apple GPU pass.
-- GPU tests: the five above pass. `scene-resolution-test`, `taa-shader-test` and
-  `camera-motion-test` stop at device creation (next section).
+- GPU tests: all nine above pass on the Apple GPU (scene targets, TAA and camera motion
+  shaders, null descriptor stand-ins).
 
-## Known blockers
+## Known limits
 
-- **`nullDescriptor`**: the renderer requires `VK_EXT_robustness2`'s `nullDescriptor`.
-  MoltenVK 1.4.2 does not provide it, so Vulkan device creation fails. Running the game needs
-  a fallback (dummy buffers/images where null descriptors are bound).
+- **Not run with the game.** The tests cover the loader's memory and thread pointer, the
+  runtime, device creation and several renderer passes. They do not construct the rasterizer:
+  where it binds the null stand-ins (unbound images, buffers and vertex buffers), and
+  everything else the game drives, only runs with the game.
 - **Geometry shaders**: Metal has none. shadPS4 emulates some stages; untested here.
-- `robustBufferAccess2`/`robustImageAccess2` are only enabled where the driver has them
-  (MoltenVK has no `robustBufferAccess2`; Metal bounds accesses itself). This is a behaviour
-  difference from the other platforms.
+- Unbound multisampled image slots get a single-sample stand-in view (a type mismatch on
+  Metal; rare).
 - FSR 4 and other features that depend on specific GPU vendors are not expected to work on
   Apple GPUs.
-- Not tested with the game: the CPU side (loader, memory, thread pointer) is covered only
-  by the tests above.

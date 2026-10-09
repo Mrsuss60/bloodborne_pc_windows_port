@@ -40,6 +40,12 @@ int main() {
     }
     assert(null.View(ImageType::Color2D) != null.View(ImageType::Color2DArray));
     assert(null.View(ImageType::Cube) != null.View(ImageType::Color2DArray));
+    // Depth slots (comparison sampling: Metal depth textures) get depth views.
+    for (const auto type : types) {
+        assert(null.View(type, true));
+    }
+    assert(null.View(ImageType::Color2D, true) != null.View(ImageType::Color2D));
+    assert(null.View(ImageType::Cube, true) != null.View(ImageType::Color2DArray, true));
     assert(null.Buffer());
 
     // Readback of the whole buffer, plus a canary past its end.
@@ -77,6 +83,6 @@ int main() {
     }
     assert(bytes[Vulkan::NullResources::BufferSize] == 0xab); // the copy stayed in range
     vmaDestroyBuffer(instance.GetAllocator(), staging, allocation);
-    std::puts("Null resources: views of every image type, zeroed buffer PASS");
+    std::puts("Null resources: color and depth views of every image type, zeroed buffer PASS");
     return 0;
 }

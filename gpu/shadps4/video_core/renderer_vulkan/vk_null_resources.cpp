@@ -11,9 +11,12 @@ namespace Vulkan {
 
 namespace {
 constexpr vk::Format Format = vk::Format::eR8G8B8A8Unorm;
+constexpr vk::Format DepthFormat = vk::Format::eD32Sfloat;
 constexpr vk::ImageUsageFlags Usage = vk::ImageUsageFlagBits::eSampled |
                                       vk::ImageUsageFlagBits::eStorage |
                                       vk::ImageUsageFlagBits::eTransferDst;
+constexpr vk::ImageUsageFlags DepthUsage =
+    vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
 } // namespace
 
 NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
@@ -22,32 +25,36 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
                                                  VideoCore::MemoryType::DeviceLocal);
 
     const auto make_image = [&](VideoCore::UniqueImage& image, vk::ImageType type, u32 layers,
-                                vk::ImageCreateFlags flags) {
+                                vk::ImageCreateFlags flags, vk::Format format = Format,
+                                vk::ImageUsageFlags usage = Usage) {
         image = VideoCore::UniqueImage(device, instance.GetAllocator());
         image.Create(vk::ImageCreateInfo{
             .flags = flags,
             .imageType = type,
-            .format = Format,
+            .format = format,
             .extent = {1, 1, 1},
             .mipLevels = 1,
             .arrayLayers = layers,
             .samples = vk::SampleCountFlagBits::e1,
             .tiling = vk::ImageTiling::eOptimal,
-            .usage = Usage,
+            .usage = usage,
             .initialLayout = vk::ImageLayout::eUndefined,
         });
     };
     make_image(image_1d, vk::ImageType::e1D, 1, {});
     make_image(image_2d, vk::ImageType::e2D, 6, vk::ImageCreateFlagBits::eCubeCompatible);
     make_image(image_3d, vk::ImageType::e3D, 1, {});
+    make_image(image_depth, vk::ImageType::e2D, 6, vk::ImageCreateFlagBits::eCubeCompatible,
+               DepthFormat, DepthUsage);
 
     const auto make_view = [&](const VideoCore::UniqueImage& image, vk::ImageViewType type,
-                               u32 layers) {
+                               u32 layers, vk::Format format = Format,
+                               vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor) {
         return Check(device.createImageViewUnique({
             .image = vk::Image(image),
             .viewType = type,
-            .format = Format,
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, layers},
+            .format = format,
+            .subresourceRange = {aspect, 0, 1, 0, layers},
         }));
     };
     views[View1D] = make_view(image_1d, vk::ImageViewType::e1D, 1);
@@ -56,6 +63,10 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
     views[View2DArray] = make_view(image_2d, vk::ImageViewType::e2DArray, 6);
     views[View3D] = make_view(image_3d, vk::ImageViewType::e3D, 1);
     views[ViewCube] = make_view(image_2d, vk::ImageViewType::eCube, 6);
+    constexpr auto depth = vk::ImageAspectFlagBits::eDepth;
+    views[Depth2D] = make_view(image_depth, vk::ImageViewType::e2D, 1, DepthFormat, depth);
+    views[Depth2DArray] = make_view(image_depth, vk::ImageViewType::e2DArray, 6, DepthFormat, depth);
+    views[DepthCube] = make_view(image_depth, vk::ImageViewType::eCube, 6, DepthFormat, depth);
 
     // Zero everything once and leave the images in the general layout for good.
     scheduler.EndRendering();
@@ -65,7 +76,18 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
                                              vk::Image(image_3d)};
     const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eColor, 0, 1, 0,
                                         VK_REMAINING_ARRAY_LAYERS};
-    std::array<vk::ImageMemoryBarrier2, 3> to_general{};
+    const vk::ImageSubresourceRange all_depth{vk::ImageAspectFlagBits::eDepth, 0, 1, 0,
+                                              VK_REMAINING_ARRAY_LAYERS};
+    std::array<vk::ImageMemoryBarrier2, 4> to_general{};
+    to_general[3] = vk::ImageMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = vk::Image(image_depth),
+        .subresourceRange = all_depth,
+    };
     for (size_t i = 0; i < images.size(); ++i) {
         to_general[i] = vk::ImageMemoryBarrier2{
             .srcStageMask = vk::PipelineStageFlagBits2::eNone,
@@ -84,6 +106,8 @@ NullResources::NullResources(const Instance& instance, Scheduler& scheduler) {
     for (const auto image : images) {
         cmdbuf.clearColorImage(image, vk::ImageLayout::eGeneral, vk::ClearColorValue{}, all);
     }
+    cmdbuf.clearDepthStencilImage(vk::Image(image_depth), vk::ImageLayout::eGeneral,
+                                  vk::ClearDepthStencilValue{0.f, 0}, all_depth);
     const vk::MemoryBarrier2 visible{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -103,7 +127,19 @@ vk::Buffer NullResources::Buffer() const noexcept {
     return buffer->Handle();
 }
 
-vk::ImageView NullResources::View(AmdGpu::ImageType type) const noexcept {
+vk::ImageView NullResources::View(AmdGpu::ImageType type, bool is_depth) const noexcept {
+    if (is_depth) {
+        switch (type) {
+        case AmdGpu::ImageType::Color1DArray:
+        case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Color2DMsaaArray:
+            return *views[Depth2DArray];
+        case AmdGpu::ImageType::Cube:
+            return *views[DepthCube];
+        default:
+            return *views[Depth2D];
+        }
+    }
     switch (type) {
     case AmdGpu::ImageType::Color1D:
         return *views[View1D];

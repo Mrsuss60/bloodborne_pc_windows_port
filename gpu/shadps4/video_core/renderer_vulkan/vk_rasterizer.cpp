@@ -2256,6 +2256,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             auto& desc = image_desc_storage.emplace_back();
             if (null_resources) {
                 desc.view_info.type = sharp.GetViewType(resource.is_array);
+                desc.view_info.format =
+                    resource.is_depth ? vk::Format::eD32Sfloat : vk::Format::eR8G8B8A8Unorm;
                 desc.type = resource.is_written ? VideoCore::TextureCache::BindingType::Storage
                                                 : VideoCore::TextureCache::BindingType::Texture;
             }
@@ -2382,7 +2384,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             const vk::ImageView null_view =
-                null_resources ? null_resources->View(desc.view_info.type) : vk::ImageView{};
+                null_resources ? null_resources->View(desc.view_info.type,
+                                                      desc.view_info.format == vk::Format::eD32Sfloat)
+                               : vk::ImageView{};
             image_infos.emplace_back(VK_NULL_HANDLE, null_view, vk::ImageLayout::eGeneral);
             if (set_ok && binding_index < resolved.size()) {
                 resolved[binding_index].view = null_view; // the texture set memo reuses it
