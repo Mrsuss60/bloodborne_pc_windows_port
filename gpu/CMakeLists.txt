@@ -222,9 +222,7 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_pa
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 if (WIN32)
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-elseif (APPLE)
-    target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_METAL_EXT)
-endif()
+endif() # macOS: vk_platform.cpp defines VK_USE_PLATFORM_METAL_EXT itself
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 if (APPLE)
     # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe at load time.
