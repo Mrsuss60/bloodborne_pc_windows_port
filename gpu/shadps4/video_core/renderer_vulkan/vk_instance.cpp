@@ -269,19 +269,21 @@ bool Instance::CreateDevice() {
 
     const auto robustness2_features = feature_chain.get<vk::PhysicalDeviceRobustness2FeaturesEXT>();
 #ifdef __APPLE__
-    // bbport: MoltenVK (Metal) has no robustBufferAccess2; Metal itself bounds buffer and
-    // texture accesses, so robust*Access2 are enabled only where the driver has them.
+    // bbport: MoltenVK (Metal) has no robustBufferAccess2 and no nullDescriptor. Metal itself
+    // bounds buffer and texture accesses, so robust*Access2 are enabled only where the driver
+    // has them; NullResources (vk_null_resources.h) replace null descriptors.
     if (!robustness2_features.robustBufferAccess2 || !robustness2_features.robustImageAccess2) {
         LOG_WARNING(Render_Vulkan, "robustBufferAccess2/robustImageAccess2 unavailable (MoltenVK)");
     }
+    null_descriptor = robustness2_features.nullDescriptor;
 #else
     ASSERT_MSG(robustness2_features.robustBufferAccess2,
                "Required Vulkan feature unavailable: robustBufferAccess2");
     ASSERT_MSG(robustness2_features.robustImageAccess2,
                "Required Vulkan feature unavailable: robustImageAccess2");
-#endif
     ASSERT_MSG(robustness2_features.nullDescriptor,
                "Required Vulkan feature unavailable: nullDescriptor");
+#endif
 
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
@@ -503,7 +505,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceRobustness2FeaturesEXT{
             .robustBufferAccess2 = robustness2_features.robustBufferAccess2,
             .robustImageAccess2 = robustness2_features.robustImageAccess2,
-            .nullDescriptor = true,
+            .nullDescriptor = null_descriptor,
         },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,

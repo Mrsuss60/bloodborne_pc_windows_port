@@ -10,11 +10,24 @@
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include <vk_mem_alloc.h>
 
+#ifdef __APPLE__
+// VK_NO_PROTOTYPES (vk_common.h): the loader's entry point, linked from libvulkan.
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance,
+                                                                         const char* name);
+#endif
+
+
 int main() {
     Vulkan::Instance instance(0, false);
-    static vk::detail::DynamicLoader loader;
     vk::detail::DispatchLoaderDynamic d;
+#ifdef __APPLE__
+    // The Vulkan loader itself: a dlopen search may find MoltenVK (see vk_platform.cpp). Not
+    // bbgpu's dispatcher field: this file's Vulkan-Hpp has another platform layout.
+    d.init(&::vkGetInstanceProcAddr);
+#else
+    static vk::detail::DynamicLoader loader;
     d.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+#endif
     d.init(instance.GetInstance()); d.init(instance.GetDevice());
     const auto device = instance.GetDevice();
     Vulkan::Scheduler scheduler(instance);

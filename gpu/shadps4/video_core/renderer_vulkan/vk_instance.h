@@ -138,6 +138,11 @@ public:
         return buffer_marker;
     }
 
+    /// bbport: VK_EXT_robustness2 nullDescriptor (absent on MoltenVK: NullResources stand in).
+    bool IsNullDescriptorSupported() const {
+        return null_descriptor;
+    }
+
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
@@ -569,6 +574,7 @@ private:
     bool maintenance_5{};
     bool maintenance_8{};
     bool buffer_marker{};
+    bool null_descriptor{true};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};

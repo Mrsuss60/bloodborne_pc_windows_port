@@ -27,6 +27,12 @@
 #include <mach-o/dyld.h>
 #endif
 
+#ifdef __APPLE__
+// VK_NO_PROTOTYPES (vk_common.h): the loader's entry point, bound to libvulkan at link time.
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance,
+                                                                         const char* name);
+#endif
+
 namespace Vulkan {
 
 static const char* const VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
@@ -275,9 +281,15 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), false);
 #endif
 
+#ifdef __APPLE__
+    // bbport: the Vulkan loader this library links. A dlopen search may return MoltenVK itself
+    // (also exporting vkGetInstanceProcAddr), whose entry points cannot take loader handles.
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(&::vkGetInstanceProcAddr);
+#else
     static vk::detail::DynamicLoader dl;
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
         dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+#endif
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion

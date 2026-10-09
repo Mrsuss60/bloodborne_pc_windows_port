@@ -282,6 +282,19 @@ target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCL
 target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
+add_executable(null-resources-test EXCLUDE_FROM_ALL ../tests/test_null_resources.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(null-resources-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(null-resources-test PRIVATE -UNDEBUG -fPIC)
+set_source_files_properties(../tests/test_null_resources.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(null-resources-test PRIVATE bbgpu)
+
+if (APPLE)
+    # These tests resolve vkGetInstanceProcAddr from the loader directly (see the tests).
+    foreach(test IN ITEMS scene-resolution-test taa-shader-test camera-motion-test null-resources-test)
+        target_link_libraries(${test} PRIVATE Vulkan::Vulkan)
+    endforeach()
+endif()
 
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp

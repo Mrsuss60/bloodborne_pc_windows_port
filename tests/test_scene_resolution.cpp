@@ -12,15 +12,28 @@
 #include "video_core/texture_cache/blit_helper.h"
 #include <vk_mem_alloc.h>
 
+#ifdef __APPLE__
+// VK_NO_PROTOTYPES (vk_common.h): the loader's entry point, linked from libvulkan.
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance,
+                                                                         const char* name);
+#endif
+
+
 int main() {
     using namespace Vulkan;
     Instance instance(0, false);
     // Calls emitted by this executable use a local dispatcher. libbbgpu.so initializes
     // its own default dispatcher while constructing Instance.
-    static vk::detail::DynamicLoader loader;
     vk::detail::DispatchLoaderDynamic dispatch;
+#ifdef __APPLE__
+    // The Vulkan loader itself: a dlopen search may find MoltenVK (see vk_platform.cpp). Not
+    // bbgpu's dispatcher field: this file's Vulkan-Hpp has another platform layout.
+    dispatch.init(&::vkGetInstanceProcAddr);
+#else
+    static vk::detail::DynamicLoader loader;
     dispatch.init(
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+#endif
     dispatch.init(instance.GetInstance());
     dispatch.init(instance.GetDevice());
     Scheduler scheduler(instance);
