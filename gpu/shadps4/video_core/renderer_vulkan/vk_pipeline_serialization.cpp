@@ -354,6 +354,11 @@ void PipelineCache::WarmUp() {
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            // bbport: a key truncated by a process that died while writing it (earlier builds
+            // wrote in place) cannot even hold its header: skipped instead of asserting.
+            if (data.size() < 2 * sizeof(u32)) {
+                return;
+            }
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};

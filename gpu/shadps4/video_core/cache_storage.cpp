@@ -152,8 +152,20 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                 }
             } else {
                 using namespace Common::FS;
-                const auto file = IOFile{path, FileAccessMode::Create};
-                file.Write(v);
+                // bbport: written aside and renamed into place, so a process that dies while
+                // writing (an assert, a crash) leaves no truncated blob the next start would read.
+                auto partial = path;
+                partial += ".partial";
+                {
+                    const auto file = IOFile{partial, FileAccessMode::Create};
+                    file.Write(v);
+                }
+                std::error_code error;
+                std::filesystem::rename(partial, path, error);
+                if (error) {
+                    LOG_ERROR(Render, "Failed to store {}: {}", path.string(), error.message());
+                    std::filesystem::remove(partial, error);
+                }
             }
         }};
         std::scoped_lock lock{m_request};
