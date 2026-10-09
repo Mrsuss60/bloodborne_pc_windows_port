@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <ranges>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "bbport_threads.h"
@@ -659,6 +662,46 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     return true;
 }
 
+namespace {
+// bbport: draws skipped for a geometry stage the device cannot run (Metal has no geometry
+// shaders; on-chip GS and stream-out are unsupported everywhere). Each ES/GS pair is reported
+// once and the totals at exit, to tell whether a game needs geometry stage emulation.
+struct GeometrySkips {
+    std::mutex mutex;
+    std::unordered_map<u64, u64> draws; ///< per ES/GS pair
+    u64 total = 0;
+
+    static u64 ProgramHash(const AmdGpu::Regs& regs, HwStage stage) {
+        const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage));
+        return pgm && pgm->Address<u32*>() ? AmdGpu::GetParams(*pgm).hash : 0;
+    }
+
+    void Note(const AmdGpu::Regs& regs, const char* why) {
+        const u64 es = ProgramHash(regs, HwStage::Export);
+        const u64 gs = ProgramHash(regs, HwStage::Geometry);
+        std::scoped_lock lock{mutex};
+        if (!total++) {
+            std::atexit([] { Instance().Report(); });
+        }
+        if (draws[gs ^ std::rotl(es, 1)]++ == 0) {
+            LOG_WARNING(Render_Vulkan, "Geometry stage {}: skipping draws of ES {:#x} GS {:#x}",
+                        why, es, gs);
+        }
+    }
+
+    void Report() {
+        std::scoped_lock lock{mutex};
+        std::printf("GPU: %llu draws skipped for geometry stages (%zu ES/GS programs)\n",
+                    static_cast<unsigned long long>(total), draws.size());
+    }
+
+    static GeometrySkips& Instance() {
+        static GeometrySkips skips;
+        return skips;
+    }
+};
+} // namespace
+
 bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
@@ -704,11 +747,11 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
+            if (!sel.worker) GeometrySkips::Instance().Note(regs, "unsupported by the device");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
+            if (!sel.worker) GeometrySkips::Instance().Note(regs, "features unsupported");
             return false;
         }
         if (!bind_stage(HwStage::Export, SwStage::Vertex)) {
@@ -737,11 +780,11 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             return false;
         }
         if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
+            if (!sel.worker) GeometrySkips::Instance().Note(regs, "unsupported by the device");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
+            if (!sel.worker) GeometrySkips::Instance().Note(regs, "features unsupported");
             return false;
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {

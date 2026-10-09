@@ -90,7 +90,12 @@ Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):
   runtime, device creation and several renderer passes. They do not construct the rasterizer:
   where it binds the null stand-ins (unbound images, buffers and vertex buffers), and
   everything else the game drives, only runs with the game.
-- **Geometry shaders**: Metal has none. shadPS4 emulates some stages; untested here.
+- **Geometry shaders**: Metal has none, and the renderer does not emulate them: draws with an
+  ES/GS stage are skipped (nothing they draw appears). Each skipped ES/GS program is logged
+  once (`Geometry stage unsupported by the device: skipping draws of ES … GS …`) and the
+  total is printed at exit (`GPU: N draws skipped for geometry stages`). Whether Bloodborne
+  uses them, and so whether emulation (ES/GS run as compute, the output drawn from a buffer)
+  is worth writing, is unknown until the game runs.
 - Unbound multisampled image slots get a single-sample stand-in view (a type mismatch on
   Metal; rare).
 - FSR 4 and other features that depend on specific GPU vendors are not expected to work on
