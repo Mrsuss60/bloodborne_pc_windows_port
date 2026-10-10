@@ -763,9 +763,9 @@ class BloodborneLauncher(tk.Tk):
         main_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
         ttk.Label(main_frame, text="Mouse & Keyboard Controls", style="Card.TLabel",
-                  font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 4))
+                  font=(UI_FONT, 12, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(main_frame, text="Configurable mouse and keyboard controls with real-time in-game synchronization.",
-                  style="Card.TLabel", font=("Segoe UI", 9), foreground="#aaaaaa").pack(anchor="w", pady=(0, 10))
+                  style="Card.TLabel", font=(UI_FONT, 9), foreground="#aaaaaa").pack(anchor="w", pady=(0, 10))
 
         ttk.Checkbutton(main_frame, text="Enable Mouse & Keyboard Mode",
                         variable=mk_enabled_var, style="Card.TCheckbutton").pack(anchor="w", pady=(0, 10))
@@ -775,7 +775,7 @@ class BloodborneLauncher(tk.Tk):
         cam_card.pack(fill="x", pady=(0, 10))
 
         ttk.Label(cam_card, text="Camera & Sensitivity Options", style="Card.TLabel",
-                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+                  font=(UI_FONT, 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         # Sens X
         ttk.Label(cam_card, text="Horizontal Sensitivity (X):", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=4)
@@ -824,7 +824,7 @@ class BloodborneLauncher(tk.Tk):
         bind_card.pack(fill="both", expand=True, pady=(0, 10))
 
         ttk.Label(bind_card, text="Control Bindings", style="Card.TLabel",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+                  font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(0, 6))
 
         bindings = [
             ("Left Click (LMB)", "Right Hand Attack (R1) / Trick Normal Attack"),
@@ -850,9 +850,9 @@ class BloodborneLauncher(tk.Tk):
             row = idx % 7
             col = (idx // 7) * 2
             ttk.Label(bind_container, text=f"{k_name}:", style="Card.TLabel",
-                      font=("Segoe UI", 8, "bold"), foreground="#c5a059").grid(row=row, column=col, sticky="w", padx=(0, 4), pady=2)
+                      font=(UI_FONT, 8, "bold"), foreground="#c5a059").grid(row=row, column=col, sticky="w", padx=(0, 4), pady=2)
             ttk.Label(bind_container, text=k_act, style="Card.TLabel",
-                      font=("Segoe UI", 8), foreground="#cccccc").grid(row=row, column=col+1, sticky="w", padx=(0, 16), pady=2)
+                      font=(UI_FONT, 8), foreground="#cccccc").grid(row=row, column=col+1, sticky="w", padx=(0, 16), pady=2)
 
         # Bottom actions
         action_bar = ttk.Frame(dlg, style="Card.TFrame", padding=10)
