@@ -12,7 +12,13 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
+#ifdef __APPLE__
+// bbport: + 0x100 on macOS: SPIR-V without NoContraction, invariant position
+// (Profile::skip_no_contraction).
+static constexpr u32 ShaderBinaryVersion = 0x108u;
+#else
 static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
+#endif
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
 } // namespace Serialization
