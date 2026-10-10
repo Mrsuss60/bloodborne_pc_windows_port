@@ -992,6 +992,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (DrawHasNoEffect(pipeline, state)) {
+        return;
+    }
 
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);
@@ -3592,6 +3595,37 @@ u32 Rasterizer::GetGpuCommandProcessorThreadId() {
 } // namespace Vulkan
 
 namespace Vulkan {
+
+bool Rasterizer::DrawHasNoEffect(const GraphicsPipeline* pipeline, const RenderState& state) const {
+    // bbport: a draw without color or depth attachments, without a pixel shader and without
+    // stores changes nothing (occlusion queries are answered on the CPU). The game issues some
+    // with a 16384x16384 render area; on a tile-based GPU (Apple) each still walks that area.
+    if (pipeline->GetStages()[u32(Shader::SwStage::Fragment)] ||
+        state.depth_stencil_attachment.image_view) {
+        return false;
+    }
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        if (state.color_attachments[cb].image_view) {
+            return false;
+        }
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& buffer : stage->buffers) {
+            if (buffer.is_written) {
+                return false;
+            }
+        }
+        for (const auto& image : stage->images) {
+            if (image.is_written) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state) {
     auto* profiler = GpuProfiler::Get();
