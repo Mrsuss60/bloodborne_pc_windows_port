@@ -1,7 +1,8 @@
 # macOS (Apple Silicon) build
 
-**Status: builds, creates its Vulkan device on MoltenVK and passes every test; not yet run
-with the game** (see [Known limits](#known-limits)).
+**Status: runs the game on an M1 Pro (16 GB): 1080p at full detail holds the game's 30 FPS in
+most areas, ~21 FPS in the heaviest geometry** (see [Performance](#performance) and
+[Known limits](#known-limits)).
 
 ## Why an x86-64 build under Rosetta 2
 
@@ -51,6 +52,22 @@ On the GPU side:
   (MoltenVK has no `robustBufferAccess2`; Metal bounds accesses itself).
 - **Portability**: the instance enables `VK_KHR_portability_enumeration`, the device
   `VK_KHR_portability_subset`.
+- **No push descriptors.** MoltenVK 1.4 puts the push constants at the Metal buffer index of a
+  push descriptor set's buffers once the set has 11 or more bindings, so the shader library
+  fails to compile (`cannot reserve 'buffer' resource location at index 0`), with or without
+  argument buffers. Pipelines use regular descriptor sets instead (`MaxPushDescriptors()` is 0).
+- **No `NoContraction` in shaders.** The recompiler marks every float add, subtract, multiply
+  and fma `NoContraction` (GCN does not fuse them). SPIRV-Cross, inside MoltenVK, implements it
+  by calling an `[[clang::optnone]]` helper for each of those operations, so Metal compiled
+  every game shader unoptimized: 5-50x slower (G-buffer 46 ms → 2 ms, lighting 40 ms → <1 ms
+  at 720p). On macOS `Profile::skip_no_contraction` leaves the decoration out, and the vertex
+  position is declared `Invariant` (`[[position, invariant]]`) so depth pre-passes and the
+  passes drawing the same meshes compute it identically; without that, lighting flickers. The
+  shader cache version differs on macOS (`ShaderBinaryVersion` 0x108) so caches made for
+  other GPUs are not reused.
+- **Draws with no effect are skipped** (`Rasterizer::DrawHasNoEffect`): no color or depth
+  target, no pixel shader, no stores (occlusion queries are answered on the CPU). The game
+  issues some with a 16384x16384 render area, which a tile-based GPU walks whole (~1 ms each).
 - **The dispatcher starts from the Vulkan loader `libbbgpu` links** (`vkGetInstanceProcAddr`
   bound at link time). Vulkan-Hpp's `DynamicLoader` may find MoltenVK itself, which also
   exports `vkGetInstanceProcAddr` but cannot take the loader's handles.
@@ -117,12 +134,39 @@ Verified on an M1 Pro (macOS 26.6, MoltenVK 1.4.2):
   shaders, null descriptor stand-ins sampled by a compute shader, also under
   `MTL_DEBUG_LAYER=1`).
 
+## Performance
+
+The log prints `Perf:` every 5 s: FPS, draws, dispatches, uploads, vertices and render passes
+per frame. **fn+F10** opens the in-game menu (Mac keyboards have no Insert key); the launcher's
+**Show FPS counter** puts FPS and frame time in a corner, and **Recommended (Mac)** applies
+1080p, 30 FPS and full detail.
+
+Measured on an M1 Pro at 1080p, full detail: 30 FPS (the game's own rate) in most areas; ~21 FPS
+at the clinic spawn, where the frame has ~1,500 draws and ~19 M vertices. There the GPU is the
+limit (94-98% busy, ~48 ms per frame) and the draw recording thread is ~80% busy. The cost
+follows the vertex count: the recompiled vertex shaders read per-instance and skinning data
+with ~40 separate 32-bit buffer loads per vertex (offsets known only at run time, so Metal
+cannot merge them into vector loads).
+
+Tools:
+
+- `BB_GPU_PROFILE=1`: GPU ms per frame for each render pass and dispatch, every 5 s. MoltenVK
+  samples GPU timestamps only in query pools of up to 4096 queries (larger pools fall back to
+  one CPU time per finished command buffer), so the profiler uses 4 x 1024 on macOS.
+- `BB_PASS_TRACE=1`: why render passes end, per frame (tile-based GPUs store and reload the
+  attachments at every end), including passes split and resumed on the same targets.
+- `MVK_CONFIG_SHADER_DUMP_DIR=<dir>`: the MSL MoltenVK generates for each shader. The SPIR-V
+  carries the recompiler's hash as a string, so `strings` finds a shader's dump.
+
+Tried without gain: `MVK_CONFIG_FAST_MATH_ENABLED=1` (+5%, risks NaN/Inf differences),
+`MVK_CONFIG_USE_MTLHEAP=0` (MoltenVK then cannot create block-texel-view images), lower model
+LOD (the heaviest geometry is instanced props and shadow maps).
+
 ## Known limits
 
-- **Not run with the game.** The tests cover the loader's memory and thread pointer, the
-  runtime, device creation and several renderer passes. They do not construct the rasterizer:
-  where it binds the null stand-ins (unbound images, buffers and vertex buffers), and
-  everything else the game drives, only runs with the game.
+- **Heavy geometry is GPU-bound** (see [Performance](#performance)): vector loads for the
+  vertex shaders' buffer reads are the next step.
+- **Skip Intro**: the patch tears the intro movie down while it starts; leave it off.
 - **Geometry shaders**: Metal has none, and the renderer does not emulate them: draws with an
   ES/GS stage are skipped (nothing they draw appears). Each skipped ES/GS program is logged
   once (`Geometry stage unsupported by the device: skipping draws of ES … GS …`) and the
