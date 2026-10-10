@@ -344,6 +344,9 @@ class BloodborneLauncher(tk.Tk):
                    command=self.set_vanilla_mode).pack(side="right", padx=(6, 0))
         ttk.Button(feat_header, text="Everything on", style="Secondary.TButton",
                    command=self.set_everything_on).pack(side="right")
+        if IS_MAC:
+            ttk.Button(feat_header, text="Recommended (Mac)", style="Secondary.TButton",
+                       command=self.set_mac_recommended).pack(side="right", padx=(0, 6))
 
         self.feat_upscaler = tk.BooleanVar(value=self.settings.get("feat_upscaler", True))
         self.feat_overlay = tk.BooleanVar(value=self.settings.get("feat_overlay", True))
@@ -351,6 +354,7 @@ class BloodborneLauncher(tk.Tk):
         self.feat_fps_patch = tk.BooleanVar(value=self.settings.get("feat_fps_patch", True))
         self.feat_mods = tk.BooleanVar(value=self.settings.get("mods", True))
         self.feat_res_scaling = tk.BooleanVar(value=self.settings.get("feat_res_scaling", True))
+        self.feat_show_fps = tk.BooleanVar(value=self.settings.get("feat_show_fps", True))
 
         grid_f = ttk.Frame(feat_card, style="Card.TFrame")
         grid_f.pack(fill="x")
@@ -365,6 +369,8 @@ class BloodborneLauncher(tk.Tk):
         ttk.Checkbutton(ov_box, text="Overlay menu", variable=self.feat_overlay,
                         style="Card.TCheckbutton").pack(side="left")
         ttk.Checkbutton(ov_box, text="HUD stats", variable=self.feat_hud,
+                        style="Card.TCheckbutton").pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(ov_box, text="FPS counter", variable=self.feat_show_fps,
                         style="Card.TCheckbutton").pack(side="left", padx=(10, 0))
 
         # Row 1
@@ -464,6 +470,29 @@ class BloodborneLauncher(tk.Tk):
         self.update_res_scaling_state()
         self.save_settings()
         self.log("Preset applied: Everything on (restored all defaults and recommended patches).")
+
+    def set_mac_recommended(self):
+        """Apple Silicon (M1 Pro measured) under Rosetta 2 + MoltenVK: 1080p at the game's own
+        30 FPS and full detail holds 30 FPS in most areas (~21 in the heaviest geometry). No
+        upscaler; the small FPS counter instead of the HUD. Skip Intro stays off: it tears the
+        intro movie down while it is still starting."""
+        self.feat_upscaler.set(False)
+        self.feat_overlay.set(True)
+        self.feat_hud.set(False)
+        self.feat_show_fps.set(True)
+        self.feat_fps_patch.set(False)
+        self.feat_mods.set(True)
+        self.feat_res_scaling.set(True)
+        self.fps_var.set("30")
+        self.res_var.set(RES_CHOICES[0])
+        self.aniso_var.set("16x")
+        self.enabled_patches = set()
+        self.sync_quick_patch_vars()
+        self.update_aniso_desc()
+        self.update_res_scaling_state()
+        self.save_settings()
+        self.log("Preset applied: Recommended (Mac): 1080p, 30 FPS, 16x aniso, full detail, "
+                 "upscaler off, FPS counter on.")
 
     def on_quick_patch_toggle(self):
         if self.feat_skip_intro.get():
@@ -904,6 +933,7 @@ class BloodborneLauncher(tk.Tk):
             "feat_fps_patch": self.feat_fps_patch.get(),
             "feat_res_scaling": self.feat_res_scaling.get(),
             "fullscreen": self.fullscreen.get(),
+            "feat_show_fps": self.feat_show_fps.get(),
             "enabled_patches": sorted(list(self.enabled_patches)),
             "vcpkg_root": self.vcpkg_var.get().strip(),
             "moltenvk_icd": self.moltenvk_var.get().strip(),
@@ -1263,6 +1293,9 @@ class BloodborneLauncher(tk.Tk):
         # Fullscreen window (read by gpu/shim/window.cpp)
         env["BB_FULLSCREEN"] = "1" if self.fullscreen.get() else "0"
 
+        # Small FPS / frame-time counter in a corner (overrides the overlay setting)
+        env["BB_SHOW_FPS"] = "1" if self.feat_show_fps.get() else "0"
+
         # Frame ahead queue (smooth frametimes & bound queue latency: 2 = balanced)
         env.setdefault("BB_FRAMES_AHEAD", "2")
 
@@ -1290,7 +1323,8 @@ class BloodborneLauncher(tk.Tk):
             f"FPSPatch={'on' if self.feat_fps_patch.get() else 'off'}, "
             f"Mods={'on' if self.feat_mods.get() else 'off'}, "
             f"ResScaling={'on' if self.feat_res_scaling.get() else 'off'}, "
-            f"Fullscreen={'on' if self.fullscreen.get() else 'off'}"
+            f"Fullscreen={'on' if self.fullscreen.get() else 'off'}, "
+            f"ShowFPS={'on' if self.feat_show_fps.get() else 'off'}"
         )
 
         self.hidden_count = 0

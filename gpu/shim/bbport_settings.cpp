@@ -137,6 +137,7 @@ void Load() {
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
         {"BB_HUD", "show_hud"},                     {"BB_HUD_QUADRANT", "hud_quadrant"},
         {"BB_HUD_OPACITY", "hud_opacity"},          {"BB_HUD_SCALE", "hud_scale"},
+        {"BB_SHOW_FPS", "show_fps"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
