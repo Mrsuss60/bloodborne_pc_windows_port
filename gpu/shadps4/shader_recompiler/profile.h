@@ -54,6 +54,10 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// bbport: leave float math without NoContraction. SPIRV-Cross (MoltenVK) implements it by
+    /// calling an [[clang::optnone]] helper for every add, subtract and multiply, so Metal
+    /// compiles the shader unoptimized; Metal may then fuse a*b+c into fma.
+    bool skip_no_contraction{};
 
     bool operator==(const Profile&) const = default;
 };

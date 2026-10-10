@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Reads every null descriptor stand-in through the image type a shader declares for it
+// (test_null_resources.cpp). All results are zero (depth texel reads: (0, 0, 0, 1)); slots the
+// shader fails to write keep 1.
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0) uniform texture1D t_1d;
+layout(binding = 1) uniform texture1DArray t_1d_array;
+layout(binding = 2) uniform texture2D t_2d;
+layout(binding = 3) uniform texture2DArray t_2d_array;
+layout(binding = 4) uniform texture3D t_3d;
+layout(binding = 5) uniform textureCube t_cube;
+layout(binding = 6) uniform texture2DMS t_msaa;
+layout(binding = 7) uniform texture2DMSArray t_msaa_array;
+layout(binding = 8) uniform texture2D t_depth;
+layout(binding = 9) uniform texture2DMS t_depth_msaa;
+layout(binding = 10) uniform texture2D t_depth_compare;
+layout(binding = 11) uniform sampler s_point;
+layout(binding = 12) uniform samplerShadow s_compare;
+layout(std430, binding = 13) buffer Results {
+    vec4 results[];
+};
+
+void main() {
+    results[0] = texelFetch(sampler1D(t_1d, s_point), 0, 0);
+    results[1] = texelFetch(sampler1DArray(t_1d_array, s_point), ivec2(0), 0);
+    results[2] = texelFetch(sampler2D(t_2d, s_point), ivec2(0), 0);
+    results[3] = texelFetch(sampler2DArray(t_2d_array, s_point), ivec3(0), 0);
+    results[4] = texelFetch(sampler3D(t_3d, s_point), ivec3(0), 0);
+    results[5] = textureLod(samplerCube(t_cube, s_point), vec3(1.0, 0.0, 0.0), 0.0);
+    results[6] = texelFetch(sampler2DMS(t_msaa, s_point), ivec2(0), 3);
+    results[7] = texelFetch(sampler2DMSArray(t_msaa_array, s_point), ivec3(0), 3);
+    results[8] = texelFetch(sampler2D(t_depth, s_point), ivec2(0), 0);
+    results[9] = texelFetch(sampler2DMS(t_depth_msaa, s_point), ivec2(0), 3);
+    // Depth 0 against reference 0.5 with LESS_OR_EQUAL (0.5 <= 0 fails): 0.
+    results[10] = vec4(textureLod(sampler2DShadow(t_depth_compare, s_compare),
+                                  vec3(0.5, 0.5, 0.5), 0.0));
+}

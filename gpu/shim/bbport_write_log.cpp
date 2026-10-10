@@ -11,6 +11,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
 #else
 #include <ucontext.h>
 #include <unistd.h>
@@ -65,6 +69,12 @@ void Note(std::uint64_t address, const void* data, std::uint64_t size, Source so
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
 #ifdef _WIN32
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(GetCurrentThreadId());
+#elif defined(__APPLE__)
+    static thread_local const std::uint32_t tid = [] {
+        std::uint64_t id = 0;
+        pthread_threadid_np(nullptr, &id);
+        return static_cast<std::uint32_t>(id);
+    }();
 #else
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
 #endif
@@ -99,6 +109,10 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     const auto* ctx = static_cast<const CONTEXT*>(ucontext);
     const std::uint64_t regs[] = {ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx,
                                   ctx->Rsi, ctx->Rdi, ctx->R14, ctx->R15};
+#elif defined(__APPLE__)
+    const auto& ss = static_cast<const ucontext_t*>(ucontext)->uc_mcontext->__ss;
+    const std::uint64_t regs[] = {ss.__rax, ss.__rbx, ss.__rcx, ss.__rdx,
+                                  ss.__rsi, ss.__rdi, ss.__r14, ss.__r15};
 #else
     const auto* uc = static_cast<const ucontext_t*>(ucontext);
     const auto* g = uc->uc_mcontext.gregs;

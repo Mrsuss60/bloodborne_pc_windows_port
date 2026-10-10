@@ -18,6 +18,10 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
  * patches above 1080p need about 4 GiB more; run.sh sets it). */
@@ -34,7 +38,11 @@ static uint64_t pool_size_bytes(void) {
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
 #define PAGE UINT64_C(16384)
+#ifdef __APPLE__
+#define USER_MIN DARWIN_USER_MIN
+#else
 #define USER_MIN UINT64_C(0x1000000000)
+#endif
 #define USER_MAX UINT64_C(0xfc00000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
@@ -69,6 +77,17 @@ static void read_unlock(void) { if (!exclusive_depth && !--shared_depth) host_re
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
 static int pool_fd=-1;
+#ifdef __APPLE__
+/* Darwin has no memfd: a named Mach memory entry is the pool, mapped at any offset. */
+static mach_port_t pool_entry=MACH_PORT_NULL;
+static int darwin_map(uintptr_t address, uint64_t size, uint64_t phys, int prot) {
+    mach_vm_address_t at=address;
+    vm_prot_t cur=(vm_prot_t)((prot & PROT_READ ? VM_PROT_READ : 0) | (prot & PROT_WRITE ? VM_PROT_WRITE : 0) |
+                              (prot & PROT_EXEC ? VM_PROT_EXECUTE : 0));
+    return mach_vm_map(mach_task_self(),&at,size,0,VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE,pool_entry,phys,FALSE,
+                       cur,VM_PROT_ALL,VM_INHERIT_NONE)!=KERN_SUCCESS || at!=address;
+}
+#endif
 static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
 #define FLEX_SPAN (UINT64_C(1024) * 1024 * 1024)
 static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
@@ -92,7 +111,7 @@ static void log_mem_op(int kind, uintptr_t addr, uint64_t size, int prot) {
     e->addr = addr;
     e->size = size;
     e->prot = prot;
-    e->tid = (uint32_t)host_thread_id();
+    e->tid = (uint32_t)(uintptr_t)host_thread_id();
 }
 void runtime_memory_dump_recent_ops(void *file_handle) {
     FILE *f = (FILE *)file_handle;
@@ -141,6 +160,15 @@ static int pool(void) {
     const char *selftest = getenv("BB_SELFTEST_MEM");
     if (selftest && selftest[0] == '1') win_mem_run_selftest();
     return 0;
+#elif defined(__APPLE__)
+    memory_object_size_t size=POOL_SIZE+FLEX_SPAN;
+    if (mach_make_memory_entry_64(mach_task_self(),&size,0,MAP_MEM_NAMED_CREATE|VM_PROT_ALL, /* ALL: mappings may be executable */
+                                  &pool_entry,MACH_PORT_NULL)!=KERN_SUCCESS || size<POOL_SIZE+FLEX_SPAN) return -1;
+    mach_vm_address_t view=0;
+    if (mach_vm_map(mach_task_self(),&view,POOL_SIZE+FLEX_SPAN,0,VM_FLAGS_ANYWHERE,pool_entry,0,FALSE,
+                    VM_PROT_READ|VM_PROT_WRITE,VM_PROT_READ|VM_PROT_WRITE,VM_INHERIT_NONE)!=KERN_SUCCESS) return -1;
+    backing_base=(unsigned char *)(uintptr_t)view; pool_fd=0;
+    return 0;
 #else
     pool_fd=memfd_create("bb-guest-memory", MFD_CLOEXEC);
     if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
@@ -153,6 +181,18 @@ static int pool(void) {
 static void punch(uint64_t phys, uint64_t size) {
 #ifdef _WIN32
     win_mem_punch(phys, size);
+#elif defined(__APPLE__)
+    /* Zero on reuse, as a punched memfd hole: only pages holding data (resident or
+     * compressed) are cleared, untouched ones are zero-fill already. Then they are released. */
+    unsigned char *base=backing_base+phys, vec[256];
+    const uint64_t page=vm_page_size, span=sizeof(vec)*page;
+    for (uint64_t off=0; off<size; off+=span) {
+        uint64_t chunk=size-off<span ? size-off : span;
+        if (mincore(base+off,chunk,(char *)vec)) { memset(base+off,0,chunk); continue; }
+        for (uint64_t i=0; i*page<chunk; ++i)
+            if (vec[i] & (MINCORE_INCORE|MINCORE_PAGED_OUT)) memset(base+off+i*page,0,page);
+    }
+    madvise(base,size,MADV_FREE_REUSABLE);
 #else
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
 #endif
@@ -191,7 +231,7 @@ static uint64_t flex_alloc(uint64_t size) {
 }
 static void flex_free(uint64_t phys, uint64_t size) {
     flex_set((phys-POOL_SIZE)/PAGE,size/PAGE,0);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     if (backing_base) memset(backing_base+phys,0,size);
 #else
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
@@ -292,6 +332,11 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     if (kind!=KIND_RESERVED ? win_mem_map(address,address+size,phys,host_prot(prot),restore_remnant)
                             : win_mem_release(address,address+size,restore_remnant)) return NO_MEMORY;
     void *mapped=(void *)address;
+#elif defined(__APPLE__)
+    void *mapped = kind!=KIND_RESERVED
+        ? (darwin_map(address,size,phys,host_prot(prot)) ? MAP_FAILED : (void *)address)
+        : mmap((void *)address,size,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+    if (mapped==MAP_FAILED) return NO_MEMORY;
 #else
     void *mapped = kind!=KIND_RESERVED
         ? mmap((void *)address,size,host_prot(prot),MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
@@ -608,7 +653,16 @@ void *runtime_low_map(size_t size, int prot) {
 #else
     void *p=MAP_FAILED;
     while (low_next+size<=USER_MIN) {
+#ifdef __APPLE__
+        /* VM_FLAGS_FIXED without OVERWRITE fails on an occupied range, like MAP_FIXED_NOREPLACE. */
+        mach_vm_address_t at=low_next;
+        if (mach_vm_allocate(mach_task_self(),&at,size,VM_FLAGS_FIXED)==KERN_SUCCESS) {
+            p=(void *)(uintptr_t)at;
+            if (mprotect(p,size,prot)) { mach_vm_deallocate(mach_task_self(),at,size); p=MAP_FAILED; }
+        }
+#else
         p=mmap((void *)low_next,size,prot,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+#endif
         low_next+=size+PAGE; /* unmapped gap catches overruns */
         if (p!=MAP_FAILED) break;
     }

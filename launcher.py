@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Bloodborne PC (Windows) Launcher GUI."""
+"""Bloodborne PC Launcher GUI (Windows: run.bat; macOS and Linux: run.sh)."""
 
 import json
 import locale
 import os
 import queue
+import signal
 import subprocess
+import sys
 import threading
 import tkinter as tk
 import xml.etree.ElementTree as ET
@@ -14,7 +16,11 @@ from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 
 APP_DIR = Path(__file__).resolve().parent
-RUN_BAT = APP_DIR / "run.bat"
+IS_WINDOWS = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+RUN_SCRIPT = APP_DIR / ("run.bat" if IS_WINDOWS else "run.sh")
+UI_FONT = "Segoe UI" if IS_WINDOWS else ("Helvetica Neue" if IS_MAC else "DejaVu Sans")
+MONO_FONT = "Consolas" if IS_WINDOWS else ("Menlo" if IS_MAC else "DejaVu Sans Mono")
 LOG_FILE = APP_DIR / "launcher.log"
 SETTINGS_FILE = APP_DIR / "launcher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
@@ -92,16 +98,41 @@ def resolve_game_dir(target: str):
     return None
 
 
+def default_vcpkg_root() -> str:
+    """macOS: vcpkg with the x86-64 dependencies (VCPKG_ROOT, else next to this repository)."""
+    return os.environ.get("VCPKG_ROOT") or str(APP_DIR.parent / "vcpkg")
+
+
+def default_moltenvk_icd() -> str:
+    """macOS: MoltenVK's ICD manifest (BB_MOLTENVK_ICD, next to bb-probe, or the Khronos
+    release unpacked next to this repository; see docs/MACOS.md)."""
+    if os.environ.get("BB_MOLTENVK_ICD"):
+        return os.environ["BB_MOLTENVK_ICD"]
+    for candidate in (APP_DIR / "out" / "MoltenVK_icd.json",
+                      APP_DIR.parent / "moltenvk" / "MoltenVK" / "MoltenVK" / "dynamic" / "dylib"
+                      / "macOS" / "MoltenVK_icd.json"):
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
 def kill_tree(proc: subprocess.Popen):
-    """Kill run.bat and everything it started (bbport.exe included)."""
-    if os.name == "nt":
+    """Kill the run script and everything it started (bbport.exe / bb-probe included)."""
+    if IS_WINDOWS:
         subprocess.run(
             ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=NO_WINDOW,
         )
-    else:
-        proc.kill()
+        return
+    # run.sh starts in a session of its own: its process group holds bash, the build and bb-probe.
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 class BloodborneLauncher(tk.Tk):
@@ -140,13 +171,13 @@ class BloodborneLauncher(tk.Tk):
         bg_input = "#1e1e1e"
         accent, accent_hover = "#990000", "#b30000"
 
-        style.configure(".", background=bg_dark, foreground=fg_text, font=("Segoe UI", 10))
+        style.configure(".", background=bg_dark, foreground=fg_text, font=(UI_FONT, 10))
         style.configure("TLabel", background=bg_dark, foreground=fg_text)
         style.configure("Card.TFrame", background=bg_card, relief="flat")
         style.configure("Card.TLabel", background=bg_card, foreground=fg_text)
         style.configure("Card.TCheckbutton", background=bg_card, foreground=fg_text)
-        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground="#c5a059", background=bg_dark)
-        style.configure("SubHeader.TLabel", font=("Segoe UI", 9), foreground="#888888", background=bg_dark)
+        style.configure("Header.TLabel", font=(UI_FONT, 16, "bold"), foreground="#c5a059", background=bg_dark)
+        style.configure("SubHeader.TLabel", font=(UI_FONT, 9), foreground="#888888", background=bg_dark)
 
         # Path Entry styling
         style.configure("TEntry",
@@ -178,13 +209,13 @@ class BloodborneLauncher(tk.Tk):
         self.option_add("*TCombobox*Listbox.selectBackground", accent)
         self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
-        style.configure("Action.TButton", font=("Segoe UI", 11, "bold"),
+        style.configure("Action.TButton", font=(UI_FONT, 11, "bold"),
                         background=accent, foreground="white", borderwidth=0)
         style.map("Action.TButton",
                   background=[("disabled", "#4a2a2a"), ("active", accent_hover)],
                   foreground=[("disabled", "#888888")])
 
-        style.configure("Secondary.TButton", font=("Segoe UI", 9),
+        style.configure("Secondary.TButton", font=(UI_FONT, 9),
                         background="#3a3a3c", foreground="white", borderwidth=0)
         style.map("Secondary.TButton",
                   background=[("disabled", "#2a2a2c"), ("active", "#4a4a4c")],
@@ -195,14 +226,17 @@ class BloodborneLauncher(tk.Tk):
         main.pack(fill="both", expand=True)
 
         ttk.Label(main, text="BLOODBORNE PC", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(main, text="Native Windows Port (bbport) Launcher",
+        subtitle = ("macOS Port (bbport, Rosetta 2 + MoltenVK) Launcher" if IS_MAC
+                    else "Native Windows Port (bbport) Launcher" if IS_WINDOWS
+                    else "Native Port (bbport) Launcher")
+        ttk.Label(main, text=subtitle,
                   style="SubHeader.TLabel").pack(anchor="w", pady=(0, 10))
 
         # eboot.bin selection
         card = ttk.Frame(main, style="Card.TFrame", padding=12)
         card.pack(fill="x", pady=(0, 10))
         ttk.Label(card, text="Game Executable (eboot.bin):", style="Card.TLabel",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 5))
+                  font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(0, 5))
 
         select_frame = ttk.Frame(card, style="Card.TFrame")
         select_frame.pack(fill="x")
@@ -217,15 +251,35 @@ class BloodborneLauncher(tk.Tk):
 
         self.eboot_var = tk.StringVar(value=initial_path)
         ttk.Entry(select_frame, textvariable=self.eboot_var,
-                  font=("Consolas", 10)).pack(side="left", fill="x", expand=True, padx=(0, 10))
+                  font=(MONO_FONT, 10)).pack(side="left", fill="x", expand=True, padx=(0, 10))
         ttk.Button(select_frame, text="Browse...", style="Secondary.TButton",
                    command=self.browse_eboot).pack(side="right")
+
+        # macOS: where the x86-64 dependencies and MoltenVK are (docs/MACOS.md)
+        self.vcpkg_var = tk.StringVar(value=self.settings.get("vcpkg_root") or default_vcpkg_root())
+        self.moltenvk_var = tk.StringVar(value=self.settings.get("moltenvk_icd") or default_moltenvk_icd())
+        if IS_MAC:
+            mac = ttk.Frame(main, style="Card.TFrame", padding=12)
+            mac.pack(fill="x", pady=(0, 10))
+            ttk.Label(mac, text="macOS Setup (see docs/MACOS.md):", style="Card.TLabel",
+                      font=(UI_FONT, 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w",
+                                                       pady=(0, 5))
+            rows = (("vcpkg (x86-64 deps):", self.vcpkg_var, self.browse_vcpkg),
+                    ("MoltenVK_icd.json:", self.moltenvk_var, self.browse_moltenvk))
+            for row, (label, var, browse) in enumerate(rows, start=1):
+                ttk.Label(mac, text=label, style="Card.TLabel").grid(row=row, column=0, sticky="w",
+                                                                      padx=(0, 8), pady=2)
+                ttk.Entry(mac, textvariable=var, font=(MONO_FONT, 10)).grid(
+                    row=row, column=1, sticky="ew", padx=(0, 10), pady=2)
+                ttk.Button(mac, text="Browse...", style="Secondary.TButton",
+                           command=browse).grid(row=row, column=2, pady=2)
+            mac.columnconfigure(1, weight=1)
 
         # Performance & Render options
         opts = ttk.Frame(main, style="Card.TFrame", padding=12)
         opts.pack(fill="x", pady=(0, 10))
         ttk.Label(opts, text="Performance & Render Options:", style="Card.TLabel",
-                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+                  font=(UI_FONT, 10, "bold")).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
         fps = self.settings.get("fps", "uncap")
         res = self.settings.get("res", RES_CHOICES[0])
@@ -267,7 +321,7 @@ class BloodborneLauncher(tk.Tk):
         self.aniso_combo.bind("<<ComboboxSelected>>", lambda e: self.update_aniso_desc())
 
         self.aniso_desc_lbl = ttk.Label(opts, textvariable=self.aniso_desc_var,
-                                        style="Card.TLabel", font=("Segoe UI", 8),
+                                        style="Card.TLabel", font=(UI_FONT, 8),
                                         foreground="#888888")
         self.aniso_desc_lbl.grid(row=2, column=2, columnspan=2, sticky="w", pady=3)
         self.update_aniso_desc()
@@ -279,7 +333,7 @@ class BloodborneLauncher(tk.Tk):
         feat_header = ttk.Frame(feat_card, style="Card.TFrame")
         feat_header.pack(fill="x", pady=(0, 8))
         ttk.Label(feat_header, text="Features & Toggles:", style="Card.TLabel",
-                  font=("Segoe UI", 10, "bold")).pack(side="left")
+                  font=(UI_FONT, 10, "bold")).pack(side="left")
 
         ttk.Button(feat_header, text="⚙  All XML Patches...", style="Secondary.TButton",
                    command=self.open_patches_dialog).pack(side="left", padx=(12, 0))
@@ -290,6 +344,9 @@ class BloodborneLauncher(tk.Tk):
                    command=self.set_vanilla_mode).pack(side="right", padx=(6, 0))
         ttk.Button(feat_header, text="Everything on", style="Secondary.TButton",
                    command=self.set_everything_on).pack(side="right")
+        if IS_MAC:
+            ttk.Button(feat_header, text="Recommended (Mac)", style="Secondary.TButton",
+                       command=self.set_mac_recommended).pack(side="right", padx=(0, 6))
 
         self.feat_upscaler = tk.BooleanVar(value=self.settings.get("feat_upscaler", True))
         self.feat_overlay = tk.BooleanVar(value=self.settings.get("feat_overlay", True))
@@ -297,6 +354,7 @@ class BloodborneLauncher(tk.Tk):
         self.feat_fps_patch = tk.BooleanVar(value=self.settings.get("feat_fps_patch", True))
         self.feat_mods = tk.BooleanVar(value=self.settings.get("mods", True))
         self.feat_res_scaling = tk.BooleanVar(value=self.settings.get("feat_res_scaling", True))
+        self.feat_show_fps = tk.BooleanVar(value=self.settings.get("feat_show_fps", True))
 
         grid_f = ttk.Frame(feat_card, style="Card.TFrame")
         grid_f.pack(fill="x")
@@ -311,6 +369,8 @@ class BloodborneLauncher(tk.Tk):
         ttk.Checkbutton(ov_box, text="Overlay menu", variable=self.feat_overlay,
                         style="Card.TCheckbutton").pack(side="left")
         ttk.Checkbutton(ov_box, text="HUD stats", variable=self.feat_hud,
+                        style="Card.TCheckbutton").pack(side="left", padx=(10, 0))
+        ttk.Checkbutton(ov_box, text="FPS counter", variable=self.feat_show_fps,
                         style="Card.TCheckbutton").pack(side="left", padx=(10, 0))
 
         # Row 1
@@ -343,7 +403,7 @@ class BloodborneLauncher(tk.Tk):
         # log header
         log_header = ttk.Frame(main)
         log_header.pack(fill="x")
-        ttk.Label(log_header, text="Launcher Log:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Label(log_header, text="Launcher Log:", font=(UI_FONT, 9, "bold")).pack(side="left")
         self.hide_vk_var = tk.BooleanVar(value=self.settings.get("hide_vk", True))
         ttk.Checkbutton(log_header, text="Hide Vulkan warnings",
                         variable=self.hide_vk_var).pack(side="right")
@@ -362,7 +422,7 @@ class BloodborneLauncher(tk.Tk):
         log_frame = ttk.Frame(main)
         log_frame.pack(fill="both", expand=True, pady=(2, 0))
         self.log_text = tk.Text(log_frame, height=8, bg="#111111", fg="#a0a0a0", insertbackground="white",
-                                font=("Consolas", 9), relief="flat", wrap="word")
+                                font=(MONO_FONT, 9), relief="flat", wrap="word")
         scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -410,6 +470,29 @@ class BloodborneLauncher(tk.Tk):
         self.update_res_scaling_state()
         self.save_settings()
         self.log("Preset applied: Everything on (restored all defaults and recommended patches).")
+
+    def set_mac_recommended(self):
+        """Apple Silicon (M1 Pro measured) under Rosetta 2 + MoltenVK: 1080p at the game's own
+        30 FPS and full detail holds 30 FPS in most areas (~21 in the heaviest geometry). No
+        upscaler; the small FPS counter instead of the HUD. Skip Intro stays off: it tears the
+        intro movie down while it is still starting."""
+        self.feat_upscaler.set(False)
+        self.feat_overlay.set(True)
+        self.feat_hud.set(False)
+        self.feat_show_fps.set(True)
+        self.feat_fps_patch.set(False)
+        self.feat_mods.set(True)
+        self.feat_res_scaling.set(True)
+        self.fps_var.set("30")
+        self.res_var.set(RES_CHOICES[0])
+        self.aniso_var.set("16x")
+        self.enabled_patches = set()
+        self.sync_quick_patch_vars()
+        self.update_aniso_desc()
+        self.update_res_scaling_state()
+        self.save_settings()
+        self.log("Preset applied: Recommended (Mac): 1080p, 30 FPS, 16x aniso, full detail, "
+                 "upscaler off, FPS counter on.")
 
     def on_quick_patch_toggle(self):
         if self.feat_skip_intro.get():
@@ -468,7 +551,7 @@ class BloodborneLauncher(tk.Tk):
         btn_row = ttk.Frame(top_frame, style="Card.TFrame")
         btn_row.pack(fill="x")
 
-        status_lbl = ttk.Label(btn_row, text="", style="Card.TLabel", font=("Segoe UI", 9, "bold"))
+        status_lbl = ttk.Label(btn_row, text="", style="Card.TLabel", font=(UI_FONT, 9, "bold"))
         status_lbl.pack(side="right")
 
         list_container = ttk.Frame(dlg, style="Card.TFrame", padding=6)
@@ -490,7 +573,9 @@ class BloodborneLauncher(tk.Tk):
         canvas.bind("<Configure>", on_canvas_configure)
 
         def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            # Windows reports multiples of 120 per notch, macOS small deltas.
+            step = -event.delta if IS_MAC else int(-1 * (event.delta / 120))
+            canvas.yview_scroll(step, "units")
         dlg.bind("<MouseWheel>", on_mousewheel)
 
         canvas.pack(side="left", fill="both", expand=True)
@@ -575,22 +660,22 @@ class BloodborneLauncher(tk.Tk):
                     command=make_toggle_cb(pname, var),
                     bg=bg_card, fg="#ffffff", selectcolor="#1e1e1e",
                     activebackground=bg_card, activeforeground="#ffffff",
-                    font=("Segoe UI", 9, "bold"), anchor="w"
+                    font=(UI_FONT, 9, "bold"), anchor="w"
                 )
                 cb.pack(side="left")
 
                 badge_text = f"by {author}" if author else ""
                 if badge_text:
                     tk.Label(header_row, text=badge_text, bg=bg_card, fg="#888888",
-                             font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
+                             font=(UI_FONT, 8)).pack(side="left", padx=(8, 0))
 
                 tk.Label(header_row, text=f"[{cat}]", bg=bg_card, fg="#c5a059",
-                         font=("Segoe UI", 8)).pack(side="right")
+                         font=(UI_FONT, 8)).pack(side="right")
 
                 if note:
                     note_lbl = tk.Label(
                         item_card, text=note, bg=bg_card, fg="#aaaaaa",
-                        font=("Segoe UI", 8, "italic"), justify="left", wraplength=640, anchor="w"
+                        font=(UI_FONT, 8, "italic"), justify="left", wraplength=640, anchor="w"
                     )
                     note_lbl.pack(fill="x", padx=(24, 0), pady=(1, 2))
 
@@ -678,9 +763,9 @@ class BloodborneLauncher(tk.Tk):
         main_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
         ttk.Label(main_frame, text="Mouse & Keyboard Controls", style="Card.TLabel",
-                  font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 4))
+                  font=(UI_FONT, 12, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(main_frame, text="Configurable mouse and keyboard controls with real-time in-game synchronization.",
-                  style="Card.TLabel", font=("Segoe UI", 9), foreground="#aaaaaa").pack(anchor="w", pady=(0, 10))
+                  style="Card.TLabel", font=(UI_FONT, 9), foreground="#aaaaaa").pack(anchor="w", pady=(0, 10))
 
         ttk.Checkbutton(main_frame, text="Enable Mouse & Keyboard Mode",
                         variable=mk_enabled_var, style="Card.TCheckbutton").pack(anchor="w", pady=(0, 10))
@@ -690,7 +775,7 @@ class BloodborneLauncher(tk.Tk):
         cam_card.pack(fill="x", pady=(0, 10))
 
         ttk.Label(cam_card, text="Camera & Sensitivity Options", style="Card.TLabel",
-                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+                  font=(UI_FONT, 10, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         # Sens X
         ttk.Label(cam_card, text="Horizontal Sensitivity (X):", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=4)
@@ -739,7 +824,7 @@ class BloodborneLauncher(tk.Tk):
         bind_card.pack(fill="both", expand=True, pady=(0, 10))
 
         ttk.Label(bind_card, text="Control Bindings", style="Card.TLabel",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+                  font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(0, 6))
 
         bindings = [
             ("Left Click (LMB)", "Right Hand Attack (R1) / Trick Normal Attack"),
@@ -765,9 +850,9 @@ class BloodborneLauncher(tk.Tk):
             row = idx % 7
             col = (idx // 7) * 2
             ttk.Label(bind_container, text=f"{k_name}:", style="Card.TLabel",
-                      font=("Segoe UI", 8, "bold"), foreground="#c5a059").grid(row=row, column=col, sticky="w", padx=(0, 4), pady=2)
+                      font=(UI_FONT, 8, "bold"), foreground="#c5a059").grid(row=row, column=col, sticky="w", padx=(0, 4), pady=2)
             ttk.Label(bind_container, text=k_act, style="Card.TLabel",
-                      font=("Segoe UI", 8), foreground="#cccccc").grid(row=row, column=col+1, sticky="w", padx=(0, 16), pady=2)
+                      font=(UI_FONT, 8), foreground="#cccccc").grid(row=row, column=col+1, sticky="w", padx=(0, 16), pady=2)
 
         # Bottom actions
         action_bar = ttk.Frame(dlg, style="Card.TFrame", padding=10)
@@ -848,7 +933,10 @@ class BloodborneLauncher(tk.Tk):
             "feat_fps_patch": self.feat_fps_patch.get(),
             "feat_res_scaling": self.feat_res_scaling.get(),
             "fullscreen": self.fullscreen.get(),
+            "feat_show_fps": self.feat_show_fps.get(),
             "enabled_patches": sorted(list(self.enabled_patches)),
+            "vcpkg_root": self.vcpkg_var.get().strip(),
+            "moltenvk_icd": self.moltenvk_var.get().strip(),
         }
         try:
             SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -924,14 +1012,18 @@ class BloodborneLauncher(tk.Tk):
             messagebox.showinfo("No log yet", "launcher.log is created the first time you launch the game.")
             return
         try:
-            os.startfile(str(LOG_FILE))
+            if IS_WINDOWS:
+                os.startfile(str(LOG_FILE))
+            else:
+                subprocess.Popen(["open" if IS_MAC else "xdg-open", str(LOG_FILE)])
         except (AttributeError, OSError) as ex:
             messagebox.showerror("Error", f"Could not open {LOG_FILE}:\n{ex}")
 
     # ------------------------------------------------------------- actions
     def browse_eboot(self):
         current = resolve_game_dir(self.eboot_var.get()) if self.eboot_var.get().strip() else None
-        start = current or (DEFAULT_GAME if DEFAULT_GAME.exists() else Path("D:/"))
+        start = current or (DEFAULT_GAME if DEFAULT_GAME.exists()
+                            else Path("D:/") if IS_WINDOWS else Path.home())
         chosen = filedialog.askopenfilename(
             title="Select Bloodborne eboot.bin",
             filetypes=[("PS4 Executable (*.bin)", "*.bin"), ("All files", "*.*")],
@@ -941,6 +1033,65 @@ class BloodborneLauncher(tk.Tk):
             chosen = os.path.normpath(chosen)
             self.eboot_var.set(chosen)
             self.log(f"Selected executable: {chosen}")
+
+    def browse_vcpkg(self):
+        chosen = filedialog.askdirectory(title="Select the vcpkg folder (VCPKG_ROOT)",
+                                         initialdir=self.vcpkg_var.get() or str(Path.home()))
+        if chosen:
+            self.vcpkg_var.set(os.path.normpath(chosen))
+
+    def browse_moltenvk(self):
+        current = Path(self.moltenvk_var.get()).parent if self.moltenvk_var.get() else Path.home()
+        chosen = filedialog.askopenfilename(title="Select MoltenVK_icd.json",
+                                            filetypes=[("Vulkan ICD manifest", "*.json")],
+                                            initialdir=str(current))
+        if chosen:
+            self.moltenvk_var.set(os.path.normpath(chosen))
+
+    def verify_mac(self, details: list[str]) -> tuple[bool, str]:
+        """macOS: Rosetta 2, the x86-64 dependencies, MoltenVK and (when built) the GPU check."""
+        if subprocess.run(["arch", "-x86_64", "/usr/bin/true"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode != 0:
+            return False, ("Rosetta 2 is not installed. The port is an x86-64 build.\n\n"
+                           "Install it with: softwareupdate --install-rosetta")
+        details.append("[OK] Rosetta 2: available")
+
+        deps = Path(self.vcpkg_var.get().strip()) / "installed" / "x64-osx"
+        if not (deps / "lib" / "pkgconfig").is_dir():
+            return False, (f"x86-64 dependencies were not found in:\n{deps}\n\n"
+                           "Select your vcpkg folder (VCPKG_ROOT) and install the dependencies "
+                           "listed in docs/MACOS.md.")
+        details.append(f"[OK] x86-64 dependencies: {deps}")
+
+        icd = Path(self.moltenvk_var.get().strip())
+        if not icd.is_file():
+            return False, ("MoltenVK_icd.json was not found.\n\n"
+                           "Download MoltenVK-macos.tar from the Khronos MoltenVK releases and "
+                           "select MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json (docs/MACOS.md).")
+        details.append(f"[OK] MoltenVK: {icd}")
+
+        probe = APP_DIR / "out" / "bb-probe"
+        if probe.is_file():
+            built = datetime.fromtimestamp(probe.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            details.append(f"[OK] Compiled binary: bb-probe (built {built}); run.sh rebuilds what changed")
+        else:
+            details.append("[NOTE] bb-probe not built yet: run.sh builds it on launch (a few minutes)")
+
+        caps = APP_DIR / "out" / "bb-gpu-capabilities"
+        if caps.is_file():
+            env = dict(os.environ, VK_DRIVER_FILES=str(icd))
+            try:
+                result = subprocess.run([str(caps), "--live-resolution"], env=env, timeout=20,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                gpu = next((ln for ln in decode_line(result.stderr).splitlines()
+                            if ln.startswith("GPU:")), "")
+                if gpu:
+                    details.append(f"[OK] Vulkan on MoltenVK: {gpu[4:].split(',')[0].strip()}")
+                else:
+                    details.append("[WARN] Vulkan on MoltenVK: no GPU reported (check MoltenVK_icd.json)")
+            except (OSError, subprocess.TimeoutExpired) as ex:
+                details.append(f"[WARN] Vulkan on MoltenVK: GPU check failed ({ex})")
+        return True, ""
 
     def verify_prelaunch(self, game_dir: Path) -> tuple[bool, str, list[str]]:
         """Verify that game directory, EBOOT, compiled source binaries, and scripts are ready."""
@@ -987,9 +1138,20 @@ class BloodborneLauncher(tk.Tk):
             details.append("[NOTE] dvdroot_ps4 not detected directly under game root (custom layout or loose files)")
 
         # 3. Launcher script
-        if not RUN_BAT.exists():
-            return False, f"Launcher script run.bat not found in:\n{APP_DIR}", details
-        details.append("[OK] Launcher script: run.bat ready")
+        if not RUN_SCRIPT.exists():
+            return False, f"Launcher script {RUN_SCRIPT.name} not found in:\n{APP_DIR}", details
+        details.append(f"[OK] Launcher script: {RUN_SCRIPT.name} ready")
+
+        if not IS_WINDOWS:
+            if IS_MAC:
+                ok, err = self.verify_mac(details)
+                if not ok:
+                    return False, err, details
+            patches_py = APP_DIR / "scripts" / "patches.py"
+            if not patches_py.is_file():
+                return False, f"Game patch script not found at:\n{patches_py}", details
+            details.append("[OK] Patch engine: scripts/patches.py ready")
+            return True, "", details
 
         # 4. Compiled bbport.exe
         bbport_exe = APP_DIR / "out" / "bbport.exe"
@@ -1131,6 +1293,9 @@ class BloodborneLauncher(tk.Tk):
         # Fullscreen window (read by gpu/shim/window.cpp)
         env["BB_FULLSCREEN"] = "1" if self.fullscreen.get() else "0"
 
+        # Small FPS / frame-time counter in a corner (overrides the overlay setting)
+        env["BB_SHOW_FPS"] = "1" if self.feat_show_fps.get() else "0"
+
         # Frame ahead queue (smooth frametimes & bound queue latency: 2 = balanced)
         env.setdefault("BB_FRAMES_AHEAD", "2")
 
@@ -1158,7 +1323,8 @@ class BloodborneLauncher(tk.Tk):
             f"FPSPatch={'on' if self.feat_fps_patch.get() else 'off'}, "
             f"Mods={'on' if self.feat_mods.get() else 'off'}, "
             f"ResScaling={'on' if self.feat_res_scaling.get() else 'off'}, "
-            f"Fullscreen={'on' if self.fullscreen.get() else 'off'}"
+            f"Fullscreen={'on' if self.fullscreen.get() else 'off'}, "
+            f"ShowFPS={'on' if self.feat_show_fps.get() else 'off'}"
         )
 
         self.hidden_count = 0
@@ -1169,7 +1335,12 @@ class BloodborneLauncher(tk.Tk):
         self.log(f"XML Patches ({len(active_patches)} active): {', '.join(active_patches) if active_patches else 'None'}")
         self.log("=" * 50)
 
-        cmd = ["cmd.exe", "/d", "/c", RUN_BAT.name] if os.name == "nt" else [str(RUN_BAT)]
+        if IS_MAC:
+            env["VCPKG_ROOT"] = self.vcpkg_var.get().strip()
+            env["BB_MOLTENVK_ICD"] = self.moltenvk_var.get().strip()
+            self.log(f"macOS: vcpkg {env['VCPKG_ROOT']}, MoltenVK {env['BB_MOLTENVK_ICD']}")
+
+        cmd = ["cmd.exe", "/d", "/c", RUN_SCRIPT.name] if IS_WINDOWS else ["bash", RUN_SCRIPT.name]
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -1179,6 +1350,8 @@ class BloodborneLauncher(tk.Tk):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 creationflags=NO_WINDOW,
+                # A process group of its own, so Stop ends bb-probe too (kill_tree).
+                start_new_session=not IS_WINDOWS,
             )
         except Exception as ex:
             self.log(f"Launch Error: {ex}")

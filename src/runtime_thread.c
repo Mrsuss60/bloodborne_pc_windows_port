@@ -2,7 +2,8 @@
  * (variant II: static TLS below the TCB). The loader rewrites the eboot's
  * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
  * keeps FS. On Windows GS is the TEB: the loader points the instruction at a TEB
- * TLS slot that holds the guest TCB instead.
+ * TLS slot that holds the guest TCB instead. On macOS GS is the pthread TSD array: the
+ * instruction reads a TSD slot that holds the guest TCB (darwin_compat.c).
  * Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
@@ -20,9 +21,11 @@
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
-#include <sys/syscall.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
+#include <sys/syscall.h>
 #include <asm/prctl.h>
+#endif
 #define EXIT_SET(buf) setjmp(buf)
 #define EXIT_JUMP(buf) longjmp(buf,1)
 #endif
@@ -58,6 +61,8 @@ static void set_tls_base(void *base) {
 #ifdef _WIN32
     runtime_win_set_tcb(base);
     __asm__ __volatile__("wrfsbase %0" : : "r"(base));
+#elif defined(__APPLE__)
+    runtime_darwin_set_tcb(base);
 #else
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
 #endif
@@ -259,6 +264,8 @@ static void set_host_name(const char *name) {
     memcpy(host,name,strnlen(name,sizeof(host)-1));
 #ifdef _WIN32
     runtime_win_set_thread_name(host);
+#elif defined(__APPLE__)
+    pthread_setname_np(host); /* Darwin names the calling thread only */
 #else
     pthread_setname_np(pthread_self(),host);
 #endif
@@ -345,6 +352,9 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_t host;
     pthread_attr_init(&host);
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
+#ifdef __APPLE__
+    stack_bytes=(stack_bytes+16383)&~(size_t)16383; /* Darwin wants a page-multiple stack size */
+#endif
     if (stack_memory) {
         CHECK_LOW_ADDR(stack_memory);
         pthread_attr_setstack(&host,stack_memory,stack_bytes);

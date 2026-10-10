@@ -288,6 +288,7 @@ static void read_inject(void) {
     if (ft.dwLowDateTime == last_ft.dwLowDateTime && ft.dwHighDateTime == last_ft.dwHighDateTime) return;
     last_ft = ft;
 #else
+    struct stat st;
     if (stat(path,&st)!=0) return;
     if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
     mtime=st.st_mtim;

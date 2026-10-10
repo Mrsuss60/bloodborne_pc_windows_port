@@ -254,6 +254,10 @@ bool AvPlayerSource::Start() {
                       m_video_stream_index.value());
             return false;
         }
+        // bbport: decode on several threads; one thread decodes a 1080p movie at ~28 FPS
+        // under Rosetta, slower than the movie.
+        m_video_codec_context->thread_count = 0;
+        m_video_codec_context->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         if (avcodec_open2(m_video_codec_context.get(), decoder, nullptr) < 0) {
             LOG_ERROR(Lib_AvPlayer, "Could not open avcodec for video stream {}.",
                       m_video_stream_index.value());
@@ -398,6 +402,19 @@ bool AvPlayerSource::GetVideoData(AvPlayerFrameInfoEx& video_info) {
     }
 
     auto frame = m_video_frames.Pop();
+    // bbport: when the game asks for frames less often than the movie's frame rate (the movie
+    // loop runs at the render rate, ~28 FPS under Rosetta for a 30 FPS movie), hand it the
+    // newest frame that is due and drop the older ones, as AV sync does. Returning every frame
+    // in turn left the picture seconds behind the audio, and the game tore the movie down at
+    // the audio clock's end while the player still had video (and its audio thread) running.
+    if (m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
+        while (m_video_frames.Size() != 0 &&
+               m_video_frames.Front().info.timestamp <= current_time) {
+            m_video_buffers.Push(std::move(frame->buffer));
+            m_video_buffers_cv.Notify();
+            frame = m_video_frames.Pop();
+        }
+    }
     video_info = frame->info;
 
     m_current_video_frame = std::move(frame);
@@ -679,7 +696,7 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     const auto width = Common::AlignUp<u32>(frame.width, 16);
     const auto pitch = Common::AlignUp<u32>(frame.width, 64);
     const auto height = Common::AlignUp<u32>(frame.height, 16);
-    if (Core::Memory::Instance() && reinterpret_cast<uintptr_t>(p_buffer) >= 0x1000000000ULL) {
+    if (Core::Memory::Instance() && !IsHostMemory(p_buffer)) {
         Core::Memory::Instance()->InvalidateMemory(reinterpret_cast<VAddr>(p_buffer),
                                                    (width * height * 3) / 2);
     }
@@ -716,6 +733,7 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
     Common::SetCurrentThreadName("shadPS4:AvVideoDecoder");
 
     LOG_INFO(Lib_AvPlayer, "Video Decoder Thread started");
+    u64 late_frames = 0;
     while ((!m_is_eof || m_video_packets.Size() != 0) && !stop.stop_requested()) {
         if (m_video_packets.Size() == 0 &&
             !m_video_packets_cv.Wait(stop, [this] { return m_video_packets.Size() != 0; })) {
@@ -752,6 +770,21 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
                     return;
                 }
             } else {
+                // bbport: the game holds most of its few output buffers (often two), so frames
+                // can only be dropped here: one the audio clock has already passed by more than
+                // two frames is decoded (later frames reference it) but never converted or
+                // queued. Otherwise the picture advances one frame per game request, drifts
+                // seconds behind the audio, and outlives the game's movie teardown.
+                if (m_audio_stream_index && m_last_audio_ts.has_value() &&
+                    m_state.GetSyncMode() == AvPlayerAvSyncMode::Default) {
+                    const auto index = m_streams[m_video_stream_index.value()].ffmpeg_index;
+                    const auto timestamp = FrameTimestampMillis(
+                        *up_frame, m_avformat_context->streams[index]->time_base);
+                    if (timestamp + 66 < CurrentTime()) {
+                        ++late_frames;
+                        continue;
+                    }
+                }
                 auto buffer = m_video_buffers.Pop();
                 if (!buffer.has_value()) {
                     // Video buffers queue was cleared. This means that player was stopped.
@@ -773,6 +806,9 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
     }
 
     LOG_INFO(Lib_AvPlayer, "Video Decoder Thread exited normally");
+    if (late_frames) {
+        LOG_WARNING(Lib_AvPlayer, "{} late video frames dropped", late_frames);
+    }
     m_video_decoder_thread.Join();
 }
 

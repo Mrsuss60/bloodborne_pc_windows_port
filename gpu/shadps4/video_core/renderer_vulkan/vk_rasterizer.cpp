@@ -51,6 +51,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // Before the rasterizer is bound: Liverpool enqueues buffers only once it sees it.
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
+    if (!instance.IsNullDescriptorSupported()) {
+        null_resources = std::make_unique<NullResources>(instance, scheduler);
+    }
     // Object motion first: it fixes the buffer addresses the motion shader variants embed.
     object_motion = std::make_unique<ObjectMotion>(instance, scheduler);
     camera_motion = std::make_unique<CameraMotion>(instance, scheduler, texture_cache, runtime);
@@ -428,7 +431,11 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
     if (draw_pipe) {
         return tid == draw_pipe->StageBThreadId();
     }
+#if defined(__linux__) || defined(_WIN32)
     return tid == liverpool->GetGpuCommandProcessorThreadId();
+#else
+    return false; // no command processor thread id on this host: the locked path
+#endif
 }
 
 void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
@@ -550,10 +557,18 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     std::array<u16, AmdGpu::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
+#ifdef __GLIBCXX__
     for (size_t block = dirty.blocks._Find_first(); block < dirty.blocks.size();
          block = dirty.blocks._Find_next(block)) {
         blocks[num_blocks++] = static_cast<u16>(block);
     }
+#else // libc++ (macOS) has no _Find_first/_Find_next
+    for (size_t block = 0; block < dirty.blocks.size(); ++block) {
+        if (dirty.blocks.test(block)) {
+            blocks[num_blocks++] = static_cast<u16>(block);
+        }
+    }
+#endif
     const auto stages =
         pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
     // Constants: copied here into the ring, the recording thread only binds them.
@@ -896,6 +911,8 @@ bool Rasterizer::FilterDrawPasses() const {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
+    BbStats::vertices.fetch_add(u64(Regs().num_indices) * Regs().num_instances.NumInstances(),
+                                std::memory_order_relaxed);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
     // to the recording thread (DrawRecord there); draws FilterDraw handles itself run here.
@@ -977,6 +994,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         return;
     }
     const auto state = BeginRendering(pipeline);
+    if (DrawHasNoEffect(pipeline, state)) {
+        return;
+    }
 
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);
@@ -1802,6 +1822,12 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
             host_buffers.emplace_back(host_buffer_info->buffer->Handle());
             host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
                                    host_buffer_info->base_address);
+        } else if (null_resources) {
+            host_buffers.emplace_back(null_resources->Buffer());
+            host_offsets.push_back(0);
+            host_sizes.push_back(VK_WHOLE_SIZE);
+            host_strides.push_back(buffer.GetStride());
+            continue;
         } else {
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
@@ -2044,7 +2070,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
                 if (Regs().clipper_control.user_clip_plane_enable == 0) {
-                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                    buffer_infos.emplace_back(null_resources ? null_resources->Buffer() : vk::Buffer{}, 0,
+                                              VK_WHOLE_SIZE);
                 } else {
                     auto& vk_buffer = buffer_cache.GetStreamBuffer();
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
@@ -2102,7 +2129,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                                      memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                buffer_infos.emplace_back(null_resources ? null_resources->Buffer() : vk::Buffer{}, 0,
+                                              VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 if (size != vsharp.GetSize()) {
@@ -2226,8 +2254,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
+        // bbport: an unbound image. Without nullDescriptor its stand-in needs the view type the
+        // shader declares and the descriptor type of the binding (storage or sampled).
+        const auto null_image_desc = [&](const Shader::ImageResource& resource,
+                                         const AmdGpu::Image& sharp) -> auto& {
+            auto& desc = image_desc_storage.emplace_back();
+            if (null_resources) {
+                desc.view_info.type = sharp.GetViewType(resource.is_array);
+                desc.view_info.format =
+                    resource.is_depth ? vk::Format::eD32Sfloat : vk::Format::eR8G8B8A8Unorm;
+                desc.type = resource.is_written ? VideoCore::TextureCache::BindingType::Storage
+                                                : VideoCore::TextureCache::BindingType::Texture;
+            }
+            return desc;
+        };
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
+            image_bindings.emplace_back(VideoCore::ImageId{}, &null_image_desc(image_desc, tsharp));
             image_binding_entries.push_back(nullptr);
             binding_proxy_ok.push_back(false);
             image_descriptor_array_sizes.push_back(1);
@@ -2241,7 +2283,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings.emplace_back(VideoCore::ImageId{}, &image_desc_storage.emplace_back());
+            image_bindings.emplace_back(VideoCore::ImageId{}, &null_image_desc(image_desc, tsharp));
             image_binding_entries.push_back(nullptr);
             binding_proxy_ok.push_back(false);
             image_descriptor_array_sizes.push_back(1);
@@ -2346,7 +2388,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
         const auto& desc = *desc_ptr;
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
-            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            const vk::ImageView null_view =
+                null_resources ? null_resources->View(desc.view_info.type,
+                                                      desc.view_info.format == vk::Format::eD32Sfloat)
+                               : vk::ImageView{};
+            image_infos.emplace_back(VK_NULL_HANDLE, null_view, vk::ImageLayout::eGeneral);
+            if (set_ok && binding_index < resolved.size()) {
+                resolved[binding_index].view = null_view; // the texture set memo reuses it
+            }
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
@@ -2617,7 +2666,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
-            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            image_infos.emplace_back(VK_NULL_HANDLE, entry.view, vk::ImageLayout::eGeneral);
             continue;
         }
         texture_cache.MarkFound(entry.id);
@@ -3548,6 +3597,37 @@ u32 Rasterizer::GetGpuCommandProcessorThreadId() {
 } // namespace Vulkan
 
 namespace Vulkan {
+
+bool Rasterizer::DrawHasNoEffect(const GraphicsPipeline* pipeline, const RenderState& state) const {
+    // bbport: a draw without color or depth attachments, without a pixel shader and without
+    // stores changes nothing (occlusion queries are answered on the CPU). The game issues some
+    // with a 16384x16384 render area; on a tile-based GPU (Apple) each still walks that area.
+    if (pipeline->GetStages()[u32(Shader::SwStage::Fragment)] ||
+        state.depth_stencil_attachment.image_view) {
+        return false;
+    }
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        if (state.color_attachments[cb].image_view) {
+            return false;
+        }
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& buffer : stage->buffers) {
+            if (buffer.is_written) {
+                return false;
+            }
+        }
+        for (const auto& image : stage->images) {
+            if (image.is_written) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state) {
     auto* profiler = GpuProfiler::Get();

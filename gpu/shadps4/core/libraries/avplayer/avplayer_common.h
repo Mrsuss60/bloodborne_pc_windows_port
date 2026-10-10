@@ -15,6 +15,18 @@
 
 namespace Libraries::AvPlayer {
 
+// bbport: whether memory came from the host heap rather than the guest's allocator. Guest
+// memory lies at [0x1000000000, 1 TiB) on Linux; on macOS it starts above Apple Silicon's GPU
+// carveout (0x7800000000) and the host heap lies above 1 TiB.
+inline bool IsHostMemory(const void* memory) {
+    const auto address = reinterpret_cast<uintptr_t>(memory);
+#ifdef __APPLE__
+    return address < 0x7800000000ULL || address >= (1ULL << 40);
+#else
+    return address < 0x1000000000ULL;
+#endif
+}
+
 enum class AvState {
     Unknown,
     Initial,

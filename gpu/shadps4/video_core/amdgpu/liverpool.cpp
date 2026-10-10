@@ -11,6 +11,9 @@
 #else
 #include <sys/resource.h>
 #endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include <time.h>
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
@@ -109,7 +112,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__) // Darwin has no per-thread CPU clock ids
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
@@ -1352,7 +1355,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         draw_prep->EndSubmission();
     }
     if (seq != NoSeq && BbStats::enabled) {
-#ifndef _WIN32
+#if defined(__APPLE__)
+        thread_basic_info_data_t info;
+        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+        const mach_port_t self = mach_thread_self();
+        if (thread_info(self, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) ==
+            KERN_SUCCESS) {
+            BbStats::gpu_user_us.store(u64(info.user_time.seconds) * 1000000 + info.user_time.microseconds,
+                                       std::memory_order_relaxed);
+            BbStats::gpu_sys_us.store(u64(info.system_time.seconds) * 1000000 +
+                                          info.system_time.microseconds,
+                                      std::memory_order_relaxed);
+        }
+        mach_port_deallocate(mach_task_self(), self);
+#elif !defined(_WIN32)
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
                                        std::memory_order_relaxed);

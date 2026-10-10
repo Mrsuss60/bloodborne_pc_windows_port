@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "runtime.h"
+/* The loader (probe.c) restores the guest thread pointer after host calls; not linked here. */
+ABI void restore_guest_fs(void) {}
 #include <stdlib.h>
 
 /* The settings menu of the GPU library restarts through probe.c, which tests do not link. */
@@ -325,6 +327,69 @@ static void rw_timeouts(void) {
     assert(rw_unlock(&f.lock)==0);
     fixture_destroy(&f);
 }
+#ifdef __APPLE__
+#include <sys/mman.h>
+/* The eboot's thread pointer load after link_modules.py and the loader's macOS rewrite
+ * (probe.c, patch_tls_loads): `mov rax, gs:[slot*8]` must yield the guest TCB, per thread. */
+static uint64_t run_tls_load(void) {
+    static unsigned char *code;
+    if (!code) {
+        code=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
+        assert(code!=MAP_FAILED);
+        /* The eboot's original load, rewritten as the loader does. */
+        const unsigned char load[]={0x64,0x48,0x8b,0x04,0x25,0,0,0,0,0xc3}; /* ...; ret */
+        memcpy(code,load,sizeof(load));
+        assert(runtime_darwin_patch_tls_loads(code,sizeof(load))==1 && code[0]==0x65);
+        assert(!mprotect(code,4096,PROT_READ|PROT_EXEC));
+    }
+    return ((uint64_t (ABI *)(void))code)();
+}
+static void *tls_thread(void *out) {
+    runtime_thread_current();
+    ((uint64_t *)out)[0]=run_tls_load();
+    ((uint64_t *)out)[1]=(uint64_t)(uintptr_t)runtime_thread_get_tcb();
+    return NULL;
+}
+/* The rewrite over an eboot-sized image: every load once, nothing else, in one pass. */
+static void darwin_tls_patch_scan(void) {
+    enum { SIZE=96*1024*1024, SITES=20000 };
+    unsigned char *code=calloc(SIZE,1);
+    assert(code);
+    static const unsigned char fs_load[]={0x64,0x48,0x8b,0x04,0x25,0,0,0,0};
+    static const unsigned char near_miss[]={0x64,0x48,0x8b,0x04,0x25,8,0,0,0}; /* fs:[8] */
+    for (uint32_t i=0;i<SITES;++i) {
+        unsigned char *at=code+(size_t)i*(SIZE/SITES);
+        memcpy(at,fs_load,sizeof(fs_load));
+        if (i%2) at[0]=0x65; /* already GS (link scripts) */
+        memcpy(at+16,near_miss,sizeof(near_miss));
+    }
+    struct timespec t0,t1;
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    uint64_t patched=runtime_darwin_patch_tls_loads(code,SIZE);
+    clock_gettime(CLOCK_MONOTONIC,&t1);
+    double seconds=(double)(t1.tv_sec-t0.tv_sec)+(double)(t1.tv_nsec-t0.tv_nsec)/1e9;
+    const uint32_t disp=runtime_darwin_tls_slot()*8;
+    for (uint32_t i=0;i<SITES;++i) {
+        const unsigned char *at=code+(size_t)i*(SIZE/SITES);
+        uint32_t got; memcpy(&got,at+5,4);
+        assert(at[0]==0x65 && got==disp);
+        assert(!memcmp(at+16,near_miss,sizeof(near_miss))); /* other displacements untouched */
+    }
+    printf("macOS thread pointer rewrite: %llu loads in 96 MiB, %.3f s\n",(unsigned long long)patched,seconds);
+    assert(patched==SITES && seconds<5.0);
+    free(code);
+}
+static void darwin_thread_pointer(void) {
+    runtime_thread_current();
+    uint64_t main_tcb=(uint64_t)(uintptr_t)runtime_thread_get_tcb();
+    assert(main_tcb && run_tls_load()==main_tcb);
+    uint64_t other[2]={0,0};
+    pthread_t thread;
+    assert(pthread_create(&thread,NULL,tls_thread,other)==0 && pthread_join(thread,NULL)==0);
+    assert(other[1] && other[1]!=main_tcb && other[0]==other[1]);
+    assert(run_tls_load()==main_tcb);
+}
+#endif
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#q#q",0)==0);
     runtime_start(1);
@@ -352,6 +417,11 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
     rw_lifecycle(); rw_concurrency(); rw_timeouts();
+#ifdef __APPLE__
+    darwin_thread_pointer();
+    darwin_tls_patch_scan();
+    puts("PASS: macOS guest thread pointer (TSD slot) on two threads, eboot-sized rewrite in one pass");
+#endif
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;
 }

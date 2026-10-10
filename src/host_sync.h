@@ -83,7 +83,11 @@ static inline void host_mutex_lock(HostMutex *m) { host_lock(m); }
 static inline void host_mutex_unlock(HostMutex *m) { host_unlock(m); }
 
 typedef pthread_mutex_t HostRecursiveMutex;
+#ifdef __APPLE__
+#define HOST_RECURSIVE_MUTEX_INIT PTHREAD_RECURSIVE_MUTEX_INITIALIZER
+#else
 #define HOST_RECURSIVE_MUTEX_INIT PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
+#endif
 static inline void host_recursive_lock(HostRecursiveMutex *m) { pthread_mutex_lock(m); }
 static inline void host_recursive_unlock(HostRecursiveMutex *m) { pthread_mutex_unlock(m); }
 
@@ -101,6 +105,13 @@ typedef pthread_cond_t HostCond;
 #define HOST_COND_INIT PTHREAD_COND_INITIALIZER
 static inline void host_cond_init(HostCond *c) { pthread_cond_init(c, NULL); }
 static inline void host_cond_wait(HostCond *c, HostMutex *m) { pthread_cond_wait(c, m); }
+#ifdef __APPLE__
+/* 0 when woken, ETIMEDOUT once at least ns passed (Darwin has no monotonic condattr clock). */
+static inline int host_cond_timedwait(HostCond *c, HostMutex *m, uint64_t ns) {
+    struct timespec t = {(time_t)(ns / 1000000000u), (long)(ns % 1000000000u)};
+    return pthread_cond_timedwait_relative_np(c, m, &t);
+}
+#endif
 static inline void host_cond_signal(HostCond *c) { pthread_cond_signal(c); }
 static inline void host_cond_broadcast(HostCond *c) { pthread_cond_broadcast(c); }
 

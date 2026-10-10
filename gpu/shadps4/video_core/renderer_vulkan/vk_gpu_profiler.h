@@ -62,7 +62,13 @@ private:
     void Print();
 
     static constexpr u32 NumSlices = 4;
+#ifdef __APPLE__
+    // MoltenVK samples GPU timestamps only in query pools of up to 4096 queries; larger pools
+    // fall back to one time per finished command buffer (every segment inside reads 0 ms).
+    static constexpr u32 SliceQueries = 1024;
+#else
     static constexpr u32 SliceQueries = 4096;
+#endif
     static inline GpuProfiler* instance_ptr = nullptr;
 
     vk::Device device;

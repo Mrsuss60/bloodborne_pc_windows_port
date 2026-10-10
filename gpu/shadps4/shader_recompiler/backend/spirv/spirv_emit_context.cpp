@@ -585,6 +585,12 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
+    if (profile.skip_no_contraction) {
+        // bbport: without NoContraction Metal may fuse the position math differently in a depth
+        // pre-pass and in the G-buffer pass drawing the same mesh: equal-depth tests flicker.
+        // An invariant position ([[invariant]], preserveInvariance) is computed the same way.
+        Decorate(output_position, spv::Decoration::Invariant);
+    }
     const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
                                                hw_stage == HwStage::Vertex &&
                                                profile.needs_clip_distance_emulation;

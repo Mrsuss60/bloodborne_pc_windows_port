@@ -100,6 +100,8 @@ if (WIN32)
             pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
         endif()
     endif()
+elseif (APPLE)
+    pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 else()
     pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
     pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
@@ -183,6 +185,14 @@ set(COMMON
     shim/common/logging/log.cpp)
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+if (APPLE)
+    # pkg_check_modules folds repeated "-framework X" flags into one "-framework X Y Z";
+    # the frameworks of a static FFmpeg are linked explicitly instead.
+    set_property(TARGET PkgConfig::FFMPEG PROPERTY INTERFACE_LINK_OPTIONS "")
+    target_link_libraries(PkgConfig::FFMPEG INTERFACE "-framework AudioToolbox" "-framework VideoToolbox"
+        "-framework CoreFoundation" "-framework CoreMedia" "-framework CoreVideo" "-framework CoreServices"
+        "-framework Security")
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 if (WIN32)
     add_library(bbgpu STATIC ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
@@ -212,9 +222,12 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_pa
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 if (WIN32)
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-endif()
+endif() # macOS: vk_platform.cpp defines VK_USE_PLATFORM_METAL_EXT itself
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
-if (NOT WIN32)
+if (APPLE)
+    # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe at load time.
+    target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
+elseif (NOT WIN32)
     # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
     target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
@@ -222,6 +235,9 @@ target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vu
 if (WIN32)
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit ws2_32)
+elseif (APPLE)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
+        tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 else()
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
@@ -232,6 +248,11 @@ add_executable(shader-user-data-test EXCLUDE_FROM_ALL ../tests/test_shader_user_
 target_compile_options(shader-user-data-test PRIVATE -UNDEBUG)
 target_include_directories(shader-user-data-test PRIVATE shim shadps4 third_party/gcn/include)
 target_link_libraries(shader-user-data-test PRIVATE fmt::fmt Boost::headers)
+
+add_executable(arena-span-test EXCLUDE_FROM_ALL ../tests/test_arena_span.cpp)
+target_compile_options(arena-span-test PRIVATE -UNDEBUG)
+target_include_directories(arena-span-test PRIVATE shadps4)
+target_link_libraries(arena-span-test PRIVATE Boost::headers)
 
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
@@ -264,6 +285,38 @@ target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCL
 target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
+set(TEST_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/test_shaders)
+add_custom_command(OUTPUT ${TEST_SHADER_DIR}/null_resources_sample_comp.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${TEST_SHADER_DIR}
+    COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${TEST_SHADER_DIR}/null_resources_sample_comp.h
+        --vn NULL_RESOURCES_SAMPLE_COMP ${CMAKE_CURRENT_SOURCE_DIR}/../tests/null_resources_sample.comp
+    COMMAND ${CMAKE_COMMAND} "-DHEADER_FILE=${TEST_SHADER_DIR}/null_resources_sample_comp.h"
+        -P ${SHADER_SRC}/AddShaderHeaderInclude.cmake
+    DEPENDS ../tests/null_resources_sample.comp VERBATIM)
+add_executable(null-resources-test EXCLUDE_FROM_ALL ../tests/test_null_resources.cpp ../tests/test_gpu_runtime_stubs.cpp
+    ${TEST_SHADER_DIR}/null_resources_sample_comp.h)
+target_include_directories(null-resources-test PRIVATE shim shadps4 third_party/gcn/include ${TEST_SHADER_DIR})
+target_compile_options(null-resources-test PRIVATE -UNDEBUG -fPIC)
+set_source_files_properties(../tests/test_null_resources.cpp PROPERTIES
+    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_link_libraries(null-resources-test PRIVATE bbgpu)
+
+if (APPLE)
+    # These tests resolve vkGetInstanceProcAddr from the loader directly (see the tests).
+    foreach(test IN ITEMS scene-resolution-test taa-shader-test camera-motion-test null-resources-test)
+        target_link_libraries(${test} PRIVATE Vulkan::Vulkan)
+    endforeach()
+    # libbbgpu resolves the runtime stubs in these executables at load time; with LTO the
+    # linker would hide them unless they are exported explicitly.
+    # Window on the main thread (Cocoa), with the device, presenter and swapchain.
+    add_executable(window-test EXCLUDE_FROM_ALL ../tests/test_window.cpp ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(window-test PRIVATE .. shim shadps4 third_party/gcn/include)
+    target_link_libraries(window-test PRIVATE bbgpu)
+    foreach(test IN ITEMS motion-shader-test scene-resolution-test taa-shader-test camera-motion-test
+                          null-resources-test window-test)
+        target_link_options(${test} PRIVATE -Wl,-export_dynamic)
+    endforeach()
+endif()
 
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
@@ -282,6 +335,8 @@ if (WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/../src/win32_compat.c"
         "${CMAKE_CURRENT_SOURCE_DIR}/../src/win32_memory.c"
     )
+elseif (APPLE)
+    list(APPEND RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../src/darwin_compat.c")
 endif()
 add_executable(bbport
     ../src/probe.c

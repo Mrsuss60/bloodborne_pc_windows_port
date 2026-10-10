@@ -36,6 +36,18 @@ asm(".section .rdata,\"dr\"\n"
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
     ".text\n");
+#elif defined(__APPLE__)
+// Mach-O: C symbols carry a leading underscore; the asm labels below spell it out.
+asm(".section __TEXT,__const\n"
+    ".balign 16\n"
+    ".private_extern _bb_font_ttf\n"
+    ".globl _bb_font_ttf\n"
+    "_bb_font_ttf:\n"
+    ".incbin \"" BB_FONT_PATH "\"\n"
+    ".private_extern _bb_font_ttf_end\n"
+    ".globl _bb_font_ttf_end\n"
+    "_bb_font_ttf_end:\n"
+    ".text\n");
 #else
 asm(".section .rodata\n"
     ".balign 16\n"
@@ -800,7 +812,11 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     }
     initialized = true;
     g_vma_allocator = instance.GetAllocator();
+#ifdef __APPLE__
+    std::printf("Overlay: menu ready (Insert, F10 or L3+R3)\n");
+#else
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+#endif
 }
 
 void UpdateTextInput(SDL_Window* window) {
@@ -829,9 +845,15 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
+#ifdef __APPLE__
+        // Mac keyboards have no Insert key: F10 (fn+F10 on laptops) opens the menu too.
+        const bool toggle = event.key.key == SDLK_INSERT || event.key.key == SDLK_F10;
+#else
+        const bool toggle = event.key.key == SDLK_INSERT;
+#endif
         if (down && !event.key.repeat) {
-            if (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE)) {
-                SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
+            if (toggle || (is_open && event.key.key == SDLK_ESCAPE)) {
+                SetOpen(toggle ? !is_open : false);
                 return true;
             }
             // HUD overlay hotkeys: F11 or Shift + Tab

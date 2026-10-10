@@ -20,7 +20,7 @@ void* PS4_SYSV_ABI AvPlayer::Allocate(void* handle, u32 alignment, u32 size) {
 
 void PS4_SYSV_ABI AvPlayer::Deallocate(void* handle, void* memory) {
     if (!memory) return;
-    if (reinterpret_cast<uintptr_t>(memory) < 0x1000000000ULL) {
+    if (IsHostMemory(memory)) {
         std::free(memory);
         return;
     }
@@ -43,7 +43,7 @@ void* PS4_SYSV_ABI AvPlayer::AllocateTexture(void* handle, u32 alignment, u32 si
 
 void PS4_SYSV_ABI AvPlayer::DeallocateTexture(void* handle, void* memory) {
     if (!memory) return;
-    if (reinterpret_cast<uintptr_t>(memory) < 0x1000000000ULL) {
+    if (IsHostMemory(memory)) {
         std::free(memory);
         return;
     }

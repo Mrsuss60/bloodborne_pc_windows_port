@@ -18,6 +18,11 @@ typedef struct {
 void bbgpu_register_kernel(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int bbgpu_init(const BbGpuConfig *config);
+#ifdef __APPLE__
+/* macOS: Cocoa windows live on the process's main thread. bbgpu_init creates the window on the
+ * calling (main) thread; this then runs its events there until the window closes (exit). */
+void bbgpu_run_window_loop(void);
+#endif
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t bbgpu_resolve(const char *scoped_nid);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */
@@ -36,6 +41,9 @@ unsigned bbgpu_symbol_count(void);
 /* Flips and submissions query for heartbeat / diagnostics. */
 uint64_t bbgpu_get_flip_count(void);
 uint64_t bbgpu_get_submit_count(void);
+/* Totals since start: draws, dispatches, buffer upload bytes, image upload bytes, pages whose
+ * write protection was revoked, vertices drawn, render passes begun (performance report). */
+void bbgpu_get_work_counters(uint64_t out[7]);
 /* Dumps host GPU / presenter thread states and counters to a log file. */
 void bbgpu_dump_host_threads_hang(void *file_handle);
 /* Computes average FPS and p95/p99 frame times in milliseconds over recent flips. */

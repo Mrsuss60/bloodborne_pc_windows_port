@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include "shader_recompiler/frontend/fetch_shader.h"
 
 int main() {
@@ -68,5 +69,37 @@ int main() {
     assert(read() == expected);
     Shader::Info::num_ud_snapshots = 0;
 
+    // Multisampled storage images (Metal cannot write texture2d_ms): only stores or atomics on a
+    // multisampled view count; reads and single-sample stores do not.
+    const auto image_resource = [](AmdGpu::ImageType type, bool written, bool array) {
+        AmdGpu::Image sharp = AmdGpu::Image::Null(false);
+        sharp.type = static_cast<u64>(type);
+        Shader::ImageResource resource{};
+        std::memcpy(resource.sharp_fetch.immediates.data(), &sharp, sizeof(sharp));
+        resource.sharp_fetch.offsets.fill(0); // known locations; load_mask 0: immediates
+        resource.sharp_fetch.load_mask = 0;
+        resource.is_written = written;
+        resource.is_array = array;
+        return resource;
+    };
+    const auto writes_msaa = [&](std::initializer_list<Shader::ImageResource> images) {
+        Shader::Info image_info{};
+        for (const auto& image : images) {
+            image_info.images.push_back(image);
+        }
+        return image_info.WritesMultisampledImage();
+    };
+    using AmdGpu::ImageType;
+    assert(writes_msaa({image_resource(ImageType::Color2DMsaa, true, false)}));
+    assert(writes_msaa({image_resource(ImageType::Color2DMsaaArray, true, true)}));
+    assert(writes_msaa({image_resource(ImageType::Color2DMsaaArray, true, false)})); // 2DMsaa view
+    assert(!writes_msaa({image_resource(ImageType::Color2DMsaa, false, false)}));
+    assert(!writes_msaa({image_resource(ImageType::Color2D, true, false)}));
+    assert(!writes_msaa({}));
+    assert(writes_msaa({image_resource(ImageType::Color2D, true, false),
+                        image_resource(ImageType::Color2DMsaa, false, false),
+                        image_resource(ImageType::Color2DMsaa, true, false)}));
+
     std::puts("Shader user data: null tables, vertex consumers, direct registers and snapshots passed");
+    std::puts("Shader info: multisampled storage images detected (stores only) passed");
 }

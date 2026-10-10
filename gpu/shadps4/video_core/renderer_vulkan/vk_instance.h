@@ -138,6 +138,11 @@ public:
         return buffer_marker;
     }
 
+    /// bbport: VK_EXT_robustness2 nullDescriptor (absent on MoltenVK: NullResources stand in).
+    bool IsNullDescriptorSupported() const {
+        return null_descriptor;
+    }
+
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
@@ -269,6 +274,21 @@ public:
         return amd_mixed_attachment_samples;
     }
 
+    /// bbport: sparse residency buffers (the buffer cache's arenas); none on MoltenVK
+    bool IsSparseBufferSupported() const {
+        return features.sparseBinding && features.sparseResidencyBuffer;
+    }
+
+    /// bbport: the largest buffer the device creates (Vulkan 1.3 maxBufferSize)
+    u64 GetMaxBufferSize() const {
+        return vk13_props.maxBufferSize;
+    }
+
+    /// Returns true when shaders may write multisampled images (no on Metal/MoltenVK)
+    bool IsStorageImageMultisampleSupported() const {
+        return features.shaderStorageImageMultisample;
+    }
+
     /// Returns true when geometry shaders are supported by the device
     bool IsGeometryStageSupported() const {
         return features.geometryShader;
@@ -386,7 +406,15 @@ public:
 
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
+#ifdef __APPLE__
+        // bbport: MoltenVK 1.4 gives push constants the Metal buffer index of a push
+        // descriptor set's buffers once the set has 11 or more bindings ("cannot reserve
+        // 'buffer' resource location at index 0"; the shader library fails to compile, with
+        // or without argument buffers). Regular descriptor sets get the right indices.
+        return 0;
+#else
         return push_descriptor_props.maxPushDescriptors;
+#endif
     }
 
     /// Returns the maximum size of a single VkDeviceMemory
@@ -569,6 +597,7 @@ private:
     bool maintenance_5{};
     bool maintenance_8{};
     bool buffer_marker{};
+    bool null_descriptor{true};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
