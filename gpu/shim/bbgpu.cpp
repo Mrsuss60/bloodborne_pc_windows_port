@@ -302,6 +302,16 @@ extern "C" uint64_t bbgpu_get_submit_count(void) {
     return BbStats::submissions.load(std::memory_order_relaxed);
 }
 
+extern "C" void bbgpu_get_work_counters(uint64_t out[7]) {
+    out[0] = BbStats::draws.load(std::memory_order_relaxed);
+    out[1] = BbStats::dispatches.load(std::memory_order_relaxed);
+    out[2] = BbStats::buffer_upload_bytes.load(std::memory_order_relaxed);
+    out[3] = BbStats::image_upload_bytes.load(std::memory_order_relaxed);
+    out[4] = BbStats::protect_revoke_pages.load(std::memory_order_relaxed);
+    out[5] = BbStats::vertices.load(std::memory_order_relaxed);
+    out[6] = BbStats::render_passes.load(std::memory_order_relaxed);
+}
+
 namespace Libraries::VideoOut {
 void GetFrametimeStats(double* avg_fps, double* p95_ms, double* p99_ms);
 }

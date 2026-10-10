@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <mutex>
 #include <unordered_map>
+#include <string>
+#include <vector>
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -56,9 +60,166 @@ Scheduler::~Scheduler() {
 #endif
 }
 
+namespace {
+// bbport: BB_PASS_TRACE=1 counts why render passes end (on tile-based GPUs every end stores
+// the attachments and the next pass loads them again), printed every 5 s per flip.
+bool PassTraceEnabledImpl() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PASS_TRACE");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+void NotePassEnd(const void* key, const char* reason) {
+    static std::mutex mutex;
+    static std::unordered_map<const void*, std::pair<u64, const char*>> counts;
+    static auto window = std::chrono::steady_clock::now();
+    static u64 last_flips = 0;
+    std::scoped_lock lk{mutex};
+    auto& entry = counts[key];
+    ++entry.first;
+    entry.second = reason;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds(5)) {
+        return;
+    }
+    window = now;
+    const u64 flips = BbStats::flips.load(std::memory_order_relaxed);
+    const double frames = flips > last_flips ? double(flips - last_flips) : 1.0;
+    last_flips = flips;
+    std::vector<std::pair<u64, const void*>> top;
+    for (const auto& [address, value] : counts) {
+        top.emplace_back(value.first, address);
+    }
+    std::ranges::sort(top, std::greater{});
+    std::printf("Pass ends per frame (%zu kinds):\n", top.size());
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 20); ++i) {
+        const auto& [count, address] = top[i];
+        const char* reason_text = counts[address].second;
+        if (reason_text) {
+            std::printf("  %7.1f  %s\n", double(count) / frames, reason_text);
+            continue;
+        }
+#ifndef _WIN32
+        Dl_info info{};
+        dladdr(address, &info);
+        std::printf("  %7.1f  EndRendering from %s+0x%lx\n", double(count) / frames,
+                    info.dli_fname ? info.dli_fname : "?",
+                    static_cast<unsigned long>(reinterpret_cast<uintptr_t>(address) -
+                                               reinterpret_cast<uintptr_t>(info.dli_fbase)));
+#else
+        std::printf("  %7.1f  EndRendering from %p\n", double(count) / frames, address);
+#endif
+    }
+    counts.clear();
+}
+const char* PassChangeReason(const RenderState& old_state, const RenderState& new_state) {
+    if (old_state.num_color_attachments != new_state.num_color_attachments ||
+        old_state.width != new_state.width || old_state.height != new_state.height ||
+        old_state.depth_stencil_attachment.image_view !=
+            new_state.depth_stencil_attachment.image_view) {
+        return "new pass: other targets";
+    }
+    bool layout = old_state.depth_stencil_attachment.image_layout !=
+                  new_state.depth_stencil_attachment.image_layout;
+    bool clear = old_state.depth_stencil_attachment.is_clear !=
+                     new_state.depth_stencil_attachment.is_clear ||
+                 old_state.depth_stencil_attachment.clear_value !=
+                     new_state.depth_stencil_attachment.clear_value;
+    for (u32 i = 0; i < new_state.num_color_attachments; ++i) {
+        const auto& a = old_state.color_attachments[i];
+        const auto& b = new_state.color_attachments[i];
+        if (a.image_view != b.image_view) {
+            return "new pass: other targets";
+        }
+        layout |= a.image_layout != b.image_layout;
+        clear |= a.is_clear != b.is_clear || a.clear_value != b.clear_value;
+    }
+    if (clear && !layout) {
+        return "same targets: clear state only";
+    }
+    if (layout && !clear) {
+        return "same targets: layout only";
+    }
+    return clear ? "same targets: clear and layout" : "same targets: other fields";
+}
+} // namespace
+
+// The last pass end (recording thread), to catch passes that resume on the same targets.
+const void* g_last_end_key = nullptr;
+const char* g_last_end_reason = nullptr;
+
+bool Scheduler::PassTraceEnabled() {
+    return PassTraceEnabledImpl();
+}
+
+void Scheduler::TraceCount(const void* key, const char* reason) {
+    NotePassEnd(key, reason);
+}
+
+void Scheduler::TracePassEnd(const void* key, const char* reason) {
+    NotePassEnd(key, reason);
+    g_last_end_key = key;
+    g_last_end_reason = reason;
+}
+
+namespace {
+bool SameTargets(const RenderState& a, const RenderState& b) {
+    if (a.num_color_attachments != b.num_color_attachments || a.width != b.width ||
+        a.height != b.height ||
+        a.depth_stencil_attachment.image_view != b.depth_stencil_attachment.image_view) {
+        return false;
+    }
+    for (u32 i = 0; i < a.num_color_attachments; ++i) {
+        if (a.color_attachments[i].image_view != b.color_attachments[i].image_view) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
 void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
+    }
+    if (is_rendering && PassTraceEnabledImpl()) {
+        const char* reason = PassChangeReason(render_state, new_state);
+        TracePassEnd(reason, reason);
+        is_rendering = false;
+        Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    } else if (!is_rendering && PassTraceEnabledImpl() && g_last_end_key &&
+               SameTargets(render_state, new_state)) {
+        // The previous pass ended and this one draws to the same targets: a split.
+        static std::mutex resumed_mutex;
+        static std::unordered_map<const void*, std::string> resumed_names;
+        std::string* name;
+        {
+            std::scoped_lock lk{resumed_mutex};
+            name = &resumed_names[g_last_end_key];
+            if (name->empty()) {
+                char text[256];
+                if (g_last_end_reason) {
+                    std::snprintf(text, sizeof(text), "SPLIT (same targets resumed) after: %s",
+                                  g_last_end_reason);
+                } else {
+#ifndef _WIN32
+                    Dl_info info{};
+                    dladdr(g_last_end_key, &info);
+                    std::snprintf(text, sizeof(text),
+                                  "SPLIT (same targets resumed) after: EndRendering from +0x%lx",
+                                  static_cast<unsigned long>(
+                                      reinterpret_cast<uintptr_t>(g_last_end_key) -
+                                      reinterpret_cast<uintptr_t>(info.dli_fbase)));
+#else
+                    std::snprintf(text, sizeof(text), "SPLIT after: EndRendering from %p",
+                                  g_last_end_key);
+#endif
+                }
+                *name = text;
+            }
+        }
+        NotePassEnd(reinterpret_cast<const char*>(g_last_end_key) + 1, name->c_str());
     }
     EndRendering();
     is_rendering = true;
@@ -108,6 +269,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
+    BbStats::render_passes.fetch_add(1, std::memory_order_relaxed);
     if (!recorder_running) {
         current_cmdbuf.beginRendering(rendering_info);
         return;
@@ -126,9 +288,12 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     });
 }
 
-void Scheduler::EndRendering() {
+void Scheduler::EndRendering(bool trace) {
     if (!is_rendering) {
         return;
+    }
+    if (trace && PassTraceEnabledImpl()) {
+        TracePassEnd(__builtin_return_address(0), nullptr);
     }
     is_rendering = false;
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });

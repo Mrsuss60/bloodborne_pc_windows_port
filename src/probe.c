@@ -844,7 +844,36 @@ static void start_timeout(unsigned seconds) {
     }
 }
 #else
-static void start_watchdog(void) {}
+/* "Perf:" every 5 s: frame rate and the GPU work per frame (draws, uploads, vertices, render
+ * passes), read from the log; the in-game FPS counter shows only the frame rate. */
+static void *perf_worker(void *unused) {
+    (void)unused;
+    uint64_t last_flips = 0, last_submits = 0, last[7] = {0};
+    for (;;) {
+        sleep(5);
+        const uint64_t flips = bbgpu_get_flip_count(), submits = bbgpu_get_submit_count();
+        uint64_t now[7];
+        bbgpu_get_work_counters(now);
+        const double frames = flips > last_flips ? (double)(flips - last_flips) : 1.0;
+        printf("Perf: %.1f FPS, %.0f GPU submits/s; per frame: %.0f draws, %.0f dispatches, "
+               "%.1f MB buffer uploads, %.1f MB image uploads, %.0f pages unprotected, "
+               "%.2f M vertices, %.0f render passes\n",
+               (double)(flips - last_flips) / 5.0, (double)(submits - last_submits) / 5.0,
+               (double)(now[0] - last[0]) / frames, (double)(now[1] - last[1]) / frames,
+               (double)(now[2] - last[2]) / frames / 1048576.0,
+               (double)(now[3] - last[3]) / frames / 1048576.0, (double)(now[4] - last[4]) / frames,
+               (double)(now[5] - last[5]) / frames / 1e6, (double)(now[6] - last[6]) / frames);
+        fflush(stdout);
+        last_flips = flips; last_submits = submits;
+        memcpy(last, now, sizeof(last));
+    }
+    return NULL;
+}
+static void start_watchdog(void) {
+    if (!gpu_enabled) return;
+    pthread_t thread;
+    if (!pthread_create(&thread, NULL, perf_worker, NULL)) pthread_detach(thread);
+}
 static void start_timeout(unsigned seconds) {
     alarm(seconds);
 }

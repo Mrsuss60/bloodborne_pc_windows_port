@@ -692,7 +692,7 @@ public:
     void BeginRendering(const RenderState& new_state);
 
     /// Ends current rendering scope.
-    void EndRendering();
+    void EndRendering(bool trace = true);
 
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
@@ -725,6 +725,14 @@ public:
 
     /// BB_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
     static void TraceDirectRecording(void* caller);
+    /// bbport: BB_PASS_TRACE=1 — counts a render pass end under `reason` (see vk_scheduler.cpp).
+    static bool PassTraceEnabled();
+    static void TracePassEnd(const void* key, const char* reason);
+    /// Counts an event in the same report without treating it as a pass end.
+    static void TraceCount(const void* key, const char* reason);
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
 
     /// Records `func(vk::CommandBuffer)` in order with other commands. The closure must own
     /// everything it uses (capture by value): it may run later on the recording thread.

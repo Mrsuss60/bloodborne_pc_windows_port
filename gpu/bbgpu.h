@@ -41,6 +41,9 @@ unsigned bbgpu_symbol_count(void);
 /* Flips and submissions query for heartbeat / diagnostics. */
 uint64_t bbgpu_get_flip_count(void);
 uint64_t bbgpu_get_submit_count(void);
+/* Totals since start: draws, dispatches, buffer upload bytes, image upload bytes, pages whose
+ * write protection was revoked, vertices drawn, render passes begun (performance report). */
+void bbgpu_get_work_counters(uint64_t out[7]);
 /* Dumps host GPU / presenter thread states and counters to a log file. */
 void bbgpu_dump_host_threads_hang(void *file_handle);
 /* Computes average FPS and p95/p99 frame times in milliseconds over recent flips. */

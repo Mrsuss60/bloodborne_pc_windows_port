@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -188,6 +194,29 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+#ifndef _WIN32
+    // bbport: BB_PASS_TRACE=1 — layout changes requested while a render pass is open (each
+    // forces FlushBarriers to end the pass), by old -> new layout and image.
+    if (image_barriers.size() != prev_num_barriers && scheduler.IsRendering() &&
+        Scheduler::PassTraceEnabled()) {
+        static std::mutex names_mutex;
+        static std::unordered_map<std::string, std::string> names;
+        for (size_t i = prev_num_barriers; i < image_barriers.size(); ++i) {
+            const auto& b = image_barriers[i];
+            auto text = fmt::format("  transit: {} -> {} {} {}x{}{}", vk::to_string(b.oldLayout),
+                                    vk::to_string(b.newLayout),
+                                    vk::to_string(image->info.pixel_format), image->info.size.width,
+                                    image->info.size.height,
+                                    b.oldLayout == b.newLayout ? " (same layout: access only)" : "");
+            std::scoped_lock lk{names_mutex};
+            auto& stored = names[text];
+            if (stored.empty()) {
+                stored = std::move(text);
+            }
+            Scheduler::TraceCount(stored.c_str(), stored.c_str());
+        }
+    }
+#endif
     return image_barriers.size() != prev_num_barriers;
 }
 
@@ -830,7 +859,45 @@ void Runtime::FlushBarriers() {
         return;
     }
 
-    scheduler.EndRendering();
+    bool traced = false;
+#ifndef _WIN32
+    if (scheduler.IsRendering() && Scheduler::PassTraceEnabled()) {
+        traced = true;
+        // What the barrier waits for, and who asked (return address of this call).
+        using S = vk::PipelineStageFlagBits2;
+        const auto src = memory_barrier.srcStageMask;
+        const char* what = !dep_info.memoryBarrierCount ? "image layouts only"
+                           : (src & (S::eTransfer | S::eCopy | S::eAllTransfer)) &&
+                                   !(src & ~(S::eTransfer | S::eCopy | S::eAllTransfer))
+                               ? "memory after transfer"
+                           : (src & (S::eFragmentShader | S::eVertexShader | S::eComputeShader |
+                                     S::eAllGraphics | S::eAllCommands))
+                               ? "memory after shader/all"
+                               : "memory after other";
+        static std::mutex names_mutex;
+        static std::unordered_map<u64, std::string> names;
+        const void* caller = __builtin_return_address(0);
+        const u64 key = reinterpret_cast<u64>(caller) ^ (reinterpret_cast<u64>(what) << 1) ^
+                        (dep_info.imageMemoryBarrierCount ? 1ull << 63 : 0);
+        std::string* name;
+        {
+            std::scoped_lock lk{names_mutex};
+            name = &names[key];
+            if (name->empty()) {
+                Dl_info info{};
+                dladdr(caller, &info);
+                *name = fmt::format("FlushBarriers: {}{} (caller +{:#x})", what,
+                                    dep_info.imageMemoryBarrierCount && dep_info.memoryBarrierCount
+                                        ? " + image layouts"
+                                        : "",
+                                    reinterpret_cast<uintptr_t>(caller) -
+                                        reinterpret_cast<uintptr_t>(info.dli_fbase));
+            }
+        }
+        Scheduler::TracePassEnd(reinterpret_cast<const void*>(key), name->c_str());
+    }
+#endif
+    scheduler.EndRendering(!traced);
     scheduler.Record([memory = memory_barrier, has_memory = dep_info.memoryBarrierCount != 0,
                       images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(
                           image_barriers.data(), image_barriers.size()))](vk::CommandBuffer cmdbuf) {
