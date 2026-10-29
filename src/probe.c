@@ -2892,11 +2892,11 @@ ABI float bb_live_clock_tick(void *singleton) {
     *interval = target;
 
     float raw = measured > 0.0f ? measured : target;
-    if (raw < target) raw = target;
     if (raw > max_dt) raw = max_dt;
+    if (raw < 1.0f / 240.0f) raw = 1.0f / 240.0f;
 
     /* Deadband: if measured dt is within ±8% of target frametime, lock to exact target.
-     * Wipes out OS timer/vsync micro-jitter so Havok cloth stays rock-steady at target FPS. */
+     * Wipes out OS timer/vsync micro-jitter so foliage and Havok cloth stay rock-steady at target FPS. */
     if (target_fps > 0) {
         const float deadband = target * 0.08f;
         if (raw >= (target - deadband) && raw <= (target + deadband)) {
@@ -2904,15 +2904,23 @@ ABI float bb_live_clock_tick(void *singleton) {
         }
     }
 
-    /* Seed immediately on initial tick or when target FPS is switched in the menu */
-    if (s_smoothed_dt <= 0.0f || s_prev_target_fps != target_fps) {
-        s_smoothed_dt = raw;
+    /* Seed immediately on initial tick or smoothly slew when target FPS is switched in the menu */
+    if (s_smoothed_dt <= 0.0f) {
+        s_smoothed_dt = target;
         s_prev_target_fps = target_fps;
     } else {
+        if (s_prev_target_fps != target_fps) {
+            s_prev_target_fps = target_fps;
+            /* Prevent UI menu dropdown stalls during target switch from injecting spikes */
+            if (target_fps > 0 && raw > target && raw > s_smoothed_dt) {
+                raw = target > s_smoothed_dt ? target : s_smoothed_dt;
+            }
+        }
+
         /* Slew-rate limiter / spike dampener: prevent sudden impulse shocks to Havok cloth
-         * constraints during frametime spikes (+15% max increase, -20% max decrease per frame). */
-        const float max_increase = s_smoothed_dt * 0.15f;
-        const float max_decrease = s_smoothed_dt * 0.20f;
+         * constraints and foliage accumulators (+12% max increase, -15% max decrease per frame). */
+        const float max_increase = s_smoothed_dt * 0.12f;
+        const float max_decrease = s_smoothed_dt * 0.15f;
         if (raw > s_smoothed_dt) {
             float step = raw - s_smoothed_dt;
             if (step > max_increase) step = max_increase;
@@ -2925,8 +2933,14 @@ ABI float bb_live_clock_tick(void *singleton) {
     }
 
     float dt = s_smoothed_dt;
-    if (dt < target) dt = target;
     if (dt > max_dt) dt = max_dt;
+    if (dt < 1.0f / 240.0f) dt = 1.0f / 240.0f;
+
+    /* Deliver the filtered simulation dt directly to the clock singleton's measured dt slot.
+     * All 31 in-engine code caves (Havok cloth, character physics, grass/flower foliage wind
+     * accumulators) sample [singleton + 0x264]. Overwriting the raw OS timer reading with our
+     * deadbanded and smoothed dt eliminates high-frequency wind flutter and cloth vibration. */
+    *(float *)((char *)singleton + 0x264) = dt;
 
     if (g_live_clock_deltatime && image) {
         *(float *)(image + 0x535A908) = dt;
@@ -3545,6 +3559,18 @@ int main(int argc, char **argv) {
 #endif
         static const unsigned char deltatime_cave[7] = {0x48, 0x8b, 0x05, 0xf1, 0x04, 0x4b, 0x00};
         g_live_clock_deltatime = (size > 0x5090007 && memcmp(image + 0x5090000, deltatime_cave, sizeof(deltatime_cave)) == 0);
+        /* Uncap the internal guest frame pacer ceiling to 240 FPS (1/240 s = 0x3b888889).
+         * This allows the presenter in driver.cpp (BbSettings::LiveFrameLimit) to freely pace
+         * 90, 120, and Uncapped framerates without being clamped to 60 FPS by the guest engine. */
+        static const uint32_t pacer_uncap = 0x3b888889;
+        if (size > 0x20348bc &&
+            image[0x2034840] == 0x41 && image[0x2034841] == 0xc7 &&
+            image[0x203485a] == 0x41 && image[0x203485b] == 0xc7) {
+            *(uint32_t *)(image + 0x2034845) = pacer_uncap;
+            *(uint32_t *)(image + 0x203485f) = pacer_uncap;
+            *(uint32_t *)(image + 0x2034883) = pacer_uncap;
+            *(uint32_t *)(image + 0x20348b8) = pacer_uncap;
+        }
         bbgpu_set_live_clock_supported(1);
         printf("[LIVE CLOCK] Hook installed at image+0x2018e3d (stub=%p, target=%d FPS, max dt 1/%d s, deltatime=%d)\n",
                (void *)t, live_target, live_max_dt, g_live_clock_deltatime);

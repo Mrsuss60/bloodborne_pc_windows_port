@@ -3576,10 +3576,10 @@
             <Line Type="bytes" Address="0x02434854" Value="41C644241401"/>
             <Line Type="bytes" Address="0x02434878" Value="41C644241401"/>
             <Line Type="bytes" Address="0x024348AD" Value="41C644241401"/>
-            <Line Type="bytes" Address="0x02434840" Value="41C74424188988883C"/>
-            <Line Type="bytes" Address="0x0243485A" Value="41C74424188988883C"/>
-            <Line Type="bytes" Address="0x0243487E" Value="41C74424188988883C"/>
-            <Line Type="bytes" Address="0x024348B3" Value="41C74424188988883C"/>
+            <Line Type="bytes" Address="0x02434840" Value="41C74424188988883B"/>
+            <Line Type="bytes" Address="0x0243485A" Value="41C74424188988883B"/>
+            <Line Type="bytes" Address="0x0243487E" Value="41C74424188988883B"/>
+            <Line Type="bytes" Address="0x024348B3" Value="41C74424188988883B"/>
             <Line Type="bytes" Address="0x024349D5" Value="448B3B"/>
             <Line Type="bytes" Address="0x02434863" Value="48B90000000000000000"/>
             <Line Type="bytes" Address="0x02434887" Value="48B90000000000000000"/>
@@ -3722,6 +3722,8 @@
             <Line Type="bytes" Address="0x04CADD28" Value="8988083D"/>
             <Line Type="bytes" Address="0x04D25E68" Value="CDCCCC3D"/>
             <Line Type="bytes" Address="0x05490700" Value="50488B05F0FD4A00C5FA10886402000058C5F25D0D4B5C89FFC5F2590D0B5C89FFC5F2590DAB7889FFC5FA58C9E9CB7D87FC"/>
+            <Line Type="bytes" Address="0x01D084EF" Value="909090909090"/>
+            <Line Type="bytes" Address="0x01D08512" Value="909090909090"/>
             <Line Type="bytes" Address="0x01D084F5" Value="E906827803909090"/>
             <Line Type="bytes" Address="0x05490740" Value="50488B05B0FD4A00C5FA10886402000058C5F25D0D0B5C89FFC5F2590DCB5B89FFC5F2590D777889FFC5FA58C9E9AE7D87FC"/>
             <Line Type="bytes" Address="0x01D08518" Value="E923827803909090"/>
@@ -3739,6 +3741,12 @@
             <Line Type="bytes" Address="0x0183BC9B" Value="E97043C603909090"/>
             <Line Type="bytes" Address="0x054A0080" Value="488D6424D04889442420C5F8112C24C5F811742410C4C17A10ADC4010000488B0553044A00C5FA10B064020000C5CA5D354BFFFFFFC5CA593547FFFFFFC5CA59F5C5CA5CEDC5D2582D3BFFFFFFC5CA58F6C5CA5EF5C5FA59C6C5F8102C24C5F810742410488B442420488D642430E97AE839FC"/>
             <Line Type="bytes" Address="0x0183E964" Value="E91717C60390909090"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="Bloodborne" Name="Wind Phase Fix (High FPS)" Note="Grass, flowers and other foliage vibrate above 30 FPS because the wind phase update stops at the zero crossing and waits for a 30 Hz animation flag: the phase freezes for one frame at 30 FPS, but for 2-8 frames at 60-240 FPS, then jumps, so every half cycle reads as a twitch. This removes the two zero-crossing holds (0x01D084EF and 0x01D08512) so the phase sweeps through zero continuously; the phase step itself is scaled by the FPS preset (and by the live target FPS)." Author="port" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x01D084EF" Value="909090909090"/>
+            <Line Type="bytes" Address="0x01D08512" Value="909090909090"/>
         </PatchList>
     </Metadata>
 </Patch>

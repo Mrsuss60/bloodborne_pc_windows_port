@@ -16,12 +16,17 @@ EBOOT_BASE=0x400000
 # BB_FPS presets: patch names from patches/Bloodborne.xml (app version 01.09).
 # Above 60 FPS the sprint fix always goes with the frame rate patch: without it sprinting drops to
 # half speed (the game's wall detector measured distance per frame, a 30 FPS rule).
-FPS_PRESETS={'30':[],'60':['60 FPS++'],'90':['90 FPS++','Sprint Fix (High FPS)'],
+WIND_FIX='Wind Phase Fix (High FPS)'
+# BB_FPS presets: patch names from patches/Bloodborne.xml (app version 01.09).
+# Above 60 FPS the sprint fix always goes with the frame rate patch: without it sprinting drops to
+# half speed (the game's wall detector measured distance per frame, a 30 FPS rule).
+FPS_PRESETS={'30':[WIND_FIX],'60':['60 FPS++',WIND_FIX],'90':['90 FPS++','Sprint Fix (High FPS)',WIND_FIX],
              # Live clock: the measured-dt base retargets cloth/animation/platform physics to the
              # real frame delta (the old fixed 1/60 base still flickered above 30 FPS). The probe
              # hook replaces its per-frame interval and payload dt at run time (30..uncapped).
+             # 60 FPS++ (Deltatime) already incorporates the wind phase zero-crossing fix.
              'live':['60 FPS++ (Deltatime)'],
-             'uncap':['Uncap FPS++','Sprint Fix (High FPS)']}
+             'uncap':['Uncap FPS++','Sprint Fix (High FPS)',WIND_FIX]}
 
 LIVE_FPS_CONFLICTS = {
     '30 FPS++',
@@ -244,6 +249,10 @@ def external_patches(directory, app_version='01.09', exclude=Path(__file__).reso
     directory=Path(directory)
     for path in sorted(directory.glob('*.xml')) if directory.is_dir() else []:
         if path.resolve()==Path(exclude).resolve(): continue  # the built-in file (patches/ in a checkout)
+        lower_name = path.name.lower()
+        if 'bloodborne' in lower_name and any(b in lower_name for b in ('copy', 'backup', 'modified', '.bak', '~')):
+            print(f'Patches: ignoring duplicate/backup patch file {path.name}', file=sys.stderr)
+            continue
         try:
             root=ET.parse(path).getroot()
         except ET.ParseError as error:

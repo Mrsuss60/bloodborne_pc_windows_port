@@ -1711,10 +1711,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         # In-game overlay configuration menu is permanently enabled
         env.pop("BB_OVERLAY", None)
 
-        if not cfg["feat_fps_patch"]:
-            env["BB_FPS_PATCH"] = "0"
-        else:
-            env.pop("BB_FPS_PATCH", None)
+        # patches.py uses BB_FPS_PATCH=0 as "apply no frame-rate patch at all". It must NOT be
+        # derived from the live checkbox: with live off, the static preset ("60/90/Uncap (XML
+        # patch)") still has to be applied, and tying the two dropped it, so the game fell back
+        # to the native 30 FPS. The "30 (Native PS4)" preset already carries no frame-rate patch
+        # on its own, so the launcher never needs to set this switch.
+        env.pop("BB_FPS_PATCH", None)
 
         env.pop("BB_RENDER_RES", None)
         env.pop("BB_OUTPUT_RES", None)
