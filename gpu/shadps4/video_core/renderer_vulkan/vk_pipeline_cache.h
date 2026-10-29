@@ -14,6 +14,18 @@
 #include <variant>
 #include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
+#include <filesystem>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace Vulkan {
+extern std::atomic<u64> g_bb_compile_ns;
+extern std::atomic<u32> g_bb_compiles;
+extern std::atomic<u32> g_bb_background_pipelines_total;
+extern std::atomic<u32> g_bb_background_pipelines_done;
+extern std::atomic<bool> g_bb_shader_import_active;
+} // namespace Vulkan
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -180,6 +192,11 @@ public:
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
+    struct PreloadJob {
+        GraphicsPipelineKey key;
+        std::function<std::unique_ptr<GraphicsPipeline>()> make;
+    };
+    bool LoadGraphicsPipeline(Serialization::Archive& ar, std::vector<PreloadJob>& jobs);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
     /// `indirect`: the draw's arguments are in memory (bbport: never skipped while compiling).
@@ -280,12 +297,83 @@ private:
     /// on worker threads (PipelineCompiler) while its draws go without it for a frame or two,
     /// instead of the game standing still for the driver (18 ms a pipeline on a GTX 1060, 1-4 s
     /// hitches on a first session). Other passes (one-time renders) compile at once, as before.
-    struct PendingPipeline;
+    struct PendingPipeline {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        GraphicsPipeline::SerializationSupport sdata{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        bool saved = false;
+        std::function<std::unique_ptr<GraphicsPipeline>()> make;
+        std::atomic<bool> started{false};
+    };
     bool AsyncSkippable(const PipelineSelection& sel, bool indirect);
     const GraphicsPipeline* FinishPipeline(const GraphicsPipelineKey& key, PendingPipeline& job);
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>> pending_graphics;
     u64 async_started = 0, async_skipped = 0, async_waited = 0; ///< statistics
     std::unique_ptr<PipelineCompiler> compiler; ///< last: its threads are joined first
+
+    struct ShaderImport;
+    void SaveProfile();
+    void StartShaderImport();
+#ifdef _WIN32
+    static bool LaunchShaderImport(ShaderImport& state);
+#endif
+    void PollShaderImport() {
+        if (import_ready.load(std::memory_order_relaxed)) [[unlikely]] {
+            MergeShaderImport(false);
+        }
+    }
+    void MergeShaderImport(bool at_start);
+    void MergeImportedProgram(ShaderImport& state, size_t index);
+    void AdoptImportedProgram(ShaderImport& state, u64 hash, u64 perms);
+    void MergeImportedKey(ShaderImport& state, std::vector<u8>&& bytes);
+    void QueueImportedCompute(ShaderImport& state, Serialization::Archive& ar);
+    void QueueImportedGraphics(ShaderImport& state, Serialization::Archive& ar);
+    std::optional<size_t> AdoptImportedPermutation(std::vector<u8>&& meta, std::vector<u32>&& spv,
+                                                   std::vector<u8>&& input);
+    std::atomic<bool> import_ready{false};
+    std::unique_ptr<ShaderImport> import;
+};
+
+struct PipelineCache::ShaderImport {
+#ifdef _WIN32
+    std::atomic<void*> process{nullptr};
+    std::wstring exe, command;
+    std::atomic<bool> stopping{false};
+#else
+    pid_t pid = -1;
+#endif
+    std::atomic<bool> running{false};
+    std::thread watcher;
+    bool listed = false, done = false;
+    std::vector<std::pair<u64, std::vector<std::filesystem::path>>> programs;
+    std::vector<std::filesystem::path> keys;
+    size_t next_program = 0, next_key = 0;
+    u32 frame = ~0u;
+    u32 merged = 0, skipped = 0, queued = 0, compute = 0, adopted = 0;
+    std::unordered_map<u64, u64> remap;
+    std::chrono::steady_clock::time_point start;
+    std::mutex compute_mutex;
+    std::vector<std::pair<ComputePipelineKey, std::unique_ptr<ComputePipeline>>> compute_made;
+    std::atomic<u32> compute_queued{0};
+
+    ~ShaderImport() {
+#ifdef _WIN32
+        stopping = true;
+        if (void* handle = process.load(); running.load() && handle) {
+            TerminateProcess(static_cast<HANDLE>(handle), 1);
+        }
+#else
+        if (running.load()) {
+            kill(pid, SIGTERM);
+        }
+#endif
+        if (watcher.joinable()) {
+            watcher.join();
+        }
+    }
 };
 
 } // namespace Vulkan

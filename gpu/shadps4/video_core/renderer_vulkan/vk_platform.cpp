@@ -33,6 +33,9 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#ifdef _WIN32
+#include "platform/win32/nvidia_profile.h"
+#endif
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -268,6 +271,9 @@ std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_c
 vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool enable_validation,
                                   bool enable_crash_diagnostic) {
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
+#ifdef _WIN32
+    BbNvidiaProfile::Apply();
+#endif
 
 #if defined(__APPLE__)
     // Initialize the environment with the path to the included ICD, so that the loader will

@@ -15,8 +15,8 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
-static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
+static constexpr u32 ShaderBinaryVersion = 24u; // bbport: interpolated integer fix (Pascal)
+static constexpr u32 ShaderMetaVersion = 8u; // the object motion buffer addresses
 static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
 } // namespace Serialization
 
@@ -96,6 +96,15 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
                                        std::move(spv));
 }
 
+void RegisterShaderInput(std::vector<u8>&& input, u64 pgm_hash, size_t perm_idx) {
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        return;
+    }
+    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderInput,
+                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
+                                       std::move(input));
+}
+
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
@@ -128,6 +137,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     fetch_shader_data = spec.fetch_shader_data;
     return true;
+}
+
+bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    Shader::StageSpecialization& spec, size_t& perm_idx) {
+    std::optional<Shader::Gcn::FetchShaderData> unused_fetch{};
+    return LoadShaderMeta(ar, info, unused_fetch, spec, perm_idx);
 }
 
 void ComputePipelineKey::Serialize(Serialization::Archive& ar) const {
@@ -216,6 +231,51 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     sdata.Read(multisampling);
     sdata.Read(tcs);
     sdata.Read(tes);
+    return true;
+}
+
+bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, std::vector<PreloadJob>& jobs) {
+    sel.infos.fill(nullptr);
+    sel.modules.fill(nullptr);
+    sel.fetch_shader.reset();
+    sel.graphics_key.Deserialize(ar);
+
+    GraphicsPipeline::SerializationSupport sdata{};
+    sdata.Deserialize(ar);
+
+    for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
+        const auto& hash = sel.graphics_key.stage_hashes[stage_idx];
+        if (!hash) {
+            continue;
+        }
+
+        std::vector<u8> meta_blob;
+        Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                           fmt::format("{:#018x}", hash), meta_blob);
+        if (meta_blob.empty()) {
+            return false;
+        }
+
+        Serialization::Archive meta_ar{std::move(meta_blob)};
+
+        if (!LoadPipelineStage(meta_ar, stage_idx)) {
+            return false;
+        }
+    }
+
+    jobs.emplace_back(sel.graphics_key,
+                      [this, key = sel.graphics_key, infos = sel.infos,
+                       runtime_infos = sel.runtime_infos, fetch = sel.fetch_shader,
+                       modules = sel.modules, sdata = std::move(sdata)]() mutable {
+                          return std::make_unique<GraphicsPipeline>(
+                              instance, scheduler, desc_heap, profile, key, *pipeline_cache,
+                              infos, runtime_infos, fetch, modules, sdata, true);
+                      });
+
+    sel.infos.fill(nullptr);
+    sel.modules.fill(nullptr);
+    sel.fetch_shader.reset();
+
     return true;
 }
 
@@ -320,6 +380,15 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     return true;
 }
 
+void PipelineCache::SaveProfile() {
+    constexpr u32 CacheMagic = 0x42425043u;
+    u32 hdr[4] = {CacheMagic, Serialization::ShaderBinaryVersion, Serialization::ShaderMetaVersion, Serialization::PipelineKeyVersion};
+    std::vector<u8> data(sizeof(hdr) + sizeof(profile));
+    std::memcpy(data.data(), hdr, sizeof(hdr));
+    std::memcpy(data.data() + sizeof(hdr), &profile, sizeof(profile));
+    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile", std::move(data));
+}
+
 void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
@@ -332,34 +401,40 @@ void PipelineCache::WarmUp() {
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
+    constexpr u32 CacheMagic = 0x42425043u;
+    const auto save_profile = [&]() {
+        u32 hdr[4] = {CacheMagic, Serialization::ShaderBinaryVersion, Serialization::ShaderMetaVersion, Serialization::PipelineKeyVersion};
+        std::vector<u8> data(sizeof(hdr) + sizeof(profile));
+        std::memcpy(data.data(), hdr, sizeof(hdr));
+        std::memcpy(data.data() + sizeof(hdr), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile", std::move(data));
+    };
     if (profile_data.empty()) {
         Storage::DataBase::Instance().FinishPreload();
-
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
-        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
+        SaveProfile();
         return;
     }
-    if (profile_data.size() != sizeof(Shader::Profile)) {
-        LOG_WARNING(Render, "Pipeline cache profile has unexpected size ({} != {})",
-                    profile_data.size(), sizeof(Shader::Profile));
-    }
     Shader::Profile cached_profile{};
-    if (profile_data.size() == sizeof(Shader::Profile)) {
+    bool valid = false;
+    if (profile_data.size() == 16 + sizeof(Shader::Profile)) {
+        u32 hdr[4];
+        std::memcpy(hdr, profile_data.data(), sizeof(hdr));
+        if (hdr[0] == CacheMagic &&
+            hdr[1] == Serialization::ShaderBinaryVersion &&
+            hdr[2] == Serialization::ShaderMetaVersion &&
+            hdr[3] == Serialization::PipelineKeyVersion) {
+            std::memcpy(&cached_profile, profile_data.data() + 16, sizeof(cached_profile));
+            valid = (cached_profile == profile);
+        }
+    } else if (profile_data.size() == sizeof(Shader::Profile)) {
         std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+        valid = (cached_profile == profile);
     }
-    if (profile_data.size() != sizeof(Shader::Profile) || cached_profile != profile) {
-        // bbport: upstream closed the cache for the session here, so it was never rewritten
-        // and every later session compiled every shader again (stutters on each new area).
-        // Start a fresh cache for this build and GPU instead.
+    if (!valid) {
         LOG_WARNING(Render, "Pipeline cache isn't compatible with current system: rebuilding it");
         Storage::DataBase::Instance().Clear();
         Storage::DataBase::Instance().FinishPreload();
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
-        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
+        SaveProfile();
         return;
     }
 

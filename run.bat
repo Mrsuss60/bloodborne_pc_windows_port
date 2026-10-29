@@ -196,6 +196,8 @@ set "user_dir=%BB_USER_DIR%"
 if "%user_dir%"=="" set "user_dir=%BB_DATA_DIR%\user"
 set "timeout=%BB_TIMEOUT%"
 if "%timeout%"=="" set "timeout=0"
+if not defined BB_SHADER_RECIPES if exist "%~dp0shader_recipes.bin" set "BB_SHADER_RECIPES=%~dp0shader_recipes.bin"
+if not defined BB_SHADER_GAME_DIR set "BB_SHADER_GAME_DIR=%game%"
 
 echo Launching Bloodborne PC (%probe%)...
 "%probe%" "%out%\boot-linked.bin" --content-profile "%out%\content.bin" --patches "%out%\patches.bin" --app0 "%game%" --user "%user_dir%" --timeout "%timeout%" %EXTRA_ARGS%

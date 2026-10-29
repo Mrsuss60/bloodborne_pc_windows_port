@@ -9,20 +9,29 @@
 
 #include <array>
 #include <atomic>
+#include <map>
+#include "shim/bb_env.h" 
 
 #include "common/assert.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 
 namespace Vulkan {
 
 class ConstantRing {
 public:
-    static constexpr u64 Capacity = 32ull << 20;
+    static u64 CapacityFor(const Instance& instance) {
+        const char* env = bb_env("BB_CONSTANT_RING_MB");
+        const u64 mb = env ? std::strtoull(env, nullptr, 10) : 0;
+        const bool small = !instance.IsIntegrated() && instance.GetTotalMemoryBudget() <= (3ull << 30);
+        return (mb ? mb : small ? 16ull : 32ull) << 20;
+    }
+    const u64 Capacity;
 
     ConstantRing(const Instance& instance, Scheduler& scheduler_)
-        : scheduler{scheduler_},
+        : Capacity{CapacityFor(instance)}, scheduler{scheduler_},
           buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "bbport constant ring"} {
         ASSERT(!buffer.mapped_data.empty());
     }
@@ -45,7 +54,30 @@ public:
                 return std::nullopt;
             }
         }
+        while (!holds.empty() && (holds.begin()->first << 16) + Capacity < at + size) {
+            if (retired < holds.begin()->second) {
+                Retire();
+                if (retired < holds.begin()->second) {
+                    return std::nullopt;
+                }
+            }
+            holds.erase(holds.begin());
+        }
         position = at + size;
+        last_at = at;
+        return at % Capacity;
+    }
+
+    [[nodiscard]] u64 LastAllocated() const noexcept {
+        return last_at;
+    }
+
+    std::optional<u64> Reuse(u64 at, u64 size) {
+        if (at + size > position || at + Capacity / 4 < position) {
+            return std::nullopt;
+        }
+        u64& until = holds[at >> 16];
+        until = std::max(until, position + 1);
         return at % Capacity;
     }
 
@@ -108,6 +140,8 @@ private:
     VideoCore::Buffer buffer;
     u64 position = 0;     ///< stage A
     u64 retired = 0;      ///< stage A: the GPU is done with everything before this
+    u64 last_at = 0;
+    std::map<u64, u64> holds;
     u64 pending_end = 0, pending_tick = 0, last_published = 0; ///< stage B
     std::array<StampEntry, 1024> stamps{};
     alignas(64) std::atomic<u64> stamps_head{0}; ///< stage B writes

@@ -20,6 +20,9 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include "../bbgpu.h"
+#ifdef _WIN32
+#include "platform/win32/nvidia_profile.h"
+#endif
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
@@ -208,6 +211,9 @@ static void StartProfileWriter() {
 #endif
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
+#ifdef _WIN32
+    BbNvidiaProfile::Apply();
+#endif
     BbSettings::Load();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();

@@ -21,6 +21,7 @@
 #include <windows.h>
 #endif
 #include <vk_mem_alloc.h>
+#include "bb_env.h"
 #include "bbport_cheats.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
@@ -59,6 +60,13 @@ extern "C" void runtime_restart(void); // bb-probe (probe.c)
 #include "sdl_window.h"
 extern Frontend::WindowSDL* g_window;
 
+namespace Vulkan {
+extern std::atomic<u32> g_bb_compiles_total;
+extern std::atomic<u32> g_bb_background_pipelines_total;
+extern std::atomic<u32> g_bb_background_pipelines_done;
+extern std::atomic<bool> g_bb_shader_import_active;
+}
+
 namespace BbOverlay {
 
 namespace {
@@ -86,6 +94,130 @@ const Vulkan::Instance* g_vk_instance = nullptr;
 constexpr int FrametimeHistorySize = 120;
 float frametime_history[FrametimeHistorySize] = {};
 int frametime_history_idx = 0;
+
+using ::Vulkan::g_bb_compiles_total;
+using ::Vulkan::g_bb_background_pipelines_total;
+using ::Vulkan::g_bb_background_pipelines_done;
+using ::Vulkan::g_bb_shader_import_active;
+
+static long long NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+struct ShaderProgress {
+    u32 done = 0, total = 0, recent = 0;
+    bool importing = false;
+};
+
+static ShaderProgress CurrentShaderProgress() {
+    static const bool enabled = !bb_env_off("BB_SHADER_PROGRESS");
+    ShaderProgress p;
+    if (!enabled) {
+        return p;
+    }
+    p.total = g_bb_background_pipelines_total.load(std::memory_order_relaxed);
+    p.done = g_bb_background_pipelines_done.load(std::memory_order_relaxed);
+    static const long long start = NowNs();
+    p.importing = g_bb_shader_import_active.load(std::memory_order_relaxed) &&
+                  NowNs() - start < 180'000'000'000ll;
+    static u32 last_compiles = 0;
+    static long long last_change = 0;
+    static u32 window_start_compiles = 0;
+    const u32 compiles = g_bb_compiles_total.load(std::memory_order_relaxed);
+    const long long now = NowNs();
+    if (compiles != last_compiles) {
+        if (now - last_change > 1'500'000'000ll) {
+            window_start_compiles = last_compiles;
+        }
+        last_compiles = compiles;
+        last_change = now;
+    }
+    if (last_change != 0 && now - last_change <= 1'500'000'000ll) {
+        p.recent = compiles - window_start_compiles;
+    }
+    return p;
+}
+
+static bool ShaderProgressShown() {
+    if (!BbSettings::Get().show_hud) {
+        return false;
+    }
+    const ShaderProgress p = CurrentShaderProgress();
+    const bool shown = p.done < p.total || p.importing || p.recent != 0;
+    static bool was_shown = false;
+    if (shown != was_shown) {
+        was_shown = shown;
+        std::printf("Overlay: \"Compiling shaders\" %s (%u of %u in the background%s, %u just now)\n",
+                    shown ? "shown" : "hidden", p.done, p.total,
+                    p.importing ? ", recipes importing" : "", p.recent);
+    }
+    return shown;
+}
+
+static void ShaderProgressLine() {
+    if (!BbSettings::Get().show_hud) {
+        return;
+    }
+    const ShaderProgress p = CurrentShaderProgress();
+    char text[128];
+    if (p.done < p.total) {
+        std::snprintf(text, sizeof(text), "Compiling shaders %u / %u", p.done, p.total);
+    } else if (p.importing) {
+        std::snprintf(text, sizeof(text), "Preparing shaders...");
+    } else if (p.recent != 0) {
+        std::snprintf(text, sizeof(text), "Compiling shaders (%u)", p.recent);
+    } else {
+        return;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + pad,
+                                   viewport->WorkPos.y + viewport->WorkSize.y - pad),
+                            ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+
+    // Subtle, low-distraction styling:
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f * base_scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f * base_scale, 5.0f * base_scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * base_scale, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35f, 0.40f, 0.48f, 0.35f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.06f, 0.08f, 0.30f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.82f, 0.85f, 0.88f, 0.85f));
+
+    ImGui::Begin("##shader_progress", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+
+    // Subtle animated spinner:
+    const float radius = 5.0f * base_scale;
+    const float thickness = 1.5f * base_scale;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(radius * 2.0f, radius * 2.0f));
+    const float time = float(ImGui::GetTime());
+    const ImVec2 center = ImVec2(pos.x + radius, pos.y + radius + 1.0f * base_scale);
+    const float a_min = time * 5.0f;
+    const float a_max = a_min + 1.25f * 3.14159265f;
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    // Background track:
+    draw_list->AddCircle(center, radius, IM_COL32(255, 255, 255, 30), 16, thickness);
+    // Spinning indicator arc:
+    draw_list->PathClear();
+    draw_list->PathArcTo(center, radius, a_min, a_max, 16);
+    draw_list->PathStroke(IM_COL32(140, 180, 240, 210), thickness, 0);
+
+    ImGui::SameLine();
+    ImGui::SetWindowFontScale(0.85f);
+    ImGui::TextUnformatted(text);
+    ImGui::SetWindowFontScale(1.0f);
+
+    ImGui::End();
+
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar(4);
+}
 
 // Host system CPU, RAM, and GPU telemetry
 float cached_cpu_usage = 0.0f;
@@ -1554,7 +1686,8 @@ bool Visible() {
         BbCheats::Update();
     }
     return initialized && (menu_open || cheat_menu_open || BbSettings::Get().show_fps ||
-                           BbSettings::Get().show_hud || (g_window && g_window->IsTextInputActive()));
+                           BbSettings::Get().show_hud || (g_window && g_window->IsTextInputActive()) ||
+                           ShaderProgressShown());
 }
 
 bool CapturesInput() {
@@ -1599,6 +1732,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         HudOverlay();
     } else if (BbSettings::Get().show_fps && !menu_open && !cheat_menu_open) {
         FpsCounter();
+    }
+    if (!menu_open && !cheat_menu_open) {
+        ShaderProgressLine();
     }
     if (g_window && g_window->IsTextInputActive()) {
         const std::string prompt = g_window->GetTextInputPrompt();

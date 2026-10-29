@@ -255,6 +255,9 @@ private:
     const AmdGpu::ComputeProgram& CsRegs() const;
     static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size);
     struct RingBinding;
+    bool CopyRingDeduplicated(
+        u32 index, VAddr address, u64 size, u64 alignment,
+        boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out);
     void CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                              boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out);
     void PrintPipeStats();

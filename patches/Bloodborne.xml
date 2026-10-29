@@ -3447,32 +3447,6 @@
               AppVer="01.09" 
               AppElf="eboot.bin" isEnabled="false">
         <PatchList>
-            <Line Type="bytes" Address="0x0183A4C3" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A8C1" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A4CD" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A8CB" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A4D7" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A8D5" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A4E1" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A8DF" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A4F5" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A8F3" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A4FF" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A8FD" Value="CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183A509" Value="8FC2753C"/>
-            <Line Type="bytes" Address="0x0183A907" Value="8FC2753C"/>
-            <Line Type="bytes" Address="0x0183A527" Value="CDCC4C3E"/>
-            <Line Type="bytes" Address="0x0183A925" Value="CDCC4C3E"/>
-            <Line Type="bytes" Address="0x0183A531" Value="CDCC4C3E"/>
-            <Line Type="bytes" Address="0x0183A92F" Value="CDCC4C3E"/>
-            <Line Type="bytes" Address="0x0183A53B" Value="9A99193E"/>
-            <Line Type="bytes" Address="0x0183A939" Value="9A99193E"/>
-            <Line Type="bytes" Address="0x0183A649" Value="C2B8323F"/>
-            <Line Type="bytes" Address="0x0183AA47" Value="C2B8323F"/>
-            <Line Type="bytes" Address="0x0183A653" Value="0AD7233D"/>
-            <Line Type="bytes" Address="0x0183AA51" Value="0AD7233D"/>
-            <Line Type="bytes" Address="0x0183A65D" Value="9A99193E"/>
-            <Line Type="bytes" Address="0x0183AA5B" Value="9A99193E"/>
             <Line Type="bytes" Address="0x0192C405" Value="14000000"/>
             <Line Type="bytes" Address="0x04CF6420" Value="CDCC4C3DCDCC4C3DCDCC4C3DCDCC4C3D"/>
             <Line Type="bytes" Address="0x01929676" Value="0A000000"/>
@@ -3594,21 +3568,6 @@
             <Line Type="bytes" Address="0x02C0137D" Value="E84AFFFFFF"/>
             <Line Type="bytes" Address="0x0183DC96" Value="E9D6050000"/>
             <Line Type="bytes" Address="0x0183DCFE" Value="00"/>
-            <Line Type="bytes" Address="0x0183FF29" Value="41C7859C010000CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183FF34" Value="41C785A0010000CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183FF3F" Value="41C785A4010000CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183FF4A" Value="41C785A8010000CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183FF55" Value="41C785B0010000CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183FF60" Value="41C785B4010000CDCC4C3D"/>
-            <Line Type="bytes" Address="0x0183FF6B" Value="E90B010000"/>
-            <Line Type="bytes" Address="0x01840799" Value="41C78538020000C2B8323F"/>
-            <Line Type="bytes" Address="0x018407A4" Value="41C7853C0200000AD7233D"/>
-            <Line Type="bytes" Address="0x018407AF" Value="41C785B80100008FC2753C"/>
-            <Line Type="bytes" Address="0x018407BA" Value="41C785C4010000CDCC4C3E"/>
-            <Line Type="bytes" Address="0x018407C5" Value="41C785C8010000CDCC4C3E"/>
-            <Line Type="bytes" Address="0x018407D0" Value="41C785CC0100009A99193E"/>
-            <Line Type="bytes" Address="0x018407DB" Value="41C785400200009A99193E"/>
-            <Line Type="bytes" Address="0x018407E6" Value="E91E000000"/>
             <Line Type="bytes" Address="0x047DF584" Value="0000803E"/>
             <Line Type="bytes" Address="0x02434FA8" Value="89F8FFFF"/>
             <Line Type="bytes" Address="0x02434FAC" Value="89F8FFFF"/>

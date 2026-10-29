@@ -2951,6 +2951,21 @@ ABI float bb_live_clock_tick(void *singleton) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
+    /* Shader recipes (Phase 2): background process and CLI tools, no guest memory mapped */
+    if (argc == 5 && !strcmp(argv[1], "--export-shader-recipes"))
+        return bbgpu_export_shader_recipes(argv[2], argv[3], argv[4]);
+    if (argc == 7 && !strcmp(argv[1], "--import-shaders"))
+        return bbgpu_import_shader_recipes(argv[2], argv[3], argv[4], strtoull(argv[5], NULL, 16),
+                                           strtoull(argv[6], NULL, 16));
+    if (argc == 3 && !strcmp(argv[1], "--rebuild-shader-cache"))
+        return bbgpu_rebuild_shader_cache(argv[2]);
+    if (argc == 9 && !strcmp(argv[1], "--merge-shader-metas"))
+        return bbgpu_merge_shader_metas(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], atoi(argv[8]));
+
+    /* Rebuild caches from older compiler versions if needed */
+    bbgpu_rebuild_shader_caches();
+
 #ifdef _WIN32
     runtime_memory_reserve_space();
     int avx_status = runtime_win_check_avx();
@@ -2996,7 +3011,6 @@ int main(int argc, char **argv) {
         g_bb_trace = 1;
     }
 
-    if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
     const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL;
@@ -3049,10 +3063,26 @@ int main(int argc, char **argv) {
     }
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
+#ifdef _WIN32
+        SetEnvironmentVariableA("BB_SHADER_GAME_DIR", app0);
+#else
+        setenv("BB_SHADER_GAME_DIR", app0, 0);
+#endif
         char sfo[4096], id[16]="";
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
+    }
+    if (!getenv("BB_SHADER_RECIPES")) {
+        FILE *rf = fopen("shader_recipes.bin", "rb");
+        if (rf) {
+            fclose(rf);
+#ifdef _WIN32
+            SetEnvironmentVariableA("BB_SHADER_RECIPES", "shader_recipes.bin");
+#else
+            setenv("BB_SHADER_RECIPES", "shader_recipes.bin", 0);
+#endif
+        }
     }
     bbgpu_register_kernel();
 #ifdef _WIN32

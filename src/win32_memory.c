@@ -198,9 +198,9 @@ int win_mem_protect(uintptr_t a, uintptr_t b, int prot) {
 
 void *win_mem_private(uintptr_t a, uintptr_t b) {
     if (!inside(a, b)) return NULL;
-    MEMORY_BASIC_INFORMATION info;
-    for (uintptr_t at = a; at < b; at = (uintptr_t)info.BaseAddress + info.RegionSize)
-        if (!VirtualQuery((void *)at, &info, sizeof(info)) || info.State != MEM_RESERVE) return NULL;
+    for (size_t i = view_index(a); i < view_count && views[i].start < b; ++i) {
+        if (views[i].end > a) return NULL;
+    }
     if (make_placeholder(a, b)) return NULL;
     return virtual_alloc2(GetCurrentProcess(), (void *)a, b - a, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
                           PAGE_READWRITE, NULL, 0);

@@ -18,6 +18,8 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include <xxhash.h>
+#include "shim/bb_env.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
 #include "bbport_button_prompts.h"
@@ -483,6 +485,57 @@ bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
     return false;
 }
 
+namespace {
+bool RingDedupOn() {
+    static const bool on = !bb_env_off("BB_RING_DEDUP");
+    return on;
+}
+} // namespace
+
+bool Rasterizer::CopyRingDeduplicated(
+    u32 index, VAddr address, u64 size, u64 alignment,
+    boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out) {
+    struct Slot {
+        VAddr address = 0;
+        u64 size = 0;
+        XXH128_hash_t hash{};
+        u64 at = 0;
+    };
+    thread_local auto slots = std::make_unique<std::array<Slot, 8192>>();
+    thread_local auto bytes = std::make_unique<std::array<u8, VideoCore::BufferCache::STREAM_THRESHOLD>>();
+    thread_local auto by_content = std::make_unique<std::array<Slot, 8192>>();
+    if (size > bytes->size()) {
+        return false;
+    }
+    memory->CopySparseMemory(address, bytes->data(), size);
+    const XXH128_hash_t hash = XXH3_128bits(bytes->data(), size);
+    auto& slot = (*slots)[((address * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full)) >> 51];
+    auto& content_slot = (*by_content)[hash.low64 >> 51];
+    std::optional<u64> offset;
+    if (slot.address == address && slot.size == size && XXH128_isEqual(slot.hash, hash)) {
+        offset = constant_ring->Reuse(slot.at, size);
+    }
+    if (!offset && content_slot.size == size && XXH128_isEqual(content_slot.hash, hash)) {
+        offset = constant_ring->Reuse(content_slot.at, size);
+        if (offset) {
+            slot = content_slot;
+            slot.address = address;
+        }
+    }
+    if (!offset) {
+        offset = constant_ring->Allocate(size, alignment);
+        if (!offset) {
+            return false;
+        }
+        std::memcpy(constant_ring->Data(*offset), bytes->data(), size);
+        constant_ring->Flush(*offset, size);
+        slot = {address, size, hash, constant_ring->LastAllocated()};
+        content_slot = slot;
+    }
+    out.push_back({index, static_cast<u32>(size), *offset, address});
+    return true;
+}
+
 void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                            boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out) {
     const PreparedStage* prepared_stage = nullptr;
@@ -499,6 +552,11 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
     const u64 alignment = std::max<u64>(instance.StorageMinAlignment(),
                                         instance.UniformMinAlignment());
     const auto copy = [&](u32 index, const void* source, VAddr address, u64 size) {
+        if (!source && address != 0 && RingDedupOn()) {
+            if (CopyRingDeduplicated(index, address, size, alignment, out)) {
+                return;
+            }
+        }
         const auto offset = constant_ring->Allocate(size, alignment);
         if (!offset) {
             return;

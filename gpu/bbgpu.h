@@ -120,6 +120,15 @@ enum BbAction {
 int bbgpu_get_action_binding(int action);
 void bbgpu_get_all_action_bindings(int *out_bindings, int count);
 void bbgpu_set_action_binding(int action, int code);
+
+/* Shader recipes & cache rebuilds (Phase 2) */
+int bbgpu_rebuild_shader_caches(void);
+int bbgpu_rebuild_shader_cache(const char *dir);
+int bbgpu_export_shader_recipes(const char *cache_dir, const char *game_dir, const char *out_path);
+int bbgpu_import_shader_recipes(const char *cache_dir, const char *pack, const char *game_dir,
+                                unsigned long long motion_params, unsigned long long motion_positions);
+int bbgpu_merge_shader_metas(const char *cache_dir, const char *pack, const char *game_dir,
+                             const char *meta_dir, const char *out_pack, const char *work_dir, int jobs);
 #ifdef __cplusplus
 }
 #endif

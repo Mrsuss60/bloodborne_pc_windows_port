@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_shader_capture.h"
 
 namespace Vulkan {
 
@@ -376,6 +377,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 
     WarmUp();
+    StartShaderImport();
 }
 
 PipelineCompiler& PipelineCache::GetCompiler() {
@@ -392,14 +394,7 @@ PipelineCompiler& PipelineCache::GetCompiler() {
     return *compiler;
 }
 
-struct PipelineCache::PendingPipeline {
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool done = false;
-    std::unique_ptr<GraphicsPipeline> pipeline;
-    GraphicsPipeline::SerializationSupport sdata{};
-    std::array<vk::ShaderModule, MaxShaderStages> modules{};
-};
+
 
 PipelineCache::~PipelineCache() {
     ClearAuxShaderCaches();
@@ -408,6 +403,10 @@ PipelineCache::~PipelineCache() {
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
 std::atomic<u32> g_bb_compiles;
+std::atomic<u32> g_bb_background_pipelines_total{0};
+std::atomic<u32> g_bb_background_pipelines_done{0};
+std::atomic<bool> g_bb_shader_import_active{false};
+std::atomic<u32> g_bb_compiles_total{0};
 namespace {
 struct CompileTimer {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -416,6 +415,7 @@ struct CompileTimer {
                                    std::chrono::steady_clock::now() - start)
                                    .count());
         ++g_bb_compiles;
+        g_bb_compiles_total.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
@@ -531,6 +531,7 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
                                                            bool indirect) {
+    PollShaderImport();
     used_prepared = nullptr;
     NoteDrawTarget(liverpool->regs);
     if (prepared) {
@@ -581,17 +582,24 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         {
             std::unique_lock lk{job->mutex};
             if (!job->done) {
-                if (skippable) {
-                    ++async_skipped;
-                    return nullptr; // drawn from the frame its pipeline is ready
+                if (job->make && !job->started.exchange(true)) {
+                    try {
+                        job->pipeline = job->make();
+                    } catch (const std::exception&) {}
+                    job->done = true;
+                } else {
+                    if (skippable) {
+                        ++async_skipped;
+                        return nullptr; // drawn from the frame its pipeline is ready
+                    }
+                    // A pass that is not drawn every frame needs it now: the wait is compile time.
+                    const auto start = std::chrono::steady_clock::now();
+                    job->cv.wait(lk, [&] { return job->done; });
+                    g_bb_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - start)
+                                               .count());
+                    ++async_waited;
                 }
-                // A pass that is not drawn every frame needs it now: the wait is compile time.
-                const auto start = std::chrono::steady_clock::now();
-                job->cv.wait(lk, [&] { return job->done; });
-                g_bb_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now() - start)
-                                           .count());
-                ++async_waited;
             }
         }
         pending_graphics.erase(sel.graphics_key);
@@ -604,6 +612,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         pending_graphics.emplace(sel.graphics_key, job);
         ++async_started;
         ++g_bb_compiles;
+        g_bb_compiles_total.fetch_add(1, std::memory_order_relaxed);
         comp.Submit([this, job, key = sel.graphics_key, infos = sel.infos,
                           runtime_infos = sel.runtime_infos, fetch = sel.fetch_shader,
                           modules = sel.modules]() mutable {
@@ -650,8 +659,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 const GraphicsPipeline* PipelineCache::FinishPipeline(const GraphicsPipelineKey& key,
                                                       PendingPipeline& job) {
     const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
-    RegisterPipelineData(key, pipeline_hash, job.sdata);
-    ++num_new_pipelines;
+    if (!job.saved) {
+        RegisterPipelineData(key, pipeline_hash, job.sdata);
+        ++num_new_pipelines;
+    }
     if (EmulatorSettings.IsShaderCollect()) {
         for (const vk::ShaderModule module : job.modules) {
             if (module) {
@@ -1070,8 +1081,28 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     CompileTimer timer;
 
+    const bool capture = BbShaderCapture::Enabled();
+    std::optional<Shader::Info> in_info;
+    const auto in_runtime_info = runtime_info;
+    const auto in_binding = binding;
+    const bool keep_input = EmulatorSettings.IsPipelineCacheEnabled();
+    if (capture || keep_input) {
+        in_info.emplace(info);
+        BbShaderCapture::BeginInput();
+    }
+
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    if (keep_input) {
+        RegisterShaderInput(
+            BbShaderCapture::TakeInput(*in_info, in_runtime_info, in_binding, code, perm_idx,
+                                       info.flattened_ud_buf),
+            info.pgm_hash, perm_idx);
+    }
+    if (capture) {
+        BbShaderCapture::Write(*in_info, in_runtime_info, profile, in_binding, code, perm_idx, spv,
+                               info, binding);
+    }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;

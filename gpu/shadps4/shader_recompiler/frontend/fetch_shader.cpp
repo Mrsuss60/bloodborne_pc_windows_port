@@ -55,6 +55,9 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    if (guest_read_hook) {
+        guest_read_hook(code, 0);
+    }
 
     // bbport: the pipeline cache parses the fetch shader on every draw. Results are cached
     // per thread by code address and revalidated against a copy of the code, which is

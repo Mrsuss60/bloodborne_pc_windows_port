@@ -11,12 +11,18 @@
 #include "video_core/host_shaders/buffer_multi_copy_comp.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "shim/bb_env.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
+
+bool CopySkipSameOn() {
+    static const bool on = !bb_env_off("BB_COPY_SKIP_SAME");
+    return on;
+}
 
 // bbport: the copy shader runs ~57 times per frame with ~1024 small ranges each. As one
 // vkCmdCopyBuffer with that many regions it cost ~37 ns of GPU time per range (~2.1 ms per
@@ -160,12 +166,27 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     copies.clear();
     copies.reserve(cs_program.dim_x);
 
+    const bool skip_same = CopySkipSameOn();
+    const u8* src_base_ptr = reinterpret_cast<const u8*>(src_buf_sharp.base_address);
+    const u8* dst_base_ptr = reinterpret_cast<const u8*>(dst_buf_sharp.base_address);
+
     for (u32 i = 0; i < cs_program.dim_x; i++) {
         const auto& [dst_idx, src_idx, end] = ctl_buf[i];
         const u32 local_dst_offset = dst_idx * buf_stride;
         const u32 local_src_offset = src_idx * buf_stride;
         const u32 local_size = (end + 1) * buf_stride;
+        if (local_size == 0) {
+            continue;
+        }
+        if (skip_same && src_base_ptr && dst_base_ptr) {
+            if (std::memcmp(dst_base_ptr + local_dst_offset, src_base_ptr + local_src_offset, local_size) == 0) {
+                continue;
+            }
+        }
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
+    }
+    if (copies.empty()) {
+        return true;
     }
 
     // bbport: 64 KiB instead of 64 MiB. The copies are a few KiB spread over up to 57 MiB, and

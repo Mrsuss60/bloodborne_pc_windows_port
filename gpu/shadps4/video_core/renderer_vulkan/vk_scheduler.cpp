@@ -316,7 +316,7 @@ void Scheduler::WaitHostCopies() {
 }
 
 void Scheduler::KickRecording(bool force) {
-    if (!recorder_thread.joinable()) {
+    if (!recorder_running) {
         return;
     }
     // Callers kick where nobody holds the raw command buffer: deferral resumes.
@@ -353,7 +353,7 @@ void Scheduler::KickRecording(bool force) {
 }
 
 void Scheduler::SyncRecording() {
-    if (!recorder_thread.joinable()) {
+    if (!recorder_running) {
         return;
     }
     KickRecording(true);
