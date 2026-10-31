@@ -112,6 +112,10 @@ struct Image {
         return track_addr != 0 && track_addr_end != 0;
     }
 
+    bool HasGpuValidData() const {
+        return True(flags & ImageFlagBits::GpuModified) && False(flags & ImageFlagBits::Dirty);
+    }
+
     bool SafeToDownload() const {
         return True(flags & ImageFlagBits::GpuModified) && False(flags & (ImageFlagBits::Dirty));
     }
