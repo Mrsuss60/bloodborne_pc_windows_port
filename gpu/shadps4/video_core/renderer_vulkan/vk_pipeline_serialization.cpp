@@ -15,7 +15,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 24u; // bbport: interpolated integer fix (Pascal)
+static constexpr u32 ShaderBinaryVersion = 25u; // bbport: modernized recompiler & fast shader math (Phase 2)
 static constexpr u32 ShaderMetaVersion = 8u; // the object motion buffer addresses
 static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
 } // namespace Serialization
