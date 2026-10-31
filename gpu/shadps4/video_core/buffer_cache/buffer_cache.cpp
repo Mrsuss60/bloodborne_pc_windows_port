@@ -11,6 +11,7 @@
 #include <magic_enum/magic_enum.hpp>
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
+#include "buffers/memory_model.h"
 #include "common/alignment.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -31,26 +32,6 @@ static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
-static constexpr auto ARENA_USAGE =
-    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
-    vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
-    vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
-    vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
-
-std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& properties,
-                                  vk::MemoryPropertyFlags wanted, u32 memory_type_bits) {
-    for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
-        if (((memory_type_bits >> i) & 1) == 0) {
-            continue;
-        }
-        const auto flags = properties.memoryTypes[i].propertyFlags;
-        if ((flags & wanted) == wanted) {
-            return i;
-        }
-    }
-    return std::nullopt;
-}
-
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -59,35 +40,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
-      gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
-      memory_semaphore{instance} {
-    const vk::BufferCreateInfo probe_ci = {
-        .flags =
-            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
-        .size = ARENA_PAGE_SIZE,
-        .usage = ARENA_USAGE,
-        .sharingMode = vk::SharingMode::eExclusive,
-    };
-    const vk::DeviceBufferMemoryRequirements req_info = {
-        .pCreateInfo = &probe_ci,
-    };
-    const auto device = instance.GetDevice();
-    const auto reqs = device.getBufferMemoryRequirements(req_info).memoryRequirements;
-    block_size = Common::AlignUp(std::max<u64>(reqs.alignment, MIN_BLOCK_SIZE), reqs.alignment);
-    ASSERT_MSG(std::popcount(block_size) == 1, "Sparse block size {} is not a power of 2",
-               block_size);
-    block_shift = std::bit_width(block_size) - 1;
-    blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
-    blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
-    arena_memory_type_index =
-        FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
-                       reqs.memoryTypeBits)
-            .value();
+      gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"} {
+    // bbport 0.7 memory model: the GPU reaches guest memory through dense device-local mirrors
+    // (no sparse resources, no vkQueueBindSparse). Blocks are a fixed 16 KiB; the BDA page table
+    // maps every block that has ever been populated to its mirror's device address.
+    BbLayer::GpuMemory::Get().SetBlockShift(BLOCK_SHIFT);
 
-    const u64 bda_pagetable_size =
-        (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
-    fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
-                                                   blocks_per_arena_page * NUM_ARENA_PAGES);
+    const u64 blocks_per_arena_page = ARENA_PAGE_SIZE / BLOCK_SIZE;
+    const u64 total_blocks = blocks_per_arena_page * NUM_ARENA_PAGES;
+    const u64 bda_pagetable_size = total_blocks * sizeof(vk::DeviceAddress);
+    fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, BLOCK_SHIFT,
+                                                   total_blocks);
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
@@ -95,6 +58,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         null_index_buffer = std::make_unique<Buffer>(instance, 0, NULL_INDEX_BUFFER_SIZE,
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
         runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
+    }
+    LOG_INFO(Render, "Layer memory: device-local mirrors, {} KiB blocks, {} MiB BDA page table, "
+                     "vkQueueBindSparse: 0 calls",
+             BLOCK_SIZE >> 10, bda_pagetable_size >> 20);
+    // Direct memory access needs the page table and buffer device addresses; without them the
+    // in-shader path cannot be used and the setting is rejected here instead of faulting later.
+    if (EmulatorSettings.IsDirectMemoryAccessEnabled() &&
+        !instance.IsBufferDeviceAddressSupported()) {
+        GuestMemoryUnusable("VK_KHR_buffer_device_address is not available");
     }
 }
 
@@ -148,19 +120,32 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
-        const u32 first_block = device_addr >> block_shift;
-        const u32 last_block = (device_addr + size - 1) >> block_shift;
-        const auto* arena = GetArena(first_block, last_block);
-
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
         constexpr u64 WindowSize = 512_KB;
-        const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
-        const VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
-        DownloadMemory(arena, window_start, window_end - window_start);
+        std::shared_ptr<Buffer> buffer;
+        VAddr mirror_base = 0;
+        VAddr mirror_end = 0;
+        {
+            std::scoped_lock lk{mirrors_mutex};
+            Mirror* mirror = FindMirrorLocked(device_addr >> BLOCK_SHIFT);
+            if (mirror) {
+                buffer = mirror->buffer;
+                mirror_base = mirror->buffer->cpu_addr;
+                mirror_end =
+                    mirror_base + ((mirror->committed_end - mirror->first_block) << BLOCK_SHIFT);
+            }
+        }
+        if (buffer) {
+            const VAddr window_start =
+                std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), mirror_base);
+            const VAddr window_end = std::min<VAddr>(
+                std::max<VAddr>(window_start + WindowSize, device_addr + size), mirror_end);
+            if (window_start < window_end) {
+                DownloadMemory(buffer, mirror_base, mirror_end, window_start,
+                               window_end - window_start);
+            }
+        }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -172,16 +157,20 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
-void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+void BufferCache::DownloadMemory(const std::shared_ptr<Buffer>& buffer, VAddr mirror_base,
+                                  VAddr mirror_end, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
-    const VAddr arena_base = arena->cpu_addr;
     memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
         const auto add_download = [&](VAddr start, VAddr end) {
-            const u64 new_offset = start - arena_base;
+            start = std::max(start, mirror_base);
+            end = std::min(end, mirror_end);
+            if (start >= end) {
+                return;
+            }
             const u64 new_size = end - start;
             copies.push_back(vk::BufferCopy{
-                .srcOffset = new_offset,
+                .srcOffset = start - mirror_base,
                 .dstOffset = total_size_bytes,
                 .size = new_size,
             });
@@ -200,12 +189,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    runtime.CopyBuffer(arena, download.buffer, copies);
+    runtime.CopyBuffer(buffer.get(), download.buffer, copies);
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
-        auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
+        auto* dst_addr = std::bit_cast<u8*>(mirror_base + copy.srcOffset);
         memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
                                 copy.size);
     }
@@ -214,11 +203,11 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 namespace {
 // bbport: BB_BUFFER_STATS=1 — how buffer bindings reach the GPU, by guest region (256 MiB),
-// printed every 5 s: small read-only copies into the stream buffer, arena bindings, and the
+// printed every 5 s: small read-only copies into the stream buffer, mirror bindings, and the
 // bytes those re-upload after CPU writes. Input for engine-level short paths.
 struct BufferStats {
     struct Region {
-        u64 stream_count{}, stream_bytes{}, arena_count{}, arena_bytes{}, upload_bytes{};
+        u64 stream_count{}, stream_bytes{}, mirror_count{}, mirror_bytes{}, upload_bytes{};
     };
     std::map<u64, Region> regions;
     /// Hot window: frame of the last binding per 64 KiB block, and the distribution of the
@@ -269,7 +258,7 @@ void PrintBufferStats() {
     if (seconds < 5.0) {
         return;
     }
-    std::printf("Buffer stats (%.1f s, per second): region, stream copies/bytes, arena bindings, "
+    std::printf("Buffer stats (%.1f s, per second): region, stream copies/bytes, mirror bindings, "
                 "re-uploaded bytes\n", seconds);
     std::printf("  hot window reuse distance in frames (1,2,3,4,5-8,9-16,17+): %llu %llu %llu %llu "
                 "%llu %llu %llu\n",
@@ -283,16 +272,205 @@ void PrintBufferStats() {
         if ((region >> 40) && r.stream_bytes + r.upload_bytes < 1e6 * seconds) {
             continue; // quiet MiB of the hot window
         }
-        std::printf("  %#012llx: %8.0f copies %8.2f MB, %8.0f arena %8.2f MB bound, %8.2f MB uploads\n",
+        std::printf("  %#012llx: %8.0f copies %8.2f MB, %8.0f mirror %8.2f MB bound, %8.2f MB "
+                    "uploads\n",
                     static_cast<unsigned long long>(base), r.stream_count / seconds,
-                    r.stream_bytes / seconds / 1e6, r.arena_count / seconds,
-                    r.arena_bytes / seconds / 1e6,
+                    r.stream_bytes / seconds / 1e6, r.mirror_count / seconds,
+                    r.mirror_bytes / seconds / 1e6,
                     r.upload_bytes / seconds / 1e6);
     }
     st.regions.clear();
     st.window = now;
 }
 } // namespace
+
+BufferCache::Mirror* BufferCache::FindMirrorLocked(u64 block) {
+    auto it = mirrors.upper_bound(block);
+    if (it == mirrors.begin()) {
+        return nullptr;
+    }
+    --it;
+    Mirror& mirror = *it->second;
+    return block < mirror.committed_end ? &mirror : nullptr;
+}
+
+void BufferCache::RetireMirrorLocked(std::unique_ptr<Mirror> mirror) {
+    if (!mirror) {
+        return;
+    }
+    // The commands recorded so far (including the copy out of this mirror) complete before the
+    // deferred operation runs, because it waits for the tick they are submitted with.
+    auto buffer = std::move(mirror->buffer);
+    scheduler.DeferOperation([buffer = std::move(buffer)] {});
+}
+
+void BufferCache::MapPageTableLocked(const Mirror& mirror, u64 first_block, u64 last_block) {
+    if (first_block > last_block) {
+        return;
+    }
+    const u64 count = last_block - first_block + 1;
+    const u64 bytes = count * sizeof(vk::DeviceAddress);
+    const auto staging = staging_pool.Request(bytes, MemoryType::HostUncached);
+    auto* entries = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+    const vk::DeviceAddress base = mirror.buffer->BufferDeviceAddress();
+    const u64 base_offset = (first_block - mirror.first_block) << BLOCK_SHIFT;
+    for (u64 i = 0; i < count; ++i) {
+        entries[i] = base + base_offset + (i << BLOCK_SHIFT);
+    }
+    staging.Flush();
+    const vk::BufferCopy copy{
+        .srcOffset = staging.offset,
+        .dstOffset = first_block * sizeof(vk::DeviceAddress),
+        .size = bytes,
+    };
+    runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), std::span{&copy, 1});
+}
+
+void BufferCache::UploadMissingBlocksLocked(Mirror& mirror, u64 first_block, u64 last_block) {
+    boost::container::small_vector<vk::BufferCopy, 8> copies;
+    size_t total_size_bytes = 0;
+    const auto add_blocks = [&](u64 begin, u64 end) {
+        if (begin >= end) {
+            return;
+        }
+        copies.push_back(vk::BufferCopy{
+            .srcOffset = 0,
+            .dstOffset = begin << BLOCK_SHIFT,
+            .size = (end - begin) << BLOCK_SHIFT,
+        });
+        total_size_bytes += (end - begin) << BLOCK_SHIFT;
+    };
+    u64 at = first_block;
+    BbLayer::GpuMemory::Get().ForEachValid(first_block, last_block + 1, [&](u64 begin, u64 end) {
+        if (begin > at) {
+            add_blocks(at, begin);
+        }
+        at = std::max(at, end);
+    });
+    if (at < last_block + 1) {
+        add_blocks(at, last_block + 1);
+    }
+    if (copies.empty()) {
+        return;
+    }
+    // The blocks are current once the copies below execute, which is before any command that
+    // binds them (all recorded in this command buffer, in order).
+    BbLayer::GpuMemory::Get().MarkValid(first_block, last_block + 1);
+    if (const auto* staging = UploadCopies(mirror.buffer.get(), copies, total_size_bytes)) {
+        runtime.CopyBuffer(staging, mirror.buffer.get(), copies);
+    }
+}
+
+BufferCache::Mirror& BufferCache::EnsureMirrorLocked(u64 first_block, u64 last_block) {
+    // Already covered by one committed mirror.
+    if (Mirror* mirror = FindMirrorLocked(first_block); mirror && last_block < mirror->committed_end) {
+        return *mirror;
+    }
+
+    // Mirrors whose committed range intersects the request (committed ranges never overlap).
+    std::vector<u64> absorbed;
+    for (auto it = mirrors.upper_bound(last_block); it != mirrors.begin();) {
+        --it;
+        const Mirror& mirror = *it->second;
+        if (mirror.committed_end <= first_block) {
+            break;
+        }
+        if (mirror.first_block <= last_block) {
+            absorbed.push_back(it->first);
+        }
+    }
+
+    // One mirror reaches back over the request and has reserved room: grow it in place.
+    if (absorbed.size() == 1) {
+        Mirror& mirror = *mirrors[absorbed.front()];
+        if (mirror.first_block <= first_block && last_block < mirror.capacity_end) {
+            if (last_block + 1 > mirror.committed_end) {
+                const u64 old_end = mirror.committed_end;
+                mirror.committed_end = last_block + 1;
+                BbLayer::GpuMemory::Get().RemoveMirror(mirror.first_block << BLOCK_SHIFT);
+                BbLayer::GpuMemory::Get().AddMirror(
+                    mirror.first_block << BLOCK_SHIFT,
+                    (mirror.committed_end - mirror.first_block) << BLOCK_SHIFT,
+                    mirror.buffer->Handle(), mirror.buffer->BufferDeviceAddress(), &mirror);
+                MapPageTableLocked(mirror, old_end, last_block);
+            }
+            return mirror;
+        }
+    }
+
+    // Merge every mirror that the new committed range will touch into one new mirror.
+    u64 new_first = first_block;
+    u64 new_last = last_block;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& [key, mirror] : mirrors) {
+            if (mirror->committed_end <= new_first || mirror->first_block > new_last) {
+                continue;
+            }
+            if (mirror->first_block < new_first) {
+                new_first = mirror->first_block;
+                changed = true;
+            }
+            if (mirror->committed_end - 1 > new_last) {
+                new_last = mirror->committed_end - 1;
+                changed = true;
+            }
+        }
+    }
+
+    std::vector<u64> merge_keys;
+    for (const auto& [key, mirror] : mirrors) {
+        if (mirror->committed_end > new_first && mirror->first_block <= new_last) {
+            merge_keys.push_back(key);
+        }
+    }
+
+    // Capacity: a modest surplus so sequential growth stays in place, capped at MAX_MIRROR_SIZE
+    // (a single larger binding still gets exactly what it needs).
+    constexpr u64 MAX_BLOCKS = u64{1} << (ADDRESS_SPACE_BITS - BLOCK_SHIFT);
+    const u64 need_blocks = new_last + 1 - new_first;
+    const u64 max_mirror_blocks = std::max<u64>(need_blocks, MAX_MIRROR_SIZE / BLOCK_SIZE);
+    const u64 extra =
+        std::min<u64>(std::max<u64>(need_blocks / 2, 32), max_mirror_blocks - need_blocks);
+    u64 capacity_blocks = std::min<u64>(need_blocks + extra, MAX_BLOCKS - new_first);
+
+    auto mirror = std::make_unique<Mirror>();
+    mirror->first_block = new_first;
+    mirror->committed_end = new_last + 1;
+    mirror->capacity_end = new_first + capacity_blocks;
+    mirror->buffer = std::make_shared<Buffer>(instance, new_first << BLOCK_SHIFT,
+                                              capacity_blocks << BLOCK_SHIFT,
+                                              MemoryType::DeviceLocal, "Mirror");
+    mirror_bytes += capacity_blocks << BLOCK_SHIFT;
+
+    // Move the current contents of the replaced mirrors into the new one.
+    for (const u64 key : merge_keys) {
+        Mirror& old = *mirrors[key];
+        const vk::BufferCopy copy{
+            .srcOffset = 0,
+            .dstOffset = (old.first_block - new_first) << BLOCK_SHIFT,
+            .size = (old.committed_end - old.first_block) << BLOCK_SHIFT,
+        };
+        runtime.CopyBuffer(old.buffer.get(), mirror->buffer.get(), std::span{&copy, 1});
+    }
+
+    for (const u64 key : merge_keys) {
+        const auto it = mirrors.find(key);
+        auto old = std::move(it->second);
+        mirror_bytes -= (old->capacity_end - old->first_block) << BLOCK_SHIFT;
+        BbLayer::GpuMemory::Get().RemoveMirror(key << BLOCK_SHIFT);
+        mirrors.erase(it);
+        RetireMirrorLocked(std::move(old));
+    }
+
+    Mirror& placed = *mirrors.emplace(new_first, std::move(mirror)).first->second;
+    BbLayer::GpuMemory::Get().AddMirror(
+        new_first << BLOCK_SHIFT, (new_last + 1 - new_first) << BLOCK_SHIFT,
+        placed.buffer->Handle(), placed.buffer->BufferDeviceAddress(), &placed);
+    MapPageTableLocked(placed, new_first, new_last);
+    return placed;
+}
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
@@ -329,23 +507,24 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         stream_buffer.Commit();
         return {&stream_buffer, offset};
     }
-    const u64 first_block = device_addr >> block_shift;
-    const u64 last_block = (device_addr + size - 1) >> block_shift;
-    const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
+    const u64 first_block = device_addr >> BLOCK_SHIFT;
+    const u64 last_block = (device_addr + size - 1) >> BLOCK_SHIFT;
     const u64 uploaded_before = BbStats::buffer_upload_bytes.load(std::memory_order_relaxed);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    std::scoped_lock lk{mirrors_mutex};
+    Mirror& mirror = EnsureMirrorLocked(first_block, last_block);
+    UploadMissingBlocksLocked(mirror, first_block, last_block);
+    SynchronizeMemoryLocked(mirror.buffer.get(), device_addr, size, is_written, is_texel_buffer);
     if (stats) {
         auto& region = Stats().regions[RegionKey(device_addr)];
-        ++region.arena_count;
-        region.arena_bytes += size;
+        ++region.mirror_count;
+        region.mirror_bytes += size;
         region.upload_bytes +=
             BbStats::buffer_upload_bytes.load(std::memory_order_relaxed) - uploaded_before;
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
-    return {arena, arena->Offset(device_addr)};
+    return {mirror.buffer.get(), device_addr - mirror.buffer->cpu_addr};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
@@ -394,127 +573,26 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
-    for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
-        const VAddr device_addr = range.start << block_shift;
-        const u64 size = (range.end - range.start) << block_shift;
-        SynchronizeMemory(address_space[page], device_addr, size, false, false);
-    }
-}
-
-const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
-    const u64 first_page = first_block >> blocks_per_arena_page_shift;
-    const u64 last_page = last_block >> blocks_per_arena_page_shift;
-    ASSERT_MSG(last_page - first_page <= 1,
-               "Buffer request cannot span more than two VA arena pages");
-
-    const auto* first_arena = address_space[first_page];
-    const auto* last_arena = address_space[last_page];
-    if (first_arena == last_arena) {
-        if (!first_arena) {
-            const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
-            const u64 num_pages = last_page - first_page + 1;
-            const auto* new_arena =
-                &arenas.emplace_back(instance, base_block << block_shift,
-                                     num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
-            address_space[first_page] = new_arena;
-            address_space[last_page] = new_arena;
+    std::scoped_lock lk{mirrors_mutex};
+    for (const auto& [key, mirror] : mirrors) {
+        if (mirror->committed_end <= mirror->first_block) {
+            continue;
         }
-        return address_space[first_page];
-    }
-
-    LOG_WARNING(Render, "Migrating arena");
-
-    const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << ARENA_PAGE_BITS);
-    const u64 first_size = first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE;
-    const u64 last_size = last_arena ? last_arena->size_bytes : ARENA_PAGE_SIZE;
-
-    const u64 base_block = first_addr >> block_shift;
-    const u64 total_size = first_size + last_size;
-    const u64 end_block = (first_addr + total_size) >> block_shift;
-    auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
-    auto* bind = BindsForArena(new_arena);
-    resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
-        const u64 start = std::max(base_block, backing.start);
-        const u64 end = std::min(end_block, backing.end);
-        bind->binds.push_back(vk::SparseMemoryBind{
-            .resourceOffset = (start - base_block) << block_shift,
-            .size = (end - start) << block_shift,
-            .memory = backing.memory,
-            .memoryOffset = backing.offset + ((start - backing.start) << block_shift),
-        });
-    });
-
-    u64 base_page = first_addr >> ARENA_PAGE_BITS;
-    for (u32 page = 0; page < (first_size >> ARENA_PAGE_BITS); ++page) {
-        address_space[base_page + page] = new_arena;
-    }
-    base_page = last_page;
-    for (u32 page = 0; page < (last_size >> ARENA_PAGE_BITS); ++page) {
-        address_space[base_page + page] = new_arena;
-    }
-    return new_arena;
-}
-
-void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
-    u32 resident_blocks{};
-    IntervalList bind_ranges;
-    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
-        resident_blocks += end - start;
-        bind_ranges.Add({start, end});
-    });
-
-    if (bind_ranges.Empty()) {
-        return;
-    }
-    BbStats::Timer timer{BbStats::t_resident};
-
-    const vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
-
-    boost::container::small_vector<vk::BufferCopy, 8> copies;
-    const auto staging =
-        staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
-
-    u64 memory_offset{};
-    ArenaBinds* binds = BindsForArena(arena);
-    auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
-    u64 offset = staging.offset;
-    for (const auto& range : bind_ranges) {
-        Backing backing;
-        backing.start = range.start;
-        backing.end = range.end;
-        backing.memory = device_memory;
-        backing.offset = memory_offset;
-        resident_ranges.Add(backing);
-
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
-
-        const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
-            .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
-            .size = (range.end - range.start) << block_shift,
-            .memory = device_memory,
-            .memoryOffset = memory_offset,
-        });
-        memory_offset += bind.size;
-
-        for (u32 block = 0; block < bind.size; block += block_size) {
-            *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
+        constexpr u64 ChunkSize = 16_MB;
+        VAddr addr = mirror->first_block << BLOCK_SHIFT;
+        u64 remaining = (mirror->committed_end - mirror->first_block) << BLOCK_SHIFT;
+        while (remaining > 0) {
+            const u64 size = std::min(remaining, ChunkSize);
+            SynchronizeMemoryLocked(mirror->buffer.get(), addr, static_cast<u32>(size), false,
+                                    false);
+            addr += size;
+            remaining -= size;
         }
-        const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
-        copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
-        offset += copy_size;
     }
-
-    staging.Flush();
-    runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
-bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
-                                    bool is_written, bool is_texel_buffer) {
+bool BufferCache::SynchronizeMemoryLocked(const Buffer* buffer, VAddr device_addr, u32 size,
+                                          bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const Buffer* src_buffer{};
@@ -524,18 +602,18 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copies.emplace_back(total_size_bytes, addr, size);
             total_size_bytes += size;
         },
-        [&] { src_buffer = UploadCopies(arena, copies, total_size_bytes); });
+        [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
     if (src_buffer) {
-        runtime.CopyBuffer(src_buffer, arena, copies);
+        runtime.CopyBuffer(src_buffer, buffer, copies);
     }
     if (is_texel_buffer && !is_written) {
-        return SynchronizeMemoryFromImage(arena, device_addr, size);
+        return SynchronizeMemoryFromImage(buffer, device_addr, size);
     }
     return false;
 }
 
-const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
+const Buffer* BufferCache::UploadCopies(const Buffer* buffer, std::span<vk::BufferCopy> copies,
                                         size_t total_size_bytes) {
     if (copies.empty()) {
         return nullptr;
@@ -557,7 +635,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
                 .extra = reinterpret_cast<u64>(staging.buffer),
             });
             copy.srcOffset += staging.offset;
-            copy.dstOffset -= arena->cpu_addr;
+            copy.dstOffset -= buffer->cpu_addr;
         }
         return staging.buffer;
     }
@@ -585,7 +663,7 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
             group->push_back({copy.dstOffset, staging.mapped + copy.srcOffset, copy.size});
             group_bytes += copy.size;
             copy.srcOffset += staging.offset;
-            copy.dstOffset -= arena->cpu_addr;
+            copy.dstOffset -= buffer->cpu_addr;
             if (group_bytes >= 1_MB) {
                 launch();
                 group = std::make_shared<Group>();
@@ -610,17 +688,17 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
     }
     for (auto& copy : copies) {
         copy.srcOffset += staging.offset;
-        copy.dstOffset -= arena->cpu_addr;
+        copy.dstOffset -= buffer->cpu_addr;
     }
     staging.Flush();
     return staging.buffer;
 }
 
-bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+bool BufferCache::SynchronizeMemoryFromImage(const Buffer* buffer, VAddr device_addr, u32 size) {
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
-            runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
+            runtime.FillBuffer(buffer, buffer->Offset(device_addr), size, ZmaskUncompressed);
             return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
@@ -645,14 +723,14 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
                image.info.guest_address);
-    const u64 arena_offset = arena->Offset(device_addr);
+    const u64 buffer_offset = buffer->Offset(device_addr);
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
         const auto& mip_info = image.info.mips_layout[mip];
         const u32 width = std::max(image.info.size.width >> mip, 1u);
         const u32 height = std::max(image.info.size.height >> mip, 1u);
         const u32 depth = std::max(image.info.size.depth >> mip, 1u);
-        if (arena_offset + mip_info.offset + mip_info.size > arena->size_bytes) {
+        if (buffer_offset + mip_info.offset + mip_info.size > buffer->size_bytes) {
             break;
         }
         buffer_copies.push_back(vk::BufferImageCopy{
@@ -673,47 +751,8 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
-    tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
+    tile_manager.TileImage(image, buffer_copies, buffer, buffer_offset);
     return true;
-}
-
-void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
-    if (pending_binds.empty()) {
-        return;
-    }
-
-    std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
-    buffer_binds.reserve(pending_binds.size());
-
-    for (const auto& binds : pending_binds) {
-        buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
-            .buffer = binds.arena->Handle(),
-            .bindCount = static_cast<u32>(binds.binds.size()),
-            .pBinds = binds.binds.data(),
-        });
-    }
-
-    const u64 signal_tick = memory_semaphore.NextTick();
-    const auto signal_sema = memory_semaphore.Handle();
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .signalSemaphoreValueCount = 1u,
-        .pSignalSemaphoreValues = &signal_tick,
-    };
-
-    const vk::BindSparseInfo sparse_info = {
-        .pNext = &timeline_si,
-        .bufferBindCount = static_cast<u32>(buffer_binds.size()),
-        .pBufferBinds = buffer_binds.data(),
-        .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &signal_sema,
-    };
-
-    info.AddWait(signal_sema, signal_tick);
-    auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
-
-    pending_binds.clear();
 }
 
 } // namespace VideoCore

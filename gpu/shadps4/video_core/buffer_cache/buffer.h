@@ -32,7 +32,6 @@ enum class MemoryType : u8 {
     HostUncached, ///< Requires a host visible memory type optimized for CPU to GPU uploads
     HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
     Stream,       ///< Requests device local host visible buffer, falling back host memory.
-    Sparse,       ///< Requires an unbacked sparse resident buffer.
 };
 
 constexpr vk::BufferUsageFlags ReadFlags =
