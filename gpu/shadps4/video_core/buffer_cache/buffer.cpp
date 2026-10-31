@@ -26,6 +26,8 @@ std::string_view BufferTypeName(MemoryType type) {
         return "Stream";
     case MemoryType::DeviceLocal:
         return "DeviceLocal";
+    case MemoryType::Sparse:
+        return "Sparse";
     default:
         return "Invalid";
     }
@@ -110,25 +112,31 @@ void UniqueBuffer::Destroy() {
 void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                           VmaAllocationInfo* out_alloc_info) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
-    const VmaAllocationCreateFlags bda_flag =
-        with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
-    const VmaAllocationCreateInfo alloc_ci = {
-        .flags =
-            VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
-        .usage = MemoryUsageVma(mem_type),
-        .requiredFlags = 0,
-        .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type),
-        .pool = VK_NULL_HANDLE,
-        .pUserData = nullptr,
-    };
+    if (mem_type != MemoryType::Sparse) {
+        const VmaAllocationCreateFlags bda_flag =
+            with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+        const VmaAllocationCreateInfo alloc_ci = {
+            .flags =
+                VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
+            .usage = MemoryUsageVma(mem_type),
+            .requiredFlags = 0,
+            .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type),
+            .pool = VK_NULL_HANDLE,
+            .pUserData = nullptr,
+        };
 
-    const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
-    VkBuffer unsafe_buffer{};
-    VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
-                                      &allocation, out_alloc_info);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
-               vk::to_string(vk::Result{result}));
-    buffer = vk::Buffer{unsafe_buffer};
+        const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
+        VkBuffer unsafe_buffer{};
+        VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                          &allocation, out_alloc_info);
+        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
+                   vk::to_string(vk::Result{result}));
+        buffer = vk::Buffer{unsafe_buffer};
+    } else {
+        buffer_ci.flags |=
+            vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+        buffer = Vulkan::Check(device.createBuffer(buffer_ci));
+    }
 
     if (with_bda) {
         const vk::BufferDeviceAddressInfo bda_info = {
@@ -160,12 +168,15 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         Vulkan::SetObjectName(device, Handle(), "Buffer {:#x}:{:#x}", cpu_addr, size_bytes);
     }
 
-    VkMemoryPropertyFlags property_flags{};
-    vmaGetAllocationMemoryProperties(instance.GetAllocator(), buffer.allocation, &property_flags);
-    if (alloc_info.pMappedData) {
-        mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
+    if (mem_type != MemoryType::Sparse) {
+        VkMemoryPropertyFlags property_flags{};
+        vmaGetAllocationMemoryProperties(instance.GetAllocator(), buffer.allocation,
+                                         &property_flags);
+        if (alloc_info.pMappedData) {
+            mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
+        }
+        is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     }
-    is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 }
 
 void Buffer::Flush(u64 offset, u64 size) {

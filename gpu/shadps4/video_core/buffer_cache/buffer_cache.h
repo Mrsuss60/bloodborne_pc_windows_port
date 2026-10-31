@@ -5,15 +5,15 @@
 
 #include "bbport_copy.h"
 
-#include <map>
-#include <memory>
-#include <mutex>
+#include <deque>
+#include <boost/container/small_vector.hpp>
 
+#include "common/interval_set.h"
 #include "common/types.h"
-#include "layer/bblayer_gpu_memory.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -41,11 +41,7 @@ class BufferCache {
     static constexpr u64 ARENA_PAGE_BITS = 32;
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
     static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
-    /// Fixed 16 KiB blocks for the BDA page table and the mirrors (upstream 0.7's granularity).
-    static constexpr u32 BLOCK_SHIFT = 14;
-    static constexpr u64 BLOCK_SIZE = u64{1} << BLOCK_SHIFT;
-    /// A mirror never grows past this (unless one binding needs more in a single range).
-    static constexpr u64 MAX_MIRROR_SIZE = 64_MB;
+    static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
 
 public:
     /// Read-only bindings up to this size are copied into a stream buffer (bbport: public for
@@ -81,9 +77,9 @@ public:
         return stream_buffer;
     }
 
-    /// Returns minimum granularity of a page table (and mirror) block.
+    /// Returns minimum granularity of a sparse memory bind.
     u32 GetSparsePageShift() const noexcept {
-        return BLOCK_SHIFT;
+        return block_shift;
     }
 
     /// Invalidates any buffer in the logical page range.
@@ -115,47 +111,40 @@ public:
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
+    /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
+    void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
+
 private:
-    /// A dense device-local copy of a run of guest blocks. `buffer` is allocated for the whole
-    /// capacity; only [first_block, committed_end) is mapped in the page table and valid.
-    struct Mirror {
-        /// Shared so a download can keep the buffer alive after a merge retires it.
-        std::shared_ptr<Buffer> buffer;
-        u64 first_block{};
-        u64 committed_end{};
-        u64 capacity_end{};
+    struct ArenaBinds {
+        const Buffer* arena;
+        boost::container::small_vector<vk::SparseMemoryBind, 32> binds;
     };
 
-    /// The mirror committed over `block`, or null (caller holds mirrors_mutex).
-    Mirror* FindMirrorLocked(u64 block);
+    ArenaBinds* BindsForArena(const Buffer* arena) {
+        auto it = std::ranges::find(pending_binds, arena, &ArenaBinds::arena);
+        if (it != pending_binds.end()) {
+            return std::addressof(*it);
+        }
+        return &pending_binds.emplace_back(arena);
+    }
 
-    /// Makes [first_block, last_block] covered by one committed mirror (allocating, growing or
-    /// merging as needed) and maps its blocks in the BDA page table.
-    Mirror& EnsureMirrorLocked(u64 first_block, u64 last_block);
-    /// Uploads the guest data of every block of [first_block, last_block] that has never been
-    /// populated in a mirror.
-    void UploadMissingBlocksLocked(Mirror& mirror, u64 first_block, u64 last_block);
-    /// Points the BDA page table entries of [first_block, last_block] at `mirror`.
-    void MapPageTableLocked(const Mirror& mirror, u64 first_block, u64 last_block);
-    /// Schedules the buffers of retired mirrors for destruction once the GPU is past this tick.
-    void RetireMirrorLocked(std::unique_ptr<Mirror> mirror);
+    const Buffer* GetArena(u64 first_block, u64 last_block);
 
-    /// Downloads GPU-modified data of one mirror. The buffer is kept alive by the shared_ptr and
-    /// no lock is held (a download waits for the GPU).
-    void DownloadMemory(const std::shared_ptr<Buffer>& buffer, VAddr mirror_base,
-                        VAddr mirror_end, VAddr device_addr, u64 size);
+    void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    bool SynchronizeMemoryLocked(const Buffer* buffer, VAddr device_addr, u32 size,
-                                 bool is_written, bool is_texel_buffer);
+    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+
+    bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
+                           bool is_texel_buffer);
 
     /// bbport: batched small copies on the copy threads (BbCopy::QueueCopy).
     static void RunGuestCopy(const BbCopy::Item& item);
     void SmallGuestCopy(const BbCopy::Item& item);
 
-    const Buffer* UploadCopies(const Buffer* buffer, std::span<vk::BufferCopy> copies,
+    const Buffer* UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
                                size_t total_size_bytes);
 
-    bool SynchronizeMemoryFromImage(const Buffer* buffer, VAddr device_addr, u32 size);
+    bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -181,11 +170,28 @@ private:
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
 
-    /// Guards the mirror map and the page table writes that go with it. ObtainBuffer runs on the
-    /// draw/recording threads; the GPU command thread only reads mirrors (downloads).
-    std::mutex mirrors_mutex;
-    std::map<u64, std::unique_ptr<Mirror>> mirrors;
-    u64 mirror_bytes{}; ///< Bytes allocated for mirrors (diagnostics).
+    std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
+    std::deque<Buffer> arenas;
+    std::vector<ArenaBinds> pending_binds;
+    Vulkan::Semaphore memory_semaphore;
+
+    struct Backing : public Interval {
+        vk::DeviceMemory memory;
+        u64 offset;
+        constexpr bool CanMergeWith(const Backing& other) const noexcept {
+            return memory == other.memory && offset + (end - start) == other.offset;
+        }
+        constexpr Backing SubRange(u64 a, u64 b) const noexcept {
+            return {{a, b}, memory, offset + (a - start)};
+        }
+    };
+    IntervalList<Backing> resident_ranges;
+
+    u32 arena_memory_type_index{};
+    u32 block_size{};
+    u32 block_shift{};
+    u32 blocks_per_arena_page{};
+    u32 blocks_per_arena_page_shift{};
 };
 
 } // namespace VideoCore

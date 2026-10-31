@@ -138,12 +138,6 @@ public:
         return maintenance_6;
     }
 
-    /// Returns true if buffer device addresses (VK_KHR_buffer_device_address) are available;
-    /// the BDA page table and the in-shader guest memory path need them.
-    bool IsBufferDeviceAddressSupported() const {
-        return vk12_features.bufferDeviceAddress;
-    }
-
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;

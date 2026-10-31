@@ -76,8 +76,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
-    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo&) {
+    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
+        buffer_cache.SubmitPendingArenaBinds(info);
     });
 }
 
