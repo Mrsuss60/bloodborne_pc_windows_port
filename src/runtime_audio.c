@@ -15,7 +15,6 @@
 #include <SDL3/SDL.h>
 #ifdef _WIN32
 #include <windows.h>
-#include <mmsystem.h>
 #endif
 
 #define PORTS 25
@@ -59,21 +58,6 @@ uint64_t runtime_audio_get_underruns(void) { return g_audio_underruns; }
 static uint64_t now_ns(void) { return host_monotonic_ns(); }
 static void sleep_until(uint64_t deadline) { host_sleep_until_ns(deadline); }
 
-/* C1-continuous soft-knee limiter: linear in [-0.8, 0.8] with unit slope at the knee,
- * smoothly saturating toward [-1.0, 1.0] for loud peaks without waveform discontinuities. */
-static inline float soft_clip(float x) {
-    const float knee = 0.8f, headroom = 0.2f;
-    if (x > knee) {
-        float excess = x - knee;
-        return knee + (headroom * excess) / (headroom + excess);
-    }
-    if (x < -knee) {
-        float excess = -x - knee;
-        return -knee - (headroom * excess) / (headroom + excess);
-    }
-    return x;
-}
-
 static int sdl_audio(void) {
     if (sdl_ready<0) {
         const char *mode=getenv("BB_AUDIO");
@@ -105,11 +89,6 @@ static Port *port_of(int32_t handle, int32_t *error) {
 static ABI int32_t audio_init(void) {
     host_lock(&table_lock);
     int32_t r=initialized ? ERR_ALREADY_INIT : 0;
-    if (!initialized) {
-#ifdef _WIN32
-        timeBeginPeriod(1);
-#endif
-    }
     initialized=1;
     host_unlock(&table_lock);
     return r;
@@ -190,80 +169,21 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
     Port *p=port_of(handle,&error);
     host_unlock(&table_lock);
     if (!p) return error;
-#ifdef _WIN32
-    static _Thread_local int s_audio_prio_set=0;
-    if (!s_audio_prio_set) {
-        /* Use THREAD_PRIORITY_HIGHEST: avoids starvation of Haswell 4C/4T CPU while maintaining low latency */
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-        s_audio_prio_set=1;
-    }
-#endif
     host_lock(&p->lock);
     size_t samples=(size_t)p->frames*(size_t)p->channels, bytes=samples*(size_t)p->sample_bytes;
     uint64_t period=(uint64_t)p->frames*1000000000u/48000u;
     if (data) {
-        /* Apply per-channel volume, channel remap, and soft-knee saturation to prevent harsh clipping */
+        /* Apply per-channel volume and map PS4 8ch (L R C LFE SL SR BL BR) to SDL 7.1 order. */
         unsigned char converted[2048*8*4];
         static const int remap[8]={0,1,2,3,6,7,4,5};
-        static float audio_boost = -1.0f;
-        if (audio_boost < 0.0f) {
-            const char *env = getenv("BB_AUDIO_BOOST");
-            audio_boost = env ? (float)atof(env) : 1.40f;
-            if (audio_boost < 0.1f) audio_boost = 0.1f;
-            else if (audio_boost > 4.0f) audio_boost = 4.0f;
-        }
-        float master_gain = ((p->channels==8) ? 0.75f : 1.25f) * audio_boost;
         for (size_t f=0;f<(size_t)p->frames;++f) for (int c=0;c<p->channels;++c) {
             int target=p->channels==8 && !p->std_layout ? remap[c] : c;
             size_t from=f*(size_t)p->channels+(size_t)c, to=f*(size_t)p->channels+(size_t)target;
-            float gain=((float)p->volume[c]/VOLUME_0DB)*master_gain;
-            if (p->is_float) {
-                float v; memcpy(&v,(const char *)data+from*4,4);
-                v*=gain;
-                v=soft_clip(v);
-                memcpy(converted+to*4,&v,4);
-            } else {
-                int16_t v; memcpy(&v,(const char *)data+from*2,2);
-                float fv=((float)v/32768.0f)*gain;
-                fv=soft_clip(fv);
-                int32_t iv=(int32_t)(fv*32767.0f);
-                if (iv>32767) iv=32767; else if (iv<-32768) iv=-32768;
-                int16_t sv=(int16_t)iv;
-                memcpy(converted+to*2,&sv,2);
-            }
+            float gain=(float)p->volume[c]/VOLUME_0DB;
+            if (p->is_float) { float v; memcpy(&v,(const char *)data+from*4,4); v*=gain; memcpy(converted+to*4,&v,4); }
+            else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
         }
         if (p->dump) fwrite(converted,1,bytes,p->dump);
-
-        if (pace) {
-            uint64_t now=now_ns();
-            if (!p->next_deadline_ns || now>p->next_deadline_ns+8*period) p->next_deadline_ns=now; /* start or stall: restart cadence */
-            else sleep_until(p->next_deadline_ns);
-            p->next_deadline_ns+=period;
-        }
-
-        if (p->stream) {
-            /* Steer the SDL queue against hardware device rate. Only prefill silence when the
-             * stream has completely drained (queued == 0); injecting silence while samples are
-             * still queued splices zeros into an active waveform and causes audible pops. */
-            int low=2*(int)bytes;
-            int queued=SDL_GetAudioStreamQueued(p->stream);
-            if (queued==0) {
-                if (buffers_out>0) ++g_audio_underruns;
-                static const unsigned char silence[2048*8*4];
-                if ((int)bytes<=(int)sizeof(silence)) {
-                    SDL_PutAudioStreamData(p->stream,silence,(int)bytes);
-                }
-                queued=low;
-            }
-            if (!p->window_count || queued<p->window_min) p->window_min=queued;
-            if (++p->window_count>=32) {
-                p->adjust_ns=p->window_min>low+2*(int)bytes ? (int64_t)(period/32) :
-                             p->window_min<low ? -(int64_t)(period/32) : 0;
-                p->window_count=0;
-            }
-            p->next_deadline_ns+=(uint64_t)p->adjust_ns;
-            SDL_PutAudioStreamData(p->stream,converted,(int)bytes);
-        }
 
         if (p->stats) {
             uint64_t now=now_ns();
@@ -281,6 +201,41 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
                        p->stat_min_queued,p->stat_starved);
                 p->stat_start_ns=now; p->stat_max_gap_ns=0; p->stat_starved=0; p->stat_buffers=0; p->stat_min_queued=1<<30;
             }
+        }
+
+        if (pace) {
+            uint64_t now=now_ns();
+            if (!p->next_deadline_ns || now>p->next_deadline_ns+8*period) p->next_deadline_ns=now; /* start or stall: restart cadence */
+            else sleep_until(p->next_deadline_ns);
+            p->next_deadline_ns+=period;
+        }
+
+        if (p->stream) {
+            /* The device drains the queue in quanta (typically 10-21 ms), so the level
+               is a sawtooth: its minimum over ~32 buffers is what gets controlled. */
+#ifdef _WIN32
+            int low=4*(int)bytes; /* ~21 ms headroom for WASAPI's 10-20 ms hardware buffer */
+#else
+            int low=2*(int)bytes;
+#endif
+            int queued=SDL_GetAudioStreamQueued(p->stream);
+            if (queued<(int)bytes) {
+                if (buffers_out>0) ++g_audio_underruns;
+                static const unsigned char silence[2048*8*4];
+                int fill=low-queued<(int)bytes ? low-queued : (int)bytes;
+                if (fill>0 && fill<=(int)sizeof(silence)) {
+                    SDL_PutAudioStreamData(p->stream,silence,fill);
+                }
+                queued=low;
+            }
+            if (!p->window_count || queued<p->window_min) p->window_min=queued;
+            if (++p->window_count==32) {
+                p->adjust_ns=p->window_min>low+2*(int)bytes ? (int64_t)(period/32) :
+                             p->window_min<low ? -(int64_t)(period/32) : 0;
+                p->window_count=0;
+            }
+            p->next_deadline_ns+=(uint64_t)p->adjust_ns;
+            SDL_PutAudioStreamData(p->stream,converted,(int)bytes);
         }
         ++buffers_out;
     }
