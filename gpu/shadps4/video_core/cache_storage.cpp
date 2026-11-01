@@ -115,7 +115,7 @@ void DataBase::Open() {
                      std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip");
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
-                                     MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
+                                     MZ_ZIP_FLAG_WRITE_ALLOW_READING) ||
             !mz_zip_validate_archive(&zip_ar, 0)) {
             LOG_INFO(Render, "Cache archive {} is not found or archive is corrupted",
                      cache_path.string().c_str());
