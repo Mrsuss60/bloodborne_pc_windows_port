@@ -28,7 +28,7 @@ LOG_KEEP = 20
 SETTINGS_FILE = APP_DIR / "bblauncher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
-LAUNCHER_VERSION = "0.7.2"
+LAUNCHER_VERSION = "0.8.0"
 
 
 def build_stamp() -> str:
