@@ -42,6 +42,7 @@ from bblauncher_UI import STYLE_SHEET, LauncherUI, WheelGuard, apply_dwm_styling
 from bblauncher_Utils import (
     ANISO_CHOICES,
     APP_DIR,
+    ASYNC_PIPELINE_CHOICES,
     DEFAULT_GAME,
     DEFAULT_SETTINGS,
     EFFECT_CHOICES,
@@ -277,6 +278,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "anti_aliasing": self.cmb_aa.currentText(),
                 "gpu": self.cmb_gpu.currentData() or "",
                 "language": self.cmb_lang.currentData() or "1",
+                "async_pipelines": self.cmb_async_pipelines.currentData() or "auto",
                 "feat_upscaler": self.chk_fsr.isChecked() and upscaler_choice != "Off",
                 "upscaler_model": upscaler_choice,
                 "feat_overlay": True,
@@ -1001,6 +1003,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "output_res": output_res_val,
                 "effect_game_aa": effect_game_aa,
                 "prep_workers": prep_workers_val,
+                "async_pipelines": self.cmb_async_pipelines.currentData() or "auto",
                 "gpu": self.cmb_gpu.currentData() or "",
                 "live_resolution": self.cmb_live_res.currentData() or "0",
                 "sharpen": "1" if self.chk_sharpen.isChecked() else "0",
@@ -1296,6 +1299,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self._set_check(self.chk_fsr, upscaler_value != "off")
         self._set_combo_data(self.cmb_preset, ini_opts.get("preset", "1"))
         self._set_combo_data(self.cmb_live_res, ini_opts.get("live_resolution", "0").strip().lower())
+        self._set_combo_data(self.cmb_async_pipelines, ini_opts.get("async_pipelines", "auto").strip().lower())
         self._set_combo_data(self.cmb_hud_quadrant, ini_opts.get("hud_quadrant", "0"))
         self._set_combo_data(self.cmb_debug_view, ini_opts.get("debug_view", "0"))
         self._set_combo_data(self.cmb_model_lod, ini_opts.get("model_lod", "0"))
@@ -1752,6 +1756,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             env["BB_PREP_WORKERS"] = prep_val
         else:
             env.pop("BB_PREP_WORKERS", None)
+
+        async_mapping = {c[0]: c[1] for c in ASYNC_PIPELINE_CHOICES}
+        raw_async = cfg.get("async_pipelines", "auto")
+        async_val = async_mapping.get(raw_async, raw_async)
+        if async_val and async_val != "auto":
+            env["BB_ASYNC_PIPELINES"] = str(async_val)
+        else:
+            env.pop("BB_ASYNC_PIPELINES", None)
 
         chosen_gpu = cfg.get("gpu", "")
         if chosen_gpu and "BB_GPU_ID" not in os.environ:

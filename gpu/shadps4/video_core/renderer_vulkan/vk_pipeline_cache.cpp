@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_set>
 
+#include "bbport_settings.h"
 #include "bbport_threads.h"
 #include "bbport_toggles.h"
 
@@ -383,13 +384,24 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCompiler& PipelineCache::GetCompiler() {
     if (!compiler) {
-        const char* env = std::getenv("BB_ASYNC_PIPELINE_THREADS");
+        const char* env_threads = std::getenv("BB_ASYNC_PIPELINE_THREADS");
+        const char* env_async = std::getenv("BB_ASYNC_PIPELINES");
+        const int cfg_val = BbSettings::Get().async_pipelines.load();
         const u32 concurrency = std::thread::hardware_concurrency();
         const u32 default_threads = concurrency <= 8 ? std::max(1u, concurrency / 4) : std::clamp(concurrency / 2, 2u, 8u);
-        const u32 threads = env && *env ? u32(std::strtoul(env, nullptr, 10)) : default_threads;
+        u32 threads = default_threads;
+        if (env_threads && *env_threads) {
+            threads = u32(std::strtoul(env_threads, nullptr, 10));
+        } else if (env_async && *env_async && env_async[0] != '0') {
+            const u32 parsed = u32(std::strtoul(env_async, nullptr, 10));
+            if (parsed > 1) {
+                threads = parsed;
+            }
+        } else if (cfg_val > 0) {
+            threads = u32(cfg_val);
+        }
         compiler = std::make_unique<PipelineCompiler>(std::max(threads, 1u));
-        std::printf("GPU: new pipelines of passes drawn every frame compile on %u threads "
-                    "(BB_ASYNC_PIPELINES=0: on the GPU thread, the game waits)\n",
+        std::printf("GPU: async pipeline compiler active on %u worker threads (BB_ASYNC_PIPELINES=0: disable)\n",
                     std::max(threads, 1u));
     }
     return *compiler;
@@ -684,7 +696,14 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
     // scene's, the output's) missed most passes: many set a 16384 scissor.
     static const bool enabled = [] {
         const char* env = std::getenv("BB_ASYNC_PIPELINES");
-        return !(env && env[0] == '0');
+        if (env) {
+            return env[0] != '0';
+        }
+        const int cfg_val = BbSettings::Get().async_pipelines.load();
+        if (cfg_val == 0) {
+            return false;
+        }
+        return true;
     }();
     if (!enabled || !instance.IsVertexInputDynamicState() || !selection.regs) {
         return false;

@@ -193,6 +193,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.max_dt_hz = std::clamp(i, 10, 240);
     } else if (key == "prep_workers") {
         v.prep_workers = value == "auto" ? -1 : std::clamp(i, 0, 16);
+    } else if (key == "async_pipelines") {
+        v.async_pipelines = value == "auto" ? -1 : std::clamp(i, 0, 16);
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "language") {
@@ -293,6 +295,7 @@ void Load() {
         {"BB_HUD", "show_hud"},                     {"BB_HUD_QUADRANT", "hud_quadrant"},
         {"BB_HUD_OPACITY", "hud_opacity"},          {"BB_HUD_SCALE", "hud_scale"},
         {"BB_PREP_WORKERS", "prep_workers"},
+        {"BB_ASYNC_PIPELINES", "async_pipelines"},
         {"BB_FPS", "target_fps"},                   {"BB_LIVE_FPS", "live_fps"},
         {"BB_TARGET_FPS", "target_fps"},            {"BB_MAX_DT_HZ", "max_dt_hz"},
         {"BB_LANG", "language"},
@@ -310,6 +313,7 @@ void Load() {
     }
     v.startup_model_lod = v.model_lod;
     v.startup_prep_workers = v.prep_workers;
+    v.startup_async_pipelines = v.async_pipelines;
     v.startup_output_res = v.output_res;
     v.startup_live_resolution = v.live_resolution;
 }
@@ -439,6 +443,11 @@ void Save() {
         std::fprintf(file, "prep_workers=auto\n");
     } else {
         std::fprintf(file, "prep_workers=%d\n", v.prep_workers.load());
+    }
+    if (v.async_pipelines < 0) {
+        std::fprintf(file, "async_pipelines=auto\n");
+    } else {
+        std::fprintf(file, "async_pipelines=%d\n", v.async_pipelines.load());
     }
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"

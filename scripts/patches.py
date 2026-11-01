@@ -88,6 +88,23 @@ def intel_tonemap_fix(env=os.environ, cpuinfo='/proc/cpuinfo'):
     return forced=='1' if forced in ('0','1') else intel_cpu(cpuinfo)
 
 # model_lod: -2 highest, 0 the game's, 1 lower, 2 lowest.
+# The title's PLAY ONLINE / PLAY OFFLINE dialog: the port has no PSN, the game goes straight to the
+# main menu offline. Hardcoded toggle in code, skipped by default (SKIP_NETWORK_CHOICE_DEFAULT = True).
+# Set SKIP_NETWORK_CHOICE_DEFAULT = False, or set BB_SKIP_NETWORK_CHOICE=0 / bbport.ini skip_network_choice=0
+# to show the online / offline choice dialog.
+SKIP_NETWORK_CHOICE = 'Skip Online/Offline Choice'
+SKIP_NETWORK_CHOICE_DEFAULT = True
+
+
+def skip_network_choice(env=os.environ, settings=None):
+    forced = env.get('BB_SKIP_NETWORK_CHOICE')
+    if forced is not None:
+        return forced not in ('0', 'off', 'false', 'False')
+    if settings and 'skip_network_choice' in settings:
+        return settings['skip_network_choice'] not in ('0', 'off', 'false', 'False')
+    return SKIP_NETWORK_CHOICE_DEFAULT
+
+
 MODEL_LOD={'-2':'Model LOD -2 (Highest)','1':'Model LOD 1 (Lower)','2':'Model LOD 2 (Lowest)'}
 
 
@@ -334,6 +351,11 @@ def main():
     raw_names += [n for n in effect_patches(read_settings(a.settings)) if n not in raw_names]
     if intel_tonemap_fix() and INTEL_TONEMAP not in raw_names:
         raw_names.append(INTEL_TONEMAP)
+    settings = read_settings(a.settings)
+    if skip_network_choice(settings=settings) and SKIP_NETWORK_CHOICE not in raw_names:
+        raw_names.append(SKIP_NETWORK_CHOICE)
+    elif not skip_network_choice(settings=settings) and SKIP_NETWORK_CHOICE in raw_names:
+        raw_names.remove(SKIP_NETWORK_CHOICE)
     names = []
     for n in raw_names:
         if n not in names:

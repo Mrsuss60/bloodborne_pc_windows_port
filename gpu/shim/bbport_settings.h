@@ -113,6 +113,7 @@ struct Values {
     std::atomic<bool> cheats[CheatSlotCount]{};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> prep_workers{-1}; ///< -1 default (Available/2), 0 off, 1..16 explicit workers
+    std::atomic<int> async_pipelines{-1}; ///< -1 default (auto), 0 off (sync on GPU thread), 1..16 workers
     /// Live engine clock (probe.c hook). live_fps/target_fps/max_dt_hz persist; the rest is
     /// runtime status for the overlay.
     std::atomic<bool> live_fps{true};
@@ -142,6 +143,7 @@ struct Values {
     bool startup_effects[EffectCount]{};
     int startup_model_lod = 0;
     int startup_prep_workers = -1;
+    int startup_async_pipelines = -1;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
 };

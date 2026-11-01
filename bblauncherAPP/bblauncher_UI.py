@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from bblauncher_Utils import (
     AA_CHOICES,
     ANISO_CHOICES,
+    ASYNC_PIPELINE_CHOICES,
     CONTENT_SKU_CHOICES,
     DEBUG_VIEW_CHOICES,
     DEFAULT_GAME,
@@ -1454,7 +1455,26 @@ class LauncherUI:
         self.cmb_gpu.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
         grid_disp.addWidget(self.cmb_gpu, 4, 1)
 
-        grid_disp.addWidget(QLabel("Game Text Language:"), 4, 2)
+        grid_disp.addWidget(QLabel("Live Resolution:"), 4, 2)
+        self.cmb_live_res = QComboBox()
+        for label, value in LIVE_RES_CHOICES:
+            self.cmb_live_res.addItem(label, value)
+        live_idx = self.cmb_live_res.findData(ini_opts.get("live_resolution", "0").strip().lower())
+        self.cmb_live_res.setCurrentIndex(live_idx if live_idx >= 0 else 0)
+        self.cmb_live_res.currentIndexChanged.connect(lambda: self.save_bbport_ini())
+        grid_disp.addWidget(self.cmb_live_res, 4, 3)
+
+        grid_disp.addWidget(QLabel("Async Pipelines:"), 5, 0)
+        self.cmb_async_pipelines = QComboBox()
+        for label, value in ASYNC_PIPELINE_CHOICES:
+            self.cmb_async_pipelines.addItem(label, value)
+        cur_async = str(ini_opts.get("async_pipelines", self.settings.get("async_pipelines", "auto"))).strip().lower()
+        async_idx = self.cmb_async_pipelines.findData(cur_async)
+        self.cmb_async_pipelines.setCurrentIndex(async_idx if async_idx >= 0 else 0)
+        self.cmb_async_pipelines.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_async_pipelines, 5, 1)
+
+        grid_disp.addWidget(QLabel("Game Text Language:"), 5, 2)
         self.cmb_lang = QComboBox()
         for label, code in LANGUAGE_CHOICES:
             self.cmb_lang.addItem(label, code)
@@ -1462,16 +1482,7 @@ class LauncherUI:
         lang_idx = next((i for i, (_, c) in enumerate(LANGUAGE_CHOICES) if c == cur_lang), 0)
         self.cmb_lang.setCurrentIndex(lang_idx)
         self.cmb_lang.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
-        grid_disp.addWidget(self.cmb_lang, 4, 3)
-
-        grid_disp.addWidget(QLabel("Live Resolution:"), 5, 0)
-        self.cmb_live_res = QComboBox()
-        for label, value in LIVE_RES_CHOICES:
-            self.cmb_live_res.addItem(label, value)
-        live_idx = self.cmb_live_res.findData(ini_opts.get("live_resolution", "0").strip().lower())
-        self.cmb_live_res.setCurrentIndex(live_idx if live_idx >= 0 else 0)
-        self.cmb_live_res.currentIndexChanged.connect(lambda: self.save_bbport_ini())
-        grid_disp.addWidget(self.cmb_live_res, 5, 1, 1, 3)
+        grid_disp.addWidget(self.cmb_lang, 5, 3)
 
         l_disp.addLayout(grid_disp)
 

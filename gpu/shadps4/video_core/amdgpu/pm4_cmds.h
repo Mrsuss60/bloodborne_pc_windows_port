@@ -259,6 +259,7 @@ struct PM4CmdStrmoutBufferUpdate {
     union {
         BitField<0, 1, u32> update_memory;
         BitField<1, 2, SourceSelect> source_select;
+        BitField<7, 1, u32> data_type;
         BitField<8, 2, u32> buffer_select;
         u32 control;
     };
@@ -277,13 +278,13 @@ struct PM4CmdStrmoutBufferUpdate {
     template <typename T = u64>
     T DstAddress() const {
         ASSERT(update_memory.Value() == 1);
-        return reinterpret_cast<T>(dst_address_lo.Value() | u64(dst_address_hi & 0xFFFF) << 32);
+        return reinterpret_cast<T>((dst_address_lo.Value() << 2) | u64(dst_address_hi & 0xFFFF) << 32);
     }
 
     template <typename T = u64>
     T SrcAddress() const {
         ASSERT(source_select.Value() == SourceSelect::SrcAddress);
-        return reinterpret_cast<T>(src_address_lo.Value() | u64(src_address_hi & 0xFFFF) << 32);
+        return reinterpret_cast<T>((src_address_lo.Value() << 2) | u64(src_address_hi & 0xFFFF) << 32);
     }
 };
 
@@ -1240,5 +1241,31 @@ struct PM4CmdCondExec {
                                                                           << 2);
     }
 };
+
+struct PM4CmdGetLodStats {
+    PM4Type3Header header;
+    union {
+        BitField<0, 16, u32> data_offset;
+        BitField<16, 16, u32> control_flags;
+        u32 control;
+    };
+    u32 addr_lo;
+    u32 addr_hi;
+
+    template <typename T = VAddr>
+    [[nodiscard]] T Address() const {
+        const u64 addr = (static_cast<u64>(addr_hi) << 32) | static_cast<u64>(addr_lo);
+        if constexpr (std::is_pointer_v<T>) {
+            return reinterpret_cast<T>(addr);
+        } else {
+            return static_cast<T>(addr);
+        }
+    }
+
+    [[nodiscard]] u32 DataOffset() const {
+        return data_offset.Value();
+    }
+};
+static_assert(sizeof(PM4CmdGetLodStats) == 0x10);
 
 } // namespace AmdGpu

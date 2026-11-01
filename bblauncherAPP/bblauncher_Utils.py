@@ -85,6 +85,14 @@ LIVE_RES_CHOICES = [
     ("Auto - strong discrete GPUs", "auto"),
     ("On - apply changes live", "1"),
 ]
+ASYNC_PIPELINE_CHOICES = [
+    ("Auto (dynamic threads)", "auto"),
+    ("Off (synchronous on GPU)", "0"),
+    ("1 Worker Thread", "1"),
+    ("2 Worker Threads", "2"),
+    ("4 Worker Threads", "4"),
+    ("8 Worker Threads", "8"),
+]
 DEBUG_VIEW_CHOICES = [
     ("Off", "0"),
     ("Reactive mask", "1"),
@@ -185,6 +193,7 @@ DEFAULT_SETTINGS = {
     "res": RES_CHOICES[0],
     "aniso": "2x",
     "prep_workers": PREP_WORKER_CHOICES[0][0],
+    "async_pipelines": "auto",
     "anti_aliasing": AA_CHOICES[0],
     "gpu": "",
     "language": "1",
