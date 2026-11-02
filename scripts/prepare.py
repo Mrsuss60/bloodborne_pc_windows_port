@@ -26,10 +26,15 @@ def unpack(fmt, data, offset):
 def parse_self(data, name="executable binary"):
     if len(data) < 32:
         raise ValueError(f"{name} is empty or truncated ({len(data)} bytes, minimum 32 bytes required)")
-    if span(data, 0, 4) != b'O\x15=\x1d':
-        raise ValueError(f"{name}: expected PS4 SELF header (magic bytes O\\x15=\\x1d)")
-    count, = unpack('<H', data, 24)
-    base = 32 + count * 32
+    magic = span(data, 0, 4)
+    raw_elf = magic == b'\x7fELF'          # already-unwrapped ELF (e.g. some dumpers)
+    if not raw_elf and magic != b'O\x15=\x1d':
+        raise ValueError(f"{name}: expected PS4 SELF header (magic bytes O\\x15=\\x1d) or a raw ELF")
+    if raw_elf:
+        count, base = 0, 0
+    else:
+        count, = unpack('<H', data, 24)
+        base = 32 + count * 32
     header = unpack('<16sHHIQQQIHHHHHH', data, base)
     if header[0][:7] != b'\x7fELF\x02\x01\x01' or header[2] != 62:
         raise ValueError(f"{name}: expected little-endian x86-64 ELF")
@@ -41,6 +46,9 @@ def parse_self(data, name="executable binary"):
     end = max(p['offset'] + p['filesz'] for p in ph)
     if end > 512 * 1024 * 1024:
         raise ValueError(f"{name}: probe image exceeds 512 MiB limit")
+    if raw_elf:
+        span(data, 0, end)                  # every segment must lie inside the file
+        return bytearray(data), header, ph, [], []
     elf = bytearray(end)
     header_end = header[5] + header[10] * 56
     elf[:header_end] = span(data, base, header_end)
