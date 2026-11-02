@@ -89,6 +89,15 @@ struct ImageInfo {
 
     VAddr stencil_addr{};
     u32 stencil_size{};
+    u8 skip_levels{};
+
+    [[nodiscard]] ImageInfo Reduced(u32 skip) const;
 };
+
+/// Computes how many mip levels to skip for texture quality downscaling.
+/// Targets 2D block-compressed textures (BC1-BC7) with >= 3 mip levels and dimensions >= 512x512.
+/// Ignores render targets, depth buffers, storage images, and lookup tables.
+u32 SkipLevelsFor(const ImageInfo& info, BindingType binding_type, bool is_storage,
+                  u64 vram_budget, bool is_gpu_modified);
 
 } // namespace VideoCore

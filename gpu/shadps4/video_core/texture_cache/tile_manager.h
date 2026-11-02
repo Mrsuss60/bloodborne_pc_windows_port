@@ -50,7 +50,7 @@ public:
                    const VideoCore::Buffer* out_buffer, u64 out_offset);
 
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
-                                              const ImageInfo& info);
+                                              const ImageInfo& info, u32 first_level = 0);
 
 private:
     void RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,

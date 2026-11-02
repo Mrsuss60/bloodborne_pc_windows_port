@@ -432,4 +432,55 @@ void BlitHelper::CreateMsCopyPipeline(const MsPipelineKey& key) {
     ms_image_copy_pl.emplace_back(key, std::move(pipeline));
 }
 
+u64 BlitHelper::BuildUploadCopies(const Image& image, u32 num_mips, u32 num_layers,
+                                  boost::container::small_vector<vk::BufferImageCopy, 14>& out_copies) {
+    const u32 skip = image.info.skip_levels;
+    const u64 skipped_offset = (skip > 0 && image.guest_info.guest_address != 0)
+                                   ? image.guest_info.mips_layout[skip].offset
+                                   : 0;
+
+    for (u32 m = 0; m < num_mips; m++) {
+        const u32 width = std::max(image.info.size.width >> m, 1u);
+        const u32 height = std::max(image.info.size.height >> m, 1u);
+        const u32 depth =
+            image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
+        const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
+
+        const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
+        const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
+
+        const u64 linear_mip_offset = (image.info.props.is_tiled && skipped_offset != 0)
+                                          ? (mip_offset >= skipped_offset ? mip_offset - skipped_offset : 0)
+                                          : mip_offset;
+
+        out_copies.push_back({
+            .bufferOffset = linear_mip_offset,
+            .bufferRowLength = mip_pitch,
+            .bufferImageHeight = mip_height,
+            .imageSubresource{
+                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = m,
+                .baseArrayLayer = 0,
+                .layerCount = num_layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {extent_width, extent_height, depth},
+        });
+    }
+
+    if (skip > 0) {
+        static std::atomic<u32> skipped_log_count{0};
+        const u32 total = ++skipped_log_count;
+        if (total <= 20 || total % 50 == 0) {
+            std::printf("[Texture Quality] Skipped %u top mip(s) during upload: guest %ux%u (%u mips, skipped %llu B) -> Vulkan %ux%u (%u mips) [total uploads: %u]\n",
+                        skip, image.guest_info.size.width, image.guest_info.size.height,
+                        image.guest_info.resources.levels, static_cast<unsigned long long>(skipped_offset),
+                        image.info.size.width, image.info.size.height, image.info.resources.levels, total);
+            std::fflush(stdout);
+        }
+    }
+
+    return skipped_offset;
+}
+
 } // namespace VideoCore

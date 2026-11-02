@@ -191,6 +191,7 @@ public:
     u64 image_uid{};
 
     ImageInfo info;
+    ImageInfo guest_info;
     Vulkan::Runtime* runtime;
     Common::SlotVector<ImageView>* slot_image_views;
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;

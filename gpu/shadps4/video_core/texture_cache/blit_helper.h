@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -30,6 +31,8 @@ public:
 
     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
                              bool src_msaa, vk::Image source, vk::Image dest);
+    u64 BuildUploadCopies(const Image& image, u32 num_mips, u32 num_layers,
+                          boost::container::small_vector<vk::BufferImageCopy, 14>& out_copies);
 
 private:
     void CreateShaders();

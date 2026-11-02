@@ -103,4 +103,12 @@ struct BufferCopy {
     std::size_t size;
 };
 
+enum class BindingType : u32 {
+    Texture,
+    Storage,
+    RenderTarget,
+    DepthTarget,
+    VideoOut,
+};
+
 } // namespace VideoCore

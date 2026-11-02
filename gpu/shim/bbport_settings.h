@@ -34,6 +34,18 @@ inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
+/// Texture quality (texture_quality in bbport.ini; BB_TEXTURE_QUALITY overrides): block-compressed
+/// materials reduced to save VRAM on GPUs with 2-4 GB.
+enum TextureQuality : int { TqAuto = 0, TqFull = 1, TqHalf = 2, TqQuarter = 3, TqCount = 4 };
+inline const char* TextureQualityName(int quality) {
+    switch (quality) {
+    case TqAuto: return "auto";
+    case TqFull: return "full";
+    case TqHalf: return "half";
+    case TqQuarter: return "quarter";
+    default: return "auto";
+    }
+}
 /// NVIDIA's DLSS render-preset hint (NVSDK_NGX_DLSS_Hint_Render_Preset): 0 = the driver's
 /// choice, 10 = J (less ghosting), 11 = K (the transformer model, recommended).
 enum DlssModel : int { DlssModelDefault = 0, DlssModelJ = 10, DlssModelK = 11 };
@@ -114,6 +126,7 @@ struct Values {
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> prep_workers{-1}; ///< -1 default (Available/2), 0 off, 1..16 explicit workers
     std::atomic<int> async_pipelines{-1}; ///< -1 default (auto), 0 off (sync on GPU thread), 1..16 workers
+    std::atomic<int> texture_quality{TqAuto}; ///< auto, full, half, quarter
     /// Live engine clock (probe.c hook). live_fps/target_fps/max_dt_hz persist; the rest is
     /// runtime status for the overlay.
     std::atomic<bool> live_fps{true};
@@ -144,6 +157,7 @@ struct Values {
     int startup_model_lod = 0;
     int startup_prep_workers = -1;
     int startup_async_pipelines = -1;
+    int startup_texture_quality = TqAuto;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
 };
