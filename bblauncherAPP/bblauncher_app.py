@@ -339,8 +339,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self._setup_timer.stop()
             self._set_setup_display(
                 "error",
-                "Path does not contain an eboot.bin.",
-                f"Selected path:\n{target}\n\nNo eboot.bin was found in that folder.",
+                "Path does not contain an eboot.bin or eboot.elf.",
+                f"Selected path:\n{target}\n\nNo eboot.bin or eboot.elf was found in that folder.",
             )
             self._set_setup_checks("fail", "unknown", "unknown")
             return
@@ -371,14 +371,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self.lbl_path_status.setStyleSheet(
                 "color: #f0b429; font-size: 14px; font-weight: 700; background: transparent;"
             )
-            self.lbl_path_hint.setText("No eboot.bin found at this path. Drag eboot.bin or the game folder here.")
+            self.lbl_path_hint.setText("No eboot.bin or eboot.elf found at this path. Drag eboot.bin/eboot.elf or the game folder here.")
             self.lbl_path_hint.setToolTip(target)
         else:
             self.lbl_path_status.setText("\u2022")
             self.lbl_path_status.setStyleSheet(
                 "color: #6a6a78; font-size: 14px; font-weight: 700; background: transparent;"
             )
-            self.lbl_path_hint.setText("Select eboot.bin or drag the game folder here.")
+            self.lbl_path_hint.setText("Select eboot.bin / eboot.elf or drag the game folder here.")
             self.lbl_path_hint.setToolTip("")
 
         if game_dir is not None:
@@ -482,8 +482,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if not game_dir:
             self._set_setup_display(
                 "error",
-                "Path does not contain an eboot.bin.",
-                f"Selected path:\n{target}\n\nNo eboot.bin was found in that folder.",
+                "Path does not contain an eboot.bin or eboot.elf.",
+                f"Selected path:\n{target}\n\nNo eboot.bin or eboot.elf was found in that folder.",
             )
             self._set_setup_checks("fail", "unknown", "unknown")
             return
@@ -510,7 +510,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
         self._set_setup_display(kind, summary, details_text)
 
-        if "Game File Verification Failed" in str(err or "") or "Missing eboot.bin" in str(err or ""):
+        if "Game File Verification Failed" in str(err or "") or "Missing eboot" in str(err or ""):
             game_state = "fail"
         elif any(("[OK] Game executable" in line or "[OK] Game Title" in line) for line in detail_lines):
             game_state = "ok"
@@ -588,7 +588,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             QMessageBox.information(
                 self,
                 "Game Folder",
-                "Select a valid eboot.bin or game folder first.",
+                "Select a valid eboot.bin, eboot.elf or game folder first.",
             )
             return
         try:
@@ -1565,7 +1565,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
     def browse_eboot(self):
         start = self.txt_eboot.text().strip() or str(DEFAULT_GAME if DEFAULT_GAME.exists() else APP_DIR)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Bloodborne eboot.bin", start, "PS4 Executable (*.bin);;All Files (*)"
+            self, "Select Bloodborne Executable", start, "PS4 Executables (*.bin *.elf);;All Files (*)"
         )
         if path:
             self.txt_eboot.setText(os.path.normpath(path))
@@ -1574,12 +1574,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
     def manual_verify_setup(self):
         target = self.txt_eboot.text().strip()
         if not target:
-            QMessageBox.critical(self, "Error", "Specify the path to eboot.bin first.")
+            QMessageBox.critical(self, "Error", "Specify the path to eboot.bin or eboot.elf first.")
             return
 
         game_dir = resolve_game_dir(target)
         if not game_dir:
-            QMessageBox.critical(self, "Invalid Path", f"Could not find eboot.bin in:\n{target}")
+            QMessageBox.critical(self, "Invalid Path", f"Could not find eboot.bin or eboot.elf in:\n{target}")
             return
 
         self.log("--- Running Pre-Launch Verification Check ---")
@@ -1664,14 +1664,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         target = self.txt_eboot.text().strip()
         if not target:
             self.update_path_state()
-            self.log("[PRE-LAUNCH] Select eboot.bin or the game folder first.")
+            self.log("[PRE-LAUNCH] Select eboot.bin / eboot.elf or the game folder first.")
             self.txt_eboot.setFocus()
             return
 
         game_dir = resolve_game_dir(target)
         if not game_dir:
             self.update_path_state()
-            self.log(f"[PRE-LAUNCH] eboot.bin not found in: {target}")
+            self.log(f"[PRE-LAUNCH] eboot.bin or eboot.elf not found in: {target}")
             self.txt_eboot.setFocus()
             return
 

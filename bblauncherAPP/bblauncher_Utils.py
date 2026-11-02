@@ -424,12 +424,23 @@ def shader_cache_dir() -> Path:
     return (user if user.is_absolute() else APP_DIR / user) / "cache"
 
 
+def find_eboot_file(game_dir: Path) -> Path | None:
+    if not game_dir or not game_dir.is_dir():
+        return None
+    for name in ("eboot.bin", "eboot.elf"):
+        candidate = game_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def resolve_game_dir(target: str):
     p = Path(target.strip().strip('"'))
-    if p.is_file() and p.name.lower() == "eboot.bin":
+    if p.is_file() and p.name.lower() in ("eboot.bin", "eboot.elf"):
         return p.parent
-    if p.is_dir() and (p / "eboot.bin").is_file():
-        return p
+    if p.is_dir():
+        if (p / "eboot.bin").is_file() or (p / "eboot.elf").is_file():
+            return p
     return None
 
 
@@ -584,7 +595,9 @@ def check_live_clock_signature(game_dir: Path) -> tuple[bool, str]:
     helper the game check uses, then read the guarded windows from the ELF image so a
     different eboot is reported instead of hooked (probe.c falls back to XML patches).
     """
-    eboot_path = game_dir / "eboot.bin"
+    eboot_path = find_eboot_file(game_dir)
+    if not eboot_path:
+        return False, "could not find eboot.bin or eboot.elf"
     try:
         data = eboot_path.read_bytes()
     except OSError as ex:
@@ -594,7 +607,7 @@ def check_live_clock_signature(game_dir: Path) -> tuple[bool, str]:
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
         from prepare import parse_self
-        elf, _header, ph, _segments, _missing = parse_self(data, "eboot.bin")
+        elf, _header, ph, _segments, _missing = parse_self(data, eboot_path.name)
     except Exception as ex:
         return False, f"eboot.bin could not be parsed ({ex})"
     loads = [p for p in ph if p["type"] in (1, 0x61000010)]
@@ -620,13 +633,13 @@ def check_live_clock_signature(game_dir: Path) -> tuple[bool, str]:
 def verify_prelaunch(game_dir: Path) -> tuple[bool, str, list[str]]:
     details = []
 
-    eboot_path = game_dir / "eboot.bin"
-    if not eboot_path.is_file():
-        return False, f"Missing eboot.bin in game directory:\n{game_dir}", details
+    eboot_path = find_eboot_file(game_dir)
+    if not eboot_path:
+        return False, f"Missing eboot.bin or eboot.elf in game directory:\n{game_dir}", details
     eboot_size = eboot_path.stat().st_size
     if eboot_size == 0:
-        return False, f"eboot.bin is empty in:\n{eboot_path}", details
-    details.append(f"[OK] Game executable: eboot.bin ({eboot_size / (1024*1024):.1f} MiB)")
+        return False, f"{eboot_path.name} is empty in:\n{eboot_path}", details
+    details.append(f"[OK] Game executable: {eboot_path.name} ({eboot_size / (1024*1024):.1f} MiB)")
 
     try:
         scripts_dir = str(APP_DIR / "scripts")

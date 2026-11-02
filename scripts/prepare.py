@@ -135,16 +135,24 @@ def inspect_libc(path):
     return evidence
 
 
+def find_eboot(game):
+    for candidate in ('eboot.bin', 'eboot.elf'):
+        p = Path(game) / candidate
+        if p.is_file():
+            return p
+    return None
+
+
 def prepare(game, out):
-    eboot_path = game / 'eboot.bin'
-    if not eboot_path.is_file():
-        raise FileNotFoundError(f"Missing eboot.bin at '{eboot_path}'. Please check your game directory.")
+    eboot_path = find_eboot(game)
+    if not eboot_path:
+        raise FileNotFoundError(f"Missing eboot.bin or eboot.elf in '{game}'. Please check your game directory.")
     source = eboot_path.read_bytes()
     if len(source) == 0:
-        raise ValueError(f"eboot.bin at '{eboot_path}' is completely empty (0 bytes). Check your game dump or extraction.")
+        raise ValueError(f"{eboot_path.name} at '{eboot_path}' is completely empty (0 bytes). Check your game dump or extraction.")
     if len(source) < 32:
-        raise ValueError(f"eboot.bin at '{eboot_path}' is truncated ({len(source)} bytes).")
-    elf, header, ph, segments, missing = parse_self(source, name='eboot.bin')
+        raise ValueError(f"{eboot_path.name} at '{eboot_path}' is truncated ({len(source)} bytes).")
+    elf, header, ph, segments, missing = parse_self(source, name=eboot_path.name)
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     def mapped(addr, size=8):
         return any(p['vaddr'] <= addr and addr + size <= p['vaddr'] + p['memsz'] for p in loads)

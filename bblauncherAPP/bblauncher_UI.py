@@ -942,10 +942,15 @@ class LauncherUI:
         row_exec.setSpacing(8)
         init_eboot = self.settings.get("eboot", "")
         if not init_eboot or not Path(init_eboot).exists():
-            init_eboot = str(DEFAULT_GAME / "eboot.bin") if (DEFAULT_GAME / "eboot.bin").exists() else ""
+            if (DEFAULT_GAME / "eboot.bin").exists():
+                init_eboot = str(DEFAULT_GAME / "eboot.bin")
+            elif (DEFAULT_GAME / "eboot.elf").exists():
+                init_eboot = str(DEFAULT_GAME / "eboot.elf")
+            else:
+                init_eboot = ""
         self.txt_eboot = PathDropEdit(init_eboot)
-        self.txt_eboot.setPlaceholderText("Path to decrypted eboot.bin or game folder...")
-        self.txt_eboot.setToolTip("Drag and drop eboot.bin or the game folder here.")
+        self.txt_eboot.setPlaceholderText("Path to decrypted eboot.bin, eboot.elf or game folder...")
+        self.txt_eboot.setToolTip("Drag and drop eboot.bin, eboot.elf or the game folder here.")
         self.txt_eboot.textChanged.connect(self.on_eboot_path_changed)
         self.txt_eboot.path_dropped.connect(self.on_eboot_path_dropped)
         row_exec.addWidget(self.txt_eboot, 1)

@@ -15,10 +15,19 @@ SUPPORTED_VERSION = '01.09'
 SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a'
 
 
+def find_eboot(game):
+    for candidate in ('eboot.bin', 'eboot.elf'):
+        p = Path(game) / candidate
+        if p.is_file():
+            return p
+    return Path(game) / 'eboot.bin'
+
+
 def image_sha256(game):
     """The SHA-256 of eboot.bin's loaded image (its loadable segments at their addresses)."""
     from prepare import parse_self, span  # same directory
-    elf, header, ph, _segments, _missing = parse_self((Path(game) / 'eboot.bin').read_bytes())
+    eboot_path = find_eboot(game)
+    elf, header, ph, _segments, _missing = parse_self(eboot_path.read_bytes(), name=eboot_path.name)
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     image = bytearray(max(p['vaddr'] + p['memsz'] for p in loads))
     for p in loads:

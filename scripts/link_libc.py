@@ -73,7 +73,8 @@ def module(path):
 
 
 def link(game, out):
-    main = module(game/'eboot.bin')
+    main_eboot = game / 'eboot.bin' if (game / 'eboot.bin').is_file() else game / 'eboot.elf'
+    main = module(main_eboot)
     libc = module(game/'sce_module/libc.prx')
     raw = (out/'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)

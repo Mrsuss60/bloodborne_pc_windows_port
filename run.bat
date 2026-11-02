@@ -41,7 +41,9 @@ set "EXTRA_ARGS="
 :arg_loop
 if "%~1"=="" goto arg_done
 if exist "%~1\eboot.bin" goto arg_game_dir
+if exist "%~1\eboot.elf" goto arg_game_dir
 if /i "%~nx1"=="eboot.bin" if exist "%~1" goto arg_eboot_file
+if /i "%~nx1"=="eboot.elf" if exist "%~1" goto arg_eboot_file
 set EXTRA_ARGS=%EXTRA_ARGS% %1
 shift
 goto arg_loop
@@ -60,7 +62,8 @@ set "game=%BB_GAME_DIR%"
 REM Strip trailing backslash if present
 if "%game:~-1%"=="\" set "game=%game:~0,-1%"
 if exist "%game%\eboot.bin" goto found_eboot
-echo No eboot.bin in "%game%" ^(set BB_GAME_DIR or pass path to run.bat^). >&2
+if exist "%game%\eboot.elf" goto found_eboot
+echo No eboot.bin or eboot.elf in "%game%" ^(set BB_GAME_DIR or pass path to run.bat^). >&2
 exit /b 1
 :found_eboot
 

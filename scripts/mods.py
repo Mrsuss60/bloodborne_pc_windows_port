@@ -93,7 +93,7 @@ def mod_files(folder):
             # Readme/metadata stay outside the mounted game. This loader handles assets;
             # executable patches use the existing patch compiler, with address validation.
             if relative.parts[0].casefold() != 'dvdroot_ps4':
-                if relative.parts[0].casefold() in ('eboot.bin', 'sce_module', 'sce_sys'):
+                if relative.parts[0].casefold() in ('eboot.bin', 'eboot.elf', 'sce_module', 'sce_sys'):
                     raise ValueError(f'Executable/system replacement is unsupported: {source}')
                 continue
             if not source.is_file():

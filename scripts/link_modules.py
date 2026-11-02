@@ -93,7 +93,8 @@ def patch_fs_loads(image, ph, base):
 
 
 def link(game, out, module_names=DEFAULT_MODULES):
-    main = module(game / 'eboot.bin')
+    main_eboot = game / 'eboot.bin' if (game / 'eboot.bin').is_file() else game / 'eboot.elf'
+    main = module(main_eboot)
     raw = (out / 'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)
     if magic != b'BBPROBE2':
