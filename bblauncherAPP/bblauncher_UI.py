@@ -50,6 +50,7 @@ from bblauncher_Utils import (
     PRESET_CHOICES,
     RES_CHOICES,
     SYSTEM_KEYBINDS,
+    TEXTURE_QUALITY_CHOICES,
     UPSCALER_CHOICES,
     WINDOW_MODE_CHOICES,
     build_stamp,
@@ -202,6 +203,10 @@ class KeybindButton(QPushButton):
         same key positions.  The label is looked up through the active layout.
         """
         key = event.key()
+        # Letters: store the character printed on the key for the active layout, so a
+        # manual bind matches the AZERTY/QWERTY presets (AZERTY "Z" key -> "Z").
+        if Qt.Key_A <= key <= Qt.Key_Z:
+            return chr(key), chr(key)
         scan_code = int(event.nativeScanCode()) & 0xFF
         stored = win_scan_to_scancode_name(scan_code)
         text = event.text()
@@ -1386,8 +1391,8 @@ class LauncherUI:
         w, c_layout = self._create_page("Display & Graphics")
         ini_opts = self.load_bbport_ini()
 
-        # ---- Display & render core ----
-        card_disp, l_disp = self._new_card("Display & Render Core")
+        # ---- Display & render settings ----
+        card_disp, l_disp = self._new_card("Display & Render Settings")
 
         grid_disp = QGridLayout()
         grid_disp.setHorizontalSpacing(16)
@@ -1433,7 +1438,81 @@ class LauncherUI:
         self.cmb_prep_workers.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
         grid_disp.addWidget(self.cmb_prep_workers, 2, 3)
 
-        grid_disp.addWidget(QLabel("Upscaler Technology:"), 3, 0)
+        grid_disp.addWidget(QLabel("GPU Adapter:"), 3, 0)
+        self.cmb_gpu = QComboBox()
+        self.fill_gpu_choices()
+        self.cmb_gpu.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_gpu, 3, 1)
+
+        grid_disp.addWidget(QLabel("Live Resolution:"), 3, 2)
+        self.cmb_live_res = QComboBox()
+        for label, value in LIVE_RES_CHOICES:
+            self.cmb_live_res.addItem(label, value)
+        live_idx = self.cmb_live_res.findData(ini_opts.get("live_resolution", "0").strip().lower())
+        self.cmb_live_res.setCurrentIndex(live_idx if live_idx >= 0 else 0)
+        self.cmb_live_res.currentIndexChanged.connect(lambda: self.save_bbport_ini())
+        grid_disp.addWidget(self.cmb_live_res, 3, 3)
+
+        grid_disp.addWidget(QLabel("Async Pipelines:"), 4, 0)
+        self.cmb_async_pipelines = QComboBox()
+        for label, value in ASYNC_PIPELINE_CHOICES:
+            self.cmb_async_pipelines.addItem(label, value)
+        cur_async = str(ini_opts.get("async_pipelines", self.settings.get("async_pipelines", "auto"))).strip().lower()
+        async_idx = self.cmb_async_pipelines.findData(cur_async)
+        self.cmb_async_pipelines.setCurrentIndex(async_idx if async_idx >= 0 else 0)
+        self.cmb_async_pipelines.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_async_pipelines, 4, 1)
+
+        grid_disp.addWidget(QLabel("Game Text Language:"), 4, 2)
+        self.cmb_lang = QComboBox()
+        for label, code in LANGUAGE_CHOICES:
+            self.cmb_lang.addItem(label, code)
+        cur_lang = self.settings.get("language", "1")
+        lang_idx = next((i for i, (_, c) in enumerate(LANGUAGE_CHOICES) if c == cur_lang), 0)
+        self.cmb_lang.setCurrentIndex(lang_idx)
+        self.cmb_lang.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_lang, 4, 3)
+
+        lbl_tq = QLabel("Texture Quality:")
+        lbl_tq.setToolTip("The size of large textures in VRAM. For GPUs with 2-4 GB.\nHalf with 3 GB of VRAM or less, else full.")
+        grid_disp.addWidget(lbl_tq, 5, 0)
+        self.cmb_texture_quality = QComboBox()
+        self.cmb_texture_quality.setToolTip("The size of large textures in VRAM. For GPUs with 2-4 GB.\nHalf with 3 GB of VRAM or less, else full.")
+        for label, value in TEXTURE_QUALITY_CHOICES:
+            self.cmb_texture_quality.addItem(label, value)
+        cur_tex = str(ini_opts.get("texture_quality", self.settings.get("texture_quality", "auto"))).strip().lower()
+        tex_idx = self.cmb_texture_quality.findData(cur_tex)
+        self.cmb_texture_quality.setCurrentIndex(tex_idx if tex_idx >= 0 else 0)
+        self.cmb_texture_quality.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_disp.addWidget(self.cmb_texture_quality, 5, 1)
+
+        l_disp.addLayout(grid_disp)
+
+        row_flags = QGridLayout()
+        row_flags.setHorizontalSpacing(16)
+        row_flags.setVerticalSpacing(8)
+
+        self.chk_fps_patch = QCheckBox("Enable Live FPS Patching (60/90/120/Uncap)")
+        self.chk_fps_patch.setChecked(self.settings.get("feat_fps_patch", True))
+        row_flags.addWidget(self.chk_fps_patch, 0, 0)
+        self._populate_fps_combo(self.chk_fps_patch.isChecked(), self.settings.get("fps", "60"))
+        self.chk_fps_patch.toggled.connect(self._on_fps_patch_toggled)
+        self.cmb_fps.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+
+        l_disp.addLayout(row_flags)
+        self._save_footer(l_disp)
+        c_layout.addWidget(card_disp)
+
+        # ---- Upscaler settings ----
+        card_q, l_q = self._new_card("Upscaler Settings (FSR & DLSS)")
+
+        grid_up = QGridLayout()
+        grid_up.setHorizontalSpacing(16)
+        grid_up.setVerticalSpacing(10)
+        grid_up.setColumnStretch(1, 1)
+        grid_up.setColumnStretch(3, 1)
+
+        grid_up.addWidget(QLabel("Upscaler Technology:"), 0, 0)
         self.cmb_upscaler = QComboBox()
         for label, value in UPSCALER_CHOICES:
             self.cmb_upscaler.addItem(label, value)
@@ -1443,99 +1522,20 @@ class LauncherUI:
         upscaler_idx = self.cmb_upscaler.findText(init_upscaler)
         if upscaler_idx >= 0:
             self.cmb_upscaler.setCurrentIndex(upscaler_idx)
-        grid_disp.addWidget(self.cmb_upscaler, 3, 1)
+        self.cmb_upscaler.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        grid_up.addWidget(self.cmb_upscaler, 0, 1)
 
-        grid_disp.addWidget(QLabel("Upscaler Preset:"), 3, 2)
+        grid_up.addWidget(QLabel("Upscaler Preset:"), 0, 2)
         self.cmb_preset = QComboBox()
         for label, value in PRESET_CHOICES:
             self.cmb_preset.addItem(label, value)
         preset_idx = self.cmb_preset.findData(ini_opts.get("preset", "1").strip())
         self.cmb_preset.setCurrentIndex(preset_idx if preset_idx >= 0 else 0)
         self.cmb_preset.currentIndexChanged.connect(lambda: self.save_bbport_ini())
-        grid_disp.addWidget(self.cmb_preset, 3, 3)
+        grid_up.addWidget(self.cmb_preset, 0, 3)
 
-        grid_disp.addWidget(QLabel("GPU Adapter:"), 4, 0)
-        self.cmb_gpu = QComboBox()
-        self.fill_gpu_choices()
-        self.cmb_gpu.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
-        grid_disp.addWidget(self.cmb_gpu, 4, 1)
+        l_q.addLayout(grid_up)
 
-        grid_disp.addWidget(QLabel("Live Resolution:"), 4, 2)
-        self.cmb_live_res = QComboBox()
-        for label, value in LIVE_RES_CHOICES:
-            self.cmb_live_res.addItem(label, value)
-        live_idx = self.cmb_live_res.findData(ini_opts.get("live_resolution", "0").strip().lower())
-        self.cmb_live_res.setCurrentIndex(live_idx if live_idx >= 0 else 0)
-        self.cmb_live_res.currentIndexChanged.connect(lambda: self.save_bbport_ini())
-        grid_disp.addWidget(self.cmb_live_res, 4, 3)
-
-        grid_disp.addWidget(QLabel("Async Pipelines:"), 5, 0)
-        self.cmb_async_pipelines = QComboBox()
-        for label, value in ASYNC_PIPELINE_CHOICES:
-            self.cmb_async_pipelines.addItem(label, value)
-        cur_async = str(ini_opts.get("async_pipelines", self.settings.get("async_pipelines", "auto"))).strip().lower()
-        async_idx = self.cmb_async_pipelines.findData(cur_async)
-        self.cmb_async_pipelines.setCurrentIndex(async_idx if async_idx >= 0 else 0)
-        self.cmb_async_pipelines.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
-        grid_disp.addWidget(self.cmb_async_pipelines, 5, 1)
-
-        grid_disp.addWidget(QLabel("Game Text Language:"), 5, 2)
-        self.cmb_lang = QComboBox()
-        for label, code in LANGUAGE_CHOICES:
-            self.cmb_lang.addItem(label, code)
-        cur_lang = self.settings.get("language", "1")
-        lang_idx = next((i for i, (_, c) in enumerate(LANGUAGE_CHOICES) if c == cur_lang), 0)
-        self.cmb_lang.setCurrentIndex(lang_idx)
-        self.cmb_lang.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
-        grid_disp.addWidget(self.cmb_lang, 5, 3)
-
-        l_disp.addLayout(grid_disp)
-
-        row_flags = QGridLayout()
-        row_flags.setHorizontalSpacing(16)
-        row_flags.setVerticalSpacing(8)
-
-        self.chk_fsr = QCheckBox("Enable Temporal Upscaler")
-        self.chk_fsr.setChecked(self.settings.get("feat_upscaler", False) and self.cmb_upscaler.currentData() != "off")
-        row_flags.addWidget(self.chk_fsr, 0, 0)
-
-        self.chk_fps_patch = QCheckBox("Enable Live FPS Patching (60/90/120/Uncap)")
-        self.chk_fps_patch.setChecked(self.settings.get("feat_fps_patch", True))
-        row_flags.addWidget(self.chk_fps_patch, 0, 1)
-        self._populate_fps_combo(self.chk_fps_patch.isChecked(), self.settings.get("fps", "60"))
-        self.chk_fps_patch.toggled.connect(self._on_fps_patch_toggled)
-        self.cmb_fps.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
-
-        def on_upscaler_combo_changed():
-            active = self.cmb_upscaler.currentData() != "off"
-            self.chk_fsr.blockSignals(True)
-            self.chk_fsr.setChecked(active)
-            self.chk_fsr.blockSignals(False)
-            self.save_settings()
-            self.save_bbport_ini()
-
-        def on_chk_fsr_toggled(checked):
-            self.cmb_upscaler.blockSignals(True)
-            if not checked:
-                self.cmb_upscaler.setCurrentIndex(self.cmb_upscaler.findData("off"))
-            elif self.cmb_upscaler.currentData() == "off":
-                self.cmb_upscaler.setCurrentIndex(self.cmb_upscaler.findData("fsr31"))
-            self.cmb_upscaler.blockSignals(False)
-            self.save_settings()
-            self.save_bbport_ini()
-
-        self.cmb_upscaler.currentIndexChanged.connect(on_upscaler_combo_changed)
-        self.chk_fsr.toggled.connect(on_chk_fsr_toggled)
-
-        l_disp.addLayout(row_flags)
-        self._save_footer(l_disp)
-        c_layout.addWidget(card_disp)
-
-        # ---- Upscaler quality ----
-        card_q, l_q = self._new_card(
-            "Upscaler Quality",
-            "Applies while the upscaler is active. The same values are available in the in-game menu.",
-        )
         grid_q = QGridLayout()
         grid_q.setHorizontalSpacing(16)
         grid_q.setVerticalSpacing(10)

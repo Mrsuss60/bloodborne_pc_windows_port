@@ -60,7 +60,6 @@ from bblauncher_Utils import (
     acquire_single_instance,
     build_stamp,
     connected_gpus,
-    display_name_to_scancode_label,
     get_bb_guard,
     kill_tree,
     load_xml_patches,
@@ -279,7 +278,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "gpu": self.cmb_gpu.currentData() or "",
                 "language": self.cmb_lang.currentData() or "1",
                 "async_pipelines": self.cmb_async_pipelines.currentData() or "auto",
-                "feat_upscaler": self.chk_fsr.isChecked() and upscaler_choice != "Off",
+                "texture_quality": self.cmb_texture_quality.currentData() or "auto",
+                "feat_upscaler": upscaler_choice != "Off",
                 "upscaler_model": upscaler_choice,
                 "feat_overlay": True,
                 "feat_fps_patch": self.chk_fps_patch.isChecked(),
@@ -976,7 +976,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
             aa_choice = self.cmb_aa.currentText()
             upscaler_choice = self.cmb_upscaler.currentText()
-            is_fsr = self.chk_fsr.isChecked() and upscaler_choice != "Off"
+            is_fsr = upscaler_choice != "Off"
             is_taa = "TAA" in aa_choice
             is_upscaler_active = is_fsr or is_taa
             effect_game_aa = "0" if is_upscaler_active or "Disable" in aa_choice else "1"
@@ -1004,6 +1004,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "effect_game_aa": effect_game_aa,
                 "prep_workers": prep_workers_val,
                 "async_pipelines": self.cmb_async_pipelines.currentData() or "auto",
+                "texture_quality": self.cmb_texture_quality.currentData() or "auto",
                 "gpu": self.cmb_gpu.currentData() or "",
                 "live_resolution": self.cmb_live_res.currentData() or "0",
                 "sharpen": "1" if self.chk_sharpen.isChecked() else "0",
@@ -1139,10 +1140,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                            "key.move_backward", "key.move_right"):
             btn = self.keybind_buttons.get(action_key)
             if btn is not None:
-                # The preset holds printed labels.  Convert each one to the physical
-                # SDL scancode name for this keyboard layout before saving.
-                stored = display_name_to_scancode_label(preset[action_key])
-                self._assign_keybind(action_key, stored, btn.current_binding)
+                # Store the printed letter as-is (AZERTY -> Z/Q/S/D, QWERTY -> W/A/S/D) so
+                # bbport.ini matches what the button shows.
+                self._assign_keybind(action_key, preset[action_key], btn.current_binding)
         self.save_bbport_ini()
         keys = "WASD" if layout == "qwerty" else "ZQSD"
         self.log(f"[Keybinds] Applied {layout.upper()} movement preset ({keys}).")
@@ -1296,10 +1296,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         else:
             upscaler_value = "off"
         self._set_combo_data(self.cmb_upscaler, upscaler_value)
-        self._set_check(self.chk_fsr, upscaler_value != "off")
         self._set_combo_data(self.cmb_preset, ini_opts.get("preset", "1"))
         self._set_combo_data(self.cmb_live_res, ini_opts.get("live_resolution", "0").strip().lower())
         self._set_combo_data(self.cmb_async_pipelines, ini_opts.get("async_pipelines", "auto").strip().lower())
+        self._set_combo_data(self.cmb_texture_quality, ini_opts.get("texture_quality", "auto").strip().lower())
         self._set_combo_data(self.cmb_hud_quadrant, ini_opts.get("hud_quadrant", "0"))
         self._set_combo_data(self.cmb_debug_view, ini_opts.get("debug_view", "0"))
         self._set_combo_data(self.cmb_model_lod, ini_opts.get("model_lod", "0"))
@@ -1777,6 +1777,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if lang_code:
             env["BB_LANGUAGE"] = str(lang_code)
 
+        tex_quality = str(cfg.get("texture_quality", "auto")).strip().lower()
+        if tex_quality:
+            env["BB_TEXTURE_QUALITY"] = tex_quality
+        else:
+            env.pop("BB_TEXTURE_QUALITY", None)
+
         for cfg_key, env_key in (
             ("timeout", "BB_TIMEOUT"),
             ("dmem_mb", "BB_DMEM_MB"),
@@ -1825,7 +1831,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.log_batch([
             "=" * 60,
             f"Starting Bloodborne from: {game_dir}  [{datetime.now():%Y-%m-%d %H:%M:%S}]",
-            f"Target FPS: {cfg['fps']} | Res: {res_choice} | Window: {win_mode_val}",
+            f"Target FPS: {cfg['fps']} | Res: {res_choice} | Window: {win_mode_val} | Texture Quality: {tex_quality}",
             f"Active XML Patches ({len(active_patches)}): {', '.join(active_patches) if active_patches else 'None'}",
             "=" * 60,
         ])

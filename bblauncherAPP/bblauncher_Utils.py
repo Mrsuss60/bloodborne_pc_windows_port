@@ -28,7 +28,7 @@ LOG_KEEP = 20
 SETTINGS_FILE = APP_DIR / "bblauncher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
-LAUNCHER_VERSION = "0.8.0"
+LAUNCHER_VERSION = "0.8.1"
 
 
 def build_stamp() -> str:
@@ -92,6 +92,12 @@ ASYNC_PIPELINE_CHOICES = [
     ("2 Worker Threads", "2"),
     ("4 Worker Threads", "4"),
     ("8 Worker Threads", "8"),
+]
+TEXTURE_QUALITY_CHOICES = [
+    ("Auto (Half on <=3GB VRAM, else Full)", "auto"),
+    ("Full (Original quality)", "full"),
+    ("Half (50% size)", "half"),
+    ("Quarter (25% size)", "quarter"),
 ]
 DEBUG_VIEW_CHOICES = [
     ("Off", "0"),
@@ -194,6 +200,7 @@ DEFAULT_SETTINGS = {
     "aniso": "2x",
     "prep_workers": PREP_WORKER_CHOICES[0][0],
     "async_pipelines": "auto",
+    "texture_quality": "auto",
     "anti_aliasing": AA_CHOICES[0],
     "gpu": "",
     "language": "1",
@@ -349,7 +356,8 @@ def scancode_display_name(stored_name: str) -> str:
         return stored_name
     if len(stored_name) != 1 or not stored_name.isascii():
         return stored_name
-    if stored_name.isdigit():
+    if stored_name.isdigit() or stored_name.isalpha():
+        # Letters are stored as the printed label (Z stays Z on AZERTY), so show them as-is.
         return stored_name
     scan_code = _SDL_NAME_TO_WIN_SCAN.get(stored_name.upper())
     if scan_code is None:
