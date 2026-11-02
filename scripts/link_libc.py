@@ -74,6 +74,26 @@ def module(path):
 
 def link(game, out):
     main_eboot = game / 'eboot.bin' if (game / 'eboot.bin').is_file() else game / 'eboot.elf'
+    boot_libc = out / 'boot-libc.bin'
+    libc_json = out / 'libc-link.json'
+    boot_bin = out / 'boot.bin'
+    libc_prx = game / 'sce_module/libc.prx'
+    if boot_libc.is_file() and libc_json.is_file() and boot_bin.is_file() and libc_prx.is_file():
+        m = boot_libc.stat().st_mtime
+        if m >= boot_bin.stat().st_mtime and m >= libc_prx.stat().st_mtime and m >= Path(__file__).stat().st_mtime:
+            try:
+                rep = json.loads(libc_json.read_text(encoding='utf-8', errors='replace'))
+                base = int(rep['base'], 16)
+                bindings = rep.get('bindings', 0)
+                tls_memsz = rep.get('tls_memory_bytes', 0)
+                main_tls = rep.get('main_tls', {})
+                eboot_tls = main_tls.get('memsz', 0)
+                patched = rep.get('fs_loads_patched', 0)
+                print(f'Linked native libc: base={base:#x}, {bindings} fallback exports, TLS={tls_memsz} bytes; '
+                      f'eboot TLS={eboot_tls} bytes, fs->gs patched={patched}')
+                return
+            except Exception:
+                pass
     main = module(main_eboot)
     libc = module(game/'sce_module/libc.prx')
     raw = (out/'boot.bin').read_bytes()

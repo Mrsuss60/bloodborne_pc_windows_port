@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/serdes.h"
+#include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -705,27 +706,76 @@ void PipelineCache::WarmUp() {
         }
 
         const std::array<Shader::RuntimeInfo, MaxShaderStages> empty_runtime_infos{};
-        for (auto& entry : staged_graphics) {
-            bool all_stages_ok = true;
-            std::array<vk::ShaderModule, MaxShaderStages> modules{};
-            for (size_t s = 0; s < MaxShaderStages; ++s) {
-                if (entry.futures[s].valid()) {
-                    modules[s] = entry.futures[s].get();
-                    if (!modules[s]) {
-                        all_stages_ok = false;
-                        break;
+        if (warmup_async) {
+            for (auto& entry : staged_graphics) {
+                if (graphics_pipelines.find(entry.key) != graphics_pipelines.end() ||
+                    pending_graphics.find(entry.key) != pending_graphics.end()) {
+                    continue;
+                }
+                auto job = std::make_shared<PendingPipeline>();
+                job->saved = true;
+                job->sdata = entry.sdata;
+                job->make = [this, key = entry.key, infos = entry.infos,
+                             fetch = entry.fetch_shader, futures = entry.futures,
+                             sdata = entry.sdata]() mutable -> std::unique_ptr<GraphicsPipeline> {
+                    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+                    for (size_t s = 0; s < MaxShaderStages; ++s) {
+                        if (futures[s].valid()) {
+                            modules[s] = futures[s].get();
+                            if (!modules[s]) {
+                                return nullptr;
+                            }
+                        }
+                    }
+                    const std::array<Shader::RuntimeInfo, MaxShaderStages> empty_runtime_infos{};
+                    return std::make_unique<GraphicsPipeline>(
+                        instance, scheduler, desc_heap, profile, key, *pipeline_cache,
+                        infos, empty_runtime_infos, fetch, modules, sdata, true);
+                };
+                pending_graphics.emplace(entry.key, job);
+                ++num_pipelines;
+                g_bb_background_pipelines_total.fetch_add(1, std::memory_order_relaxed);
+                GetCompiler().Submit([job] {
+                    SCOPE_EXIT {
+                        g_bb_background_pipelines_done.fetch_add(1, std::memory_order_relaxed);
+                    };
+                    if (job->started.exchange(true)) {
+                        return;
+                    }
+                    std::unique_ptr<GraphicsPipeline> pipeline;
+                    try {
+                        pipeline = job->make();
+                    } catch (const std::exception&) {
+                    }
+                    std::unique_lock lk{job->mutex};
+                    job->pipeline = std::move(pipeline);
+                    job->done = true;
+                    job->cv.notify_all();
+                });
+            }
+        } else {
+            for (auto& entry : staged_graphics) {
+                bool all_stages_ok = true;
+                std::array<vk::ShaderModule, MaxShaderStages> modules{};
+                for (size_t s = 0; s < MaxShaderStages; ++s) {
+                    if (entry.futures[s].valid()) {
+                        modules[s] = entry.futures[s].get();
+                        if (!modules[s]) {
+                            all_stages_ok = false;
+                            break;
+                        }
                     }
                 }
-            }
-            if (!all_stages_ok) {
-                continue;
-            }
-            const auto [it, is_new] = graphics_pipelines.try_emplace(entry.key);
-            if (is_new) {
-                it.value() = std::make_unique<GraphicsPipeline>(
-                    instance, scheduler, desc_heap, profile, entry.key, *pipeline_cache,
-                    entry.infos, empty_runtime_infos, entry.fetch_shader, modules, entry.sdata, true);
-                ++num_pipelines;
+                if (!all_stages_ok) {
+                    continue;
+                }
+                const auto [it, is_new] = graphics_pipelines.try_emplace(entry.key);
+                if (is_new) {
+                    it.value() = std::make_unique<GraphicsPipeline>(
+                        instance, scheduler, desc_heap, profile, entry.key, *pipeline_cache,
+                        entry.infos, empty_runtime_infos, entry.fetch_shader, modules, entry.sdata, true);
+                    ++num_pipelines;
+                }
             }
         }
     }

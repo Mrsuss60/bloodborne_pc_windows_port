@@ -333,9 +333,9 @@ void PipelineCache::MergeShaderImport(bool at_start) {
         return;
     }
     state.frame = frame;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(at_start ? 5 : 2);
     const auto in_budget = [&] {
-        return at_start || std::chrono::steady_clock::now() < deadline;
+        return std::chrono::steady_clock::now() < deadline;
     };
     while (state.next_program < state.programs.size() && in_budget()) {
         MergeImportedProgram(state, state.next_program++);

@@ -173,6 +173,12 @@ std::vector<u8> RewriteMeta(std::vector<u8>&& meta, const std::vector<u8>& info,
 
 bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& translated,
                       u32& failed) {
+#ifdef _WIN32
+    void (*old_abrt)(int) = std::signal(SIGABRT, RecipeSignalHandler);
+    void (*old_segv)(int) = std::signal(SIGSEGV, RecipeSignalHandler);
+    void (*old_ill)(int) = std::signal(SIGILL, RecipeSignalHandler);
+    PVOID veh = AddVectoredExceptionHandler(1, RecipeVectoredHandler);
+#endif
     struct Record {
         fs::path path;
         BbShaderCapture::Input input;
@@ -196,11 +202,23 @@ bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& 
         std::vector<u8> program_info;
         for (auto& [perm_idx, record] : perms) {
             std::optional<Translated> result;
+#ifdef _WIN32
+            if (setjmp(g_recipe_jmp) == 0) {
+                try {
+                    result = Translate(record.input, profile);
+                } catch (const std::exception&) {
+                    result.reset();
+                }
+            } else {
+                result.reset();
+            }
+#else
             try {
                 result = Translate(record.input, profile);
             } catch (const std::exception&) {
                 result.reset();
             }
+#endif
             const std::string name = HexName(pgm_hash) + "_" + std::to_string(perm_idx);
             if (!result) {
                 fs::remove(dir / (name + ".spv"), ec);
@@ -232,6 +250,14 @@ bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& 
             ++translated;
         }
     }
+#ifdef _WIN32
+    std::signal(SIGABRT, old_abrt);
+    std::signal(SIGSEGV, old_segv);
+    std::signal(SIGILL, old_ill);
+    if (veh) {
+        RemoveVectoredExceptionHandler(veh);
+    }
+#endif
     return true;
 }
 
@@ -576,6 +602,9 @@ int RebuildCaches() {
         if (!rebuilt_ok) {
             std::printf("Shader cache %s: rebuilding failed, it is compiled again in the game\n",
                         dir.filename().string().c_str());
+            versions[1] = Vulkan::PipelineStore::ShaderBinaryVersion;
+            std::memcpy(header.data(), versions, sizeof(versions));
+            WriteFile(dir / "profile.bin", header);
             continue;
         }
         versions[1] = Vulkan::PipelineStore::ShaderBinaryVersion;

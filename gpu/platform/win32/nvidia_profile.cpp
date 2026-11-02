@@ -125,9 +125,11 @@ struct Api {
 } // namespace
 
 void Apply() {
-    if (bb_env_off("BB_NV_POWER")) {
+    static bool applied = false;
+    if (applied || bb_env_off("BB_NV_POWER")) {
         return;
     }
+    applied = true;
     Api api{};
     if (!api.Load() || api.initialize() != Ok) {
         return; // no NVIDIA driver

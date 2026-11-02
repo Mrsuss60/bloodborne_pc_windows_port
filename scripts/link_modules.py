@@ -94,6 +94,24 @@ def patch_fs_loads(image, ph, base):
 
 def link(game, out, module_names=DEFAULT_MODULES):
     main_eboot = game / 'eboot.bin' if (game / 'eboot.bin').is_file() else game / 'eboot.elf'
+    boot_linked = out / 'boot-linked.bin'
+    link_json = out / 'link.json'
+    boot_bin = out / 'boot.bin'
+    if boot_linked.is_file() and link_json.is_file() and boot_bin.is_file():
+        m = boot_linked.stat().st_mtime
+        if m >= boot_bin.stat().st_mtime and m >= Path(__file__).stat().st_mtime:
+            try:
+                rep = json.loads(link_json.read_text(encoding='utf-8', errors='replace'))
+                table = rep.get('modules', [])
+                summary = ', '.join(f"{t.get('file', 'mod')}@{t.get('base', '0')}" for t in table)
+                bindings = rep.get('bindings', 0)
+                unresolved = len(rep.get('unresolved_imports', []))
+                fs_patched = rep.get('fs_loads_patched', 0)
+                print(f'Linked modules: {summary}; {bindings} native bindings, {unresolved} imports left to the host runtime, '
+                      f'fs->gs patched={fs_patched}')
+                return
+            except Exception:
+                pass
     main = module(main_eboot)
     raw = (out / 'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)

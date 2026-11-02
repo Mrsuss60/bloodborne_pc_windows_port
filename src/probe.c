@@ -2963,9 +2963,6 @@ int main(int argc, char **argv) {
     if (argc == 9 && !strcmp(argv[1], "--merge-shader-metas"))
         return bbgpu_merge_shader_metas(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], atoi(argv[8]));
 
-    /* Rebuild caches from older compiler versions if needed */
-    bbgpu_rebuild_shader_caches();
-
 #ifdef _WIN32
     runtime_memory_reserve_space();
     int avx_status = runtime_win_check_avx();
@@ -3227,6 +3224,8 @@ int main(int argc, char **argv) {
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
+        /* Rebuild caches from older compiler versions if needed */
+        bbgpu_rebuild_shader_caches();
     }
     image_size = size;
     resolved_targets = calloc(import_count + 1, sizeof(void *));

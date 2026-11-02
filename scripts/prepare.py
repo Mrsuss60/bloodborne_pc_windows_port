@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 
 
 def span(data, offset, size):
@@ -147,6 +148,26 @@ def prepare(game, out):
     eboot_path = find_eboot(game)
     if not eboot_path:
         raise FileNotFoundError(f"Missing eboot.bin or eboot.elf in '{game}'. Please check your game directory.")
+    boot_bin = out / 'boot.bin'
+    analysis_json = out / 'analysis.json'
+    eboot_mtime = eboot_path.stat().st_mtime
+    script_mtime = Path(__file__).stat().st_mtime
+    if boot_bin.is_file() and analysis_json.is_file():
+        boot_mtime = boot_bin.stat().st_mtime
+        if boot_mtime >= eboot_mtime and boot_mtime >= script_mtime:
+            try:
+                report = json.loads(analysis_json.read_text(encoding='utf-8', errors='replace'))
+                title = report['sfo'].get('TITLE', 'Bloodborne')
+                safe_title = title.encode(sys.stdout.encoding or 'utf-8', 'replace').decode(sys.stdout.encoding or 'utf-8', 'replace')
+                print(f"{safe_title} | entry={report.get('entry')} | image={report.get('image_bytes', 0):,} bytes")
+                print(f"{report.get('import_count', len(report.get('imports', [])))} imported symbols; {sum(report.get('relocation_counts', {}).values()):,} relocations; {len(report.get('needed', []))} required modules")
+                print(f"Unavailable non-loadable metadata headers: {report.get('unavailable_metadata_headers', [])}; not a byte-exact ELF reconstruction")
+                print(f"Output: {out.resolve()}")
+                libc_evidence = report.get('libc_evidence', {})
+                print(f"libc _init_env verified RET: {libc_evidence.get('init_env_is_ret', True)}")
+                return
+            except Exception:
+                pass
     source = eboot_path.read_bytes()
     if len(source) == 0:
         raise ValueError(f"{eboot_path.name} at '{eboot_path}' is completely empty (0 bytes). Check your game dump or extraction.")
@@ -253,10 +274,6 @@ def prepare(game, out):
     (out / 'entry.bin').write_bytes(image[:1024])
     resources = collections.Counter()
     total_bytes = 0
-    for path in (game / 'dvdroot_ps4').rglob('*'):
-        if path.is_file():
-            resources[path.relative_to(game / 'dvdroot_ps4').parts[0]] += 1
-            total_bytes += path.stat().st_size
     report = dict(source_sha256=hashlib.sha256(source).hexdigest(), source_bytes=len(source),
                   sfo=sfo((game / 'sce_sys/param.sfo').read_bytes()), entry=hex(header[4]),
                   image_bytes=size, program_headers=ph, self_segments=segments,
@@ -267,8 +284,10 @@ def prepare(game, out):
                   bundled_modules=sorted(p.name for p in (game / 'sce_module').iterdir()),
                   resources=dict(resources), resource_bytes=total_bytes,
                   status='Prepared only; execution and Vulkan are tested separately.')
-    (out / 'analysis.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
-    print(f"{report['sfo'].get('TITLE')} | entry={header[4]:#x} | image={size:,} bytes")
+    (out / 'analysis.json').write_text(json.dumps(report, ensure_ascii=True, indent=2) + '\n', encoding='utf-8')
+    title = report['sfo'].get('TITLE', 'Bloodborne')
+    safe_title = title.encode(sys.stdout.encoding or 'utf-8', 'replace').decode(sys.stdout.encoding or 'utf-8', 'replace')
+    print(f"{safe_title} | entry={header[4]:#x} | image={size:,} bytes")
     print(f"{len(names)} imported symbols; {sum(counts.values()):,} relocations; {len(report['needed'])} required modules")
     print(f"Unavailable non-loadable metadata headers: {missing}; not a byte-exact ELF reconstruction")
     print(f"Output: {out.resolve()}")
