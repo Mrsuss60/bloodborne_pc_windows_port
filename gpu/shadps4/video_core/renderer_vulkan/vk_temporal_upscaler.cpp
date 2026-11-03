@@ -1354,17 +1354,27 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
     if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
-    if (!Scaled() || !color) {
+    if (!Scaled()) {
         return;
     }
     if (ui_phase) {
-        // A UI movie can start without stencil and enable it for later text/masks.
-        if (color == ui_color && depth && depth != ui_depth) {
+        // A UI movie can start without stencil and enable it for later text/masks. Masks are
+        // drawn with color writes off: a depth of the UI target's size is the UI's then.
+        const auto ui_sized = [&] {
+            const auto& d = texture_cache.GetImage(depth).info.size;
+            const auto& c = texture_cache.GetImage(ui_color).info.size;
+            return d.width + 8 > c.width && c.width + 8 > d.width &&
+                   d.height + 8 > c.height && c.height + 8 > d.height;
+        };
+        if (depth && depth != ui_depth && (color ? color == ui_color : ui_sized())) {
             EnsureUiResources(ui_width, ui_height, ui_format,
                               texture_cache.GetImage(depth).info.pixel_format);
             PrepareUiDepth(depth);
             ui_depth = depth;
         }
+        return;
+    }
+    if (!color) {
         return;
     }
     const auto& image = texture_cache.GetImage(color);

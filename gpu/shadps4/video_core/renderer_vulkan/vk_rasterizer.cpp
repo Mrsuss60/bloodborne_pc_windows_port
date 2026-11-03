@@ -1024,10 +1024,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_geometry = 0;
 
     PrepareRenderState(pipeline);
-    if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
+    const u32 draw_colors = std::popcount(pipeline->GetGraphicsKey().mrt_mask);
+    // Stencil-only draws (UI masks) too: their depth must become the UI depth.
+    if (upscaler->Enabled() && (draw_colors == 1 || (draw_colors == 0 && db_desc.first))) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
-                         cb_descs[0].first, db_desc.first,
+                         draw_colors ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
     }
     const PreparedDraw* draw_prepared = bind_prepared;
@@ -1239,10 +1241,11 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     motion_draw = false;
     motion_geometry = 0;
     PrepareRenderState(pipeline);
-    if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
+    const u32 draw_colors = std::popcount(pipeline->GetGraphicsKey().mrt_mask);
+    if (upscaler->Enabled() && (draw_colors == 1 || (draw_colors == 0 && db_desc.first))) {
         const auto& viewport = Regs().viewports[0];
         upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
-                         cb_descs[0].first, db_desc.first,
+                         draw_colors ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
     }
     if (!BindResources(pipeline)) {
