@@ -66,13 +66,82 @@ static size_t reads;
 static uint8_t connected_count;
 
 static uint64_t now_us(void) { return host_monotonic_ns() / 1000u; }
-static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
+static uint8_t axis(int16_t v) {
+    const int deadzone = 3200;
+    if (v > -deadzone && v < deadzone) return 128;
+    float scaled = (v > 0) ? (float)(v - deadzone) / (32767 - deadzone)
+                           : (float)(v + deadzone) / (32768 - deadzone);
+    int x = 128 + (int)lroundf(scaled * (scaled > 0 ? 127.0f : 128.0f));
+    return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
+}
 static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
 static uint16_t touch_axis(float v, int max) {
     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
 }
 static uint8_t synth_touch_id = 1;
 static uint64_t touch_down_us = 0;
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* Analog simulation for keyboard movement: smooth acceleration (rise 70ms, fall 45ms),
+ * natural angular sweep on direction changes (1100 deg/s), and true unit-circle normalization
+ * so diagonal movement does not overshoot or jerk, and straight movements stay dead-center. */
+typedef struct { float angle, mag; uint64_t last_us; } KeyStick;
+
+static float key_tunable(const char *name, float def) {
+    const char *env = getenv(name);
+    if (!env || !*env) return def;
+    const float v = (float)atof(env);
+    return v > 0.0f ? v : def;
+}
+
+static int key_stick(KeyStick *st, uint64_t now, int left, int right, int up, int down, uint8_t *x, uint8_t *y) {
+    static float rise_ms, fall_ms, turn_dps;
+    if (rise_ms == 0.0f) {
+        rise_ms = key_tunable("BB_KEY_RISE_MS", 70.0f);
+        fall_ms = key_tunable("BB_KEY_FALL_MS", 45.0f);
+        turn_dps = key_tunable("BB_KEY_TURN_DPS", 1100.0f);
+    }
+    const int tx = (right ? 1 : 0) - (left ? 1 : 0);
+    const int ty = (down ? 1 : 0) - (up ? 1 : 0);
+    float dt = (st->last_us && now > st->last_us) ? (float)(now - st->last_us) * 1e-6f : 0.0f;
+    st->last_us = now;
+    if (dt > 0.05f) dt = 0.05f;
+    const float target_mag = (tx || ty) ? 1.0f : 0.0f;
+    if (tx || ty) {
+        const float target = atan2f((float)ty, (float)tx);
+        if (st->mag < 0.12f) {
+            st->angle = target;
+        } else {
+            float diff = target - st->angle;
+            while (diff > (float)M_PI) diff -= 2.0f * (float)M_PI;
+            while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+            const float step = turn_dps * ((float)M_PI / 180.0f) * dt;
+            st->angle += (diff > step) ? step : ((diff < -step) ? -step : diff);
+        }
+    }
+    const float rate = (target_mag > st->mag) ? (1.0f / (rise_ms * 1e-3f)) : (1.0f / (fall_ms * 1e-3f));
+    const float dm = rate * dt;
+    st->mag += (target_mag > st->mag) ? ((target_mag - st->mag < dm) ? (target_mag - st->mag) : dm)
+                                      : -((st->mag - target_mag < dm) ? (st->mag - target_mag) : dm);
+    if (st->mag < 0.003f) {
+        st->mag = 0.0f;
+        return 0;
+    }
+    float fx = cosf(st->angle) * st->mag;
+    float fy = sinf(st->angle) * st->mag;
+    if (tx == 0 && ty != 0 && fabsf(fx) < 0.005f) fx = 0.0f;
+    if (ty == 0 && tx != 0 && fabsf(fy) < 0.005f) fy = 0.0f;
+    int vx = 128 + (int)lroundf(fx * 127.0f);
+    int vy = 128 + (int)lroundf(fy * 127.0f);
+    *x = (uint8_t)(vx < 0 ? 0 : vx > 255 ? 255 : vx);
+    *y = (uint8_t)(vy < 0 ? 0 : vy > 255 ? 255 : vy);
+    return 1;
+}
+
+static KeyStick move_stick;
 
 static void touch_click(PadData *d, int right) {
     uint64_t t = now_us();
@@ -431,11 +500,23 @@ static void sample_host(PadData *d) {
 
         // Movement (Left Stick); the walk key holds the stick under the engine's run threshold
         const int walk = is_action_down(binds[BB_ACTION_WALK], k, lmb, rmb, mmb, x1, x2, chords);
-        const uint8_t stick_lo = walk ? 128 - 48 : 0, stick_hi = walk ? 128 + 48 : 255;
-        if (is_action_down(binds[BB_ACTION_MOVE_LEFT], k, lmb, rmb, mmb, x1, x2, chords)) d->left_x = stick_lo;
-        else if (is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, chords)) d->left_x = stick_hi;
-        if (is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_lo;
-        else if (is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, chords)) d->left_y = stick_hi;
+        const int move_l = is_action_down(binds[BB_ACTION_MOVE_LEFT], k, lmb, rmb, mmb, x1, x2, chords);
+        const int move_r = is_action_down(binds[BB_ACTION_MOVE_RIGHT], k, lmb, rmb, mmb, x1, x2, chords);
+        const int move_u = is_action_down(binds[BB_ACTION_MOVE_FORWARD], k, lmb, rmb, mmb, x1, x2, chords);
+        const int move_d = is_action_down(binds[BB_ACTION_MOVE_BACKWARD], k, lmb, rmb, mmb, x1, x2, chords);
+        if (key_stick(&move_stick, d->timestamp, move_l, move_r, move_u, move_d, &d->left_x, &d->left_y)) {
+            if (walk) {
+                d->left_x = (uint8_t)(128 + ((int)d->left_x - 128) * 2 / 5);
+                d->left_y = (uint8_t)(128 + ((int)d->left_y - 128) * 2 / 5);
+            }
+        } else if (walk) {
+            d->left_x = (uint8_t)(128 + ((int)d->left_x - 128) * 2 / 5);
+            d->left_y = (uint8_t)(128 + ((int)d->left_y - 128) * 2 / 5);
+        }
+
+
+
+
 
         // Mouse as right stick whenever the native camera hook doesn't own it (lock-on target switching):
         // each delta is an impulse that decays over LOOK_TAU_US.
@@ -473,10 +554,14 @@ static void sample_host(PadData *d) {
         for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
         if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
         if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
-        if (k[SDL_SCANCODE_A]) d->left_x = 0;
-        else if (k[SDL_SCANCODE_D]) d->left_x = 255;
-        if (k[SDL_SCANCODE_W]) d->left_y = 0;
-        else if (k[SDL_SCANCODE_S]) d->left_y = 255;
+        const int key_l = k && k[SDL_SCANCODE_A];
+        const int key_r = k && k[SDL_SCANCODE_D];
+        const int key_u = k && k[SDL_SCANCODE_W];
+        const int key_d = k && k[SDL_SCANCODE_S];
+        key_stick(&move_stick, d->timestamp, key_l, key_r, key_u, key_d, &d->left_x, &d->left_y);
+
+
+
 
         if (k[SDL_SCANCODE_I]) d->right_y = 0;
         else if (k[SDL_SCANCODE_K]) d->right_y = 255;
