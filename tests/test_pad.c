@@ -124,5 +124,43 @@ int main(void) {
     assert(SDL_DetachVirtualJoystick(id));
     SDL_Quit();
     unlink(path);
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture");
+
+    /* Test key_stick last-input priority (SOCD last-win) */
+    KeyStick ks = {0};
+    uint8_t sx = 128, sy = 128;
+    uint64_t t = 1000000;
+
+    /* 1. Hold Left (A) for 10 frames (160ms) */
+    for (int i = 0; i < 10; ++i) { t += 16000; key_stick(&ks, t, 1, 0, 0, 0, &sx, &sy); }
+    assert(sx < 5 && sy == 128); /* Full Left */
+
+    /* 2. Press Right (D) while still holding Left (A) for 10 frames -> Right was pressed last, so Right wins! */
+    for (int i = 0; i < 10; ++i) { t += 16000; key_stick(&ks, t, 1, 1, 0, 0, &sx, &sy); }
+    assert(sx > 250 && sy == 128); /* Full Right */
+
+    /* 3. Release Right (D) while still holding Left (A) for 10 frames -> Left resumes! */
+    for (int i = 0; i < 10; ++i) { t += 16000; key_stick(&ks, t, 1, 0, 0, 0, &sx, &sy); }
+    assert(sx < 5 && sy == 128); /* Resumed Full Left */
+
+    /* 4. Release all -> centers to 128 */
+    for (int i = 0; i < 10; ++i) { t += 16000; if (!key_stick(&ks, t, 0, 0, 0, 0, &sx, &sy)) { sx = 128; sy = 128; } }
+    assert(sx == 128 && sy == 128);
+
+    /* 5. Vertical: Hold Up (W) for 10 frames */
+    for (int i = 0; i < 10; ++i) { t += 16000; key_stick(&ks, t, 0, 0, 1, 0, &sx, &sy); }
+    assert(sy < 5 && sx == 128); /* Full Up */
+
+    /* 6. Press Down (S) while holding Up (W) -> Down was pressed last, Down wins! */
+    for (int i = 0; i < 10; ++i) { t += 16000; key_stick(&ks, t, 0, 0, 1, 1, &sx, &sy); }
+    assert(sy > 250 && sx == 128); /* Full Down */
+
+    /* 7. Release Down (S) while holding Up (W) -> Up resumes! */
+    for (int i = 0; i < 10; ++i) { t += 16000; key_stick(&ks, t, 0, 0, 1, 0, &sx, &sy); }
+    assert(sy < 5 && sx == 128); /* Resumed Full Up */
+
+    /* 8. Release all -> centers to 128 */
+    for (int i = 0; i < 10; ++i) { t += 16000; if (!key_stick(&ks, t, 0, 0, 0, 0, &sx, &sy)) { sx = 128; sy = 128; } }
+    assert(sx == 128 && sy == 128);
+
+    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, key_stick SOCD");
 }

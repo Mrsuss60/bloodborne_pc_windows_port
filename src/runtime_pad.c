@@ -86,9 +86,16 @@ static uint64_t touch_down_us = 0;
 #endif
 
 /* Analog simulation for keyboard movement: smooth acceleration (rise 70ms, fall 45ms),
- * natural angular sweep on direction changes (1100 deg/s), and true unit-circle normalization
- * so diagonal movement does not overshoot or jerk, and straight movements stay dead-center. */
-typedef struct { float angle, mag; uint64_t last_us; } KeyStick;
+ * natural angular sweep on direction changes (1100 deg/s), true unit-circle normalization
+ * so diagonal movement does not overshoot or jerk, straight movements stay dead-center,
+ * and last-input priority (SOCD last-win) on opposing keys so strafing does not dead-stop. */
+typedef struct {
+    float angle, mag;
+    uint64_t last_us;
+    uint64_t press_seq;
+    uint64_t left_order, right_order, up_order, down_order;
+    uint8_t prev_left, prev_right, prev_up, prev_down;
+} KeyStick;
 
 static float key_tunable(const char *name, float def) {
     const char *env = getenv(name);
@@ -104,8 +111,59 @@ static int key_stick(KeyStick *st, uint64_t now, int left, int right, int up, in
         fall_ms = key_tunable("BB_KEY_FALL_MS", 45.0f);
         turn_dps = key_tunable("BB_KEY_TURN_DPS", 1100.0f);
     }
-    const int tx = (right ? 1 : 0) - (left ? 1 : 0);
-    const int ty = (down ? 1 : 0) - (up ? 1 : 0);
+
+    const int l_press = left && !st->prev_left;
+    const int r_press = right && !st->prev_right;
+    const int u_press = up && !st->prev_up;
+    const int d_press = down && !st->prev_down;
+
+    if (l_press && r_press) {
+        const uint64_t seq = ++st->press_seq;
+        st->left_order = seq;
+        st->right_order = seq;
+    } else if (l_press) {
+        st->left_order = ++st->press_seq;
+    } else if (r_press) {
+        st->right_order = ++st->press_seq;
+    }
+
+    if (u_press && d_press) {
+        const uint64_t seq = ++st->press_seq;
+        st->up_order = seq;
+        st->down_order = seq;
+    } else if (u_press) {
+        st->up_order = ++st->press_seq;
+    } else if (d_press) {
+        st->down_order = ++st->press_seq;
+    }
+
+    st->prev_left = left ? 1 : 0;
+    st->prev_right = right ? 1 : 0;
+    st->prev_up = up ? 1 : 0;
+    st->prev_down = down ? 1 : 0;
+
+    int tx = 0;
+    if (left && right) {
+        if (st->right_order > st->left_order) tx = 1;
+        else if (st->left_order > st->right_order) tx = -1;
+        else tx = 0;
+    } else if (right) {
+        tx = 1;
+    } else if (left) {
+        tx = -1;
+    }
+
+    int ty = 0;
+    if (up && down) {
+        if (st->down_order > st->up_order) ty = 1;
+        else if (st->up_order > st->down_order) ty = -1;
+        else ty = 0;
+    } else if (down) {
+        ty = 1;
+    } else if (up) {
+        ty = -1;
+    }
+
     float dt = (st->last_us && now > st->last_us) ? (float)(now - st->last_us) * 1e-6f : 0.0f;
     st->last_us = now;
     if (dt > 0.05f) dt = 0.05f;
@@ -118,8 +176,13 @@ static int key_stick(KeyStick *st, uint64_t now, int left, int right, int up, in
             float diff = target - st->angle;
             while (diff > (float)M_PI) diff -= 2.0f * (float)M_PI;
             while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-            const float step = turn_dps * ((float)M_PI / 180.0f) * dt;
-            st->angle += (diff > step) ? step : ((diff < -step) ? -step : diff);
+            if (fabsf(fabsf(diff) - (float)M_PI) < 0.15f) {
+                st->angle = target;
+                st->mag = 0.0f;
+            } else {
+                const float step = turn_dps * ((float)M_PI / 180.0f) * dt;
+                st->angle += (diff > step) ? step : ((diff < -step) ? -step : diff);
+            }
         }
     }
     const float rate = (target_mag > st->mag) ? (1.0f / (rise_ms * 1e-3f)) : (1.0f / (fall_ms * 1e-3f));
