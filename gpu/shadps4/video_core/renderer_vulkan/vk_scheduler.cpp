@@ -26,24 +26,33 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-void ReportCommandOutsideChunk(const void* chunk, size_t chunk_used,
-                               const void* command) noexcept {
-    /* Once per session: the same overwritten chunk would report on every
-     * Execute call, and this path abandons the rest of the chunk anyway. */
-    static std::atomic<bool> reported{false};
-    if (reported.exchange(true, std::memory_order_relaxed)) {
+void ReportCommandOutsideChunk(const void* chunk, size_t chunk_used, const void* command,
+                               const char* reason) noexcept {
+    /* Rate limited rather than once per session: a single overwritten chunk abandons the rest of
+     * its list on every Execute, and the next ones carry the same defect. */
+    static std::atomic<u32> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 32) {
         return;
     }
     const auto base = reinterpret_cast<std::uintptr_t>(chunk);
     const auto addr = reinterpret_cast<std::uintptr_t>(command);
     LOG_CRITICAL(Render_Vulkan,
-                 "RecordChunk::Execute: command {:#x} is outside the chunk storage [{:#x}..{:#x}) "
-                 "(slot {}, used {}, capacity {}): dropped the rest of the chunk",
-                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(base),
-                 static_cast<unsigned long long>(base + chunk_used),
+                 "RecordChunk::Execute: {} for command {:#x} (slot {}, used {}, capacity {}): "
+                 "dropped the rest of the chunk",
+                 reason, static_cast<unsigned long long>(addr),
                  static_cast<unsigned long long>(addr - base),
                  static_cast<unsigned long long>(chunk_used),
                  static_cast<unsigned long long>(RecordChunk::Capacity));
+}
+
+void ReportRecordOutOfMemory() noexcept {
+    static std::atomic<u32> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    LOG_CRITICAL(Render_Vulkan,
+                 "Recording chunk is out of host memory: the affected draw is skipped instead of "
+                 "being recorded with data that was not copied");
 }
 
 Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
@@ -321,23 +330,29 @@ void Scheduler::KickRecording(bool force) {
     }
     // Callers kick where nobody holds the raw command buffer: deferral resumes.
     direct_mode = false;
-    // Batches of tens of KiB keep the queue handoff cheap relative to the work it carries.
-    if (!force && full_chunks.empty() && CurrentChunk().Size() < 32 * 1024) {
-        return;
-    }
-    if (full_chunks.empty() && CurrentChunk().Empty()) {
-        return;
-    }
-    // The chunk that takes the current one's place, taken first (AcquireChunk locks
-    // recorder_mutex) and swapped in below: record_chunk is never null, not even for a fault
-    // handler recording on this thread meanwhile (issue #100).
-    std::unique_ptr<RecordChunk> next_record = record_chunk->Empty() ? nullptr : AcquireChunk();
-    bool wake;
+    bool wake = false;
     {
-        std::scoped_lock lk{recorder_mutex};
+        /* bbport: the same lock the recording path takes. Handing the current chunk to the
+         * recorder while another thread is still pushing into it let the recorder reset `used`
+         * and recycle the storage under that thread (#185, "randomly closes after 10-60 min"). */
+        std::scoped_lock lk{record_mutex};
+        // Batches of tens of KiB keep the queue handoff cheap relative to the work it carries.
+        if (!force && full_chunks.empty() && CurrentChunk().Size() < 32 * 1024) {
+            return;
+        }
+        if (full_chunks.empty() && CurrentChunk().Empty()) {
+            return;
+        }
+        // The chunk that takes the current one's place, taken first (AcquireChunk locks
+        // recorder_mutex) and swapped in below: record_chunk is never null, not even for a fault
+        // handler recording on this thread meanwhile (issue #100).
+        std::unique_ptr<RecordChunk> next_record =
+            CurrentChunk().Empty() ? nullptr : AcquireChunk();
+        std::scoped_lock recorder_lk{recorder_mutex};
         for (auto& chunk : full_chunks) {
             recorder_queue.push_back(std::move(chunk));
         }
+        full_chunks.clear();
         if (next_record) {
             record_chunk.swap(next_record); // next_record: the chunk handed over
             recorder_queue.push_back(std::move(next_record));
@@ -345,7 +360,6 @@ void Scheduler::KickRecording(bool force) {
         wake = recorder_sleeping;
         queued_chunks.store(recorder_queue.size(), std::memory_order_release);
     }
-    full_chunks.clear();
     // A busy recorder picks the new chunks up by itself: waking it is a syscall per draw.
     if (wake) {
         recorder_cv.notify_one();

@@ -5,11 +5,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <new>
 #include <span>
 #include <utility>
 #include <vector>
@@ -579,7 +581,13 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 /// a recorded command that is not inside its chunk's storage (the intrusive list was
 /// overwritten). Logs once per session; `chunk` is the chunk storage, `chunk_used` its high
 /// water mark (chunk slot index = command - chunk).
-void ReportCommandOutsideChunk(const void* chunk, size_t chunk_used, const void* command) noexcept;
+void ReportCommandOutsideChunk(const void* chunk, size_t chunk_used, const void* command,
+                               const char* reason) noexcept;
+
+/// A recorded command could not be stored (host out of memory). The command is dropped, never
+/// run with data that was not copied: a dropped draw leaves a frame wrong, a freed span crashes
+/// the driver.
+void ReportRecordOutOfMemory() noexcept;
 
 /// a block of deferred Vulkan commands. Commands are closures placed in
 /// fixed storage (no allocation per command) and run in order on the recording thread.
@@ -587,46 +595,64 @@ class RecordChunk {
 public:
     static constexpr size_t Capacity = 128 * 1024;
 
-    /// Returns false (and leaves `func` untouched) when the chunk has no room.
+    /// Stamp of a live command slot. Command storage is bump-allocated, so a slot is only ever
+    /// written once; a stamp that no longer matches means the chunk memory was reused under a
+    /// live command list. Checking it costs one load and catches what the address check cannot
+    /// (#185: the "vtable" read was 0x756ad00, i.e. buffer-handle data in the slot).
+    static constexpr std::uint32_t CommandMagic = 0x4242434Du; // "BBCM"
+
+    /// Records `func`. Only false when the host is out of memory; the command storage spills to
+    /// the heap instead of failing, so a full chunk can never split data from its command.
     template <typename Func>
     bool Push(Func&& func) {
         using Command = TypedCommand<std::decay_t<Func>>;
         static_assert(sizeof(Command) <= Capacity, "recorded command is too large");
-        const size_t offset = (used + alignof(Command) - 1) & ~(alignof(Command) - 1);
-        if (offset + sizeof(Command) > Capacity) {
+        auto* slot = static_cast<void*>(Allocate(sizeof(Command), alignof(Command)));
+        if (!slot) [[unlikely]] {
             return false;
         }
-        auto* command = new (storage + offset) Command(std::forward<Func>(func));
+        auto* command = new (slot) Command(std::forward<Func>(func));
         if (last) {
             last->next = command;
         } else {
             first = command;
         }
         last = command;
-        used = offset + sizeof(Command);
-        PrefetchAhead();
         return true;
     }
 
-    /// Raw storage in the chunk for a command's variable-length data; null when full.
+    /// Raw storage in the chunk for a command's variable-length data. Bump-allocated from the
+    /// fixed block; the heap spill keeps it in the same chunk when the block is full, so the
+    /// data can never be split from the command that reads it. Null only on host OOM.
     void* Allocate(size_t bytes, size_t align) {
-        const size_t offset = (used + align - 1) & ~(align - 1);
-        if (offset + bytes > Capacity) {
-            return nullptr;
+        if (bytes == 0) {
+            return storage + used;
         }
-        used = offset + bytes;
-        PrefetchAhead();
-        return storage + offset;
+        if (align < alignof(std::max_align_t)) {
+            align = alignof(std::max_align_t);
+        }
+        const size_t offset = (used + align - 1) & ~(align - 1);
+        if (offset + bytes <= Capacity) {
+            used = offset + bytes;
+            PrefetchAhead();
+            return storage + offset;
+        }
+        return AllocateSpill(bytes, align);
     }
 
     void Execute(vk::CommandBuffer cmdbuf) {
         for (CommandBase* command = first; command;) {
             /* bbport: a command outside this chunk's storage means the list was overwritten
              * (phase-2 C8: the loop read command 0 at +0x1d7378 and 0x4803b9f9492 at +0x1d2c38,
-             * both faulting on [command+0x10]). Two integer comparisons, no dereference, so it
-             * runs unconditionally: no legitimate command is ever outside its own chunk. */
+             * both faulting on [command+0x10]). The stamp check below additionally rejects a
+             * slot whose memory was reused for data; both are integer comparisons on validated
+             * memory, so they run unconditionally. */
             if (!InChunk(command)) {
-                ReportCommandOutsideChunk(storage, used, command);
+                ReportCommandOutsideChunk(storage, used, command, "outside the chunk storage");
+                break;
+            }
+            if (command->magic != CommandMagic) {
+                ReportCommandOutsideChunk(storage, used, command, "command stamp overwritten");
                 break;
             }
             CommandBase* const next = command->next;
@@ -636,6 +662,7 @@ public:
         }
         first = last = nullptr;
         used = 0;
+        spill.clear();
     }
 
     [[nodiscard]] bool Empty() const noexcept {
@@ -657,9 +684,36 @@ private:
         }
     }
 
+    /// A block owned by this chunk for data/commands that did not fit in `storage`. Freed once
+    /// the chunk has been executed, so anything it holds outlives every command recorded with
+    /// it and never outlives the chunk.
+    struct Spill {
+        std::unique_ptr<std::byte[]> memory;
+        std::byte* data = nullptr;
+        size_t size = 0;
+    };
+
+    void* AllocateSpill(size_t bytes, size_t align) {
+        if (align > 64) {
+            align = 64;
+        }
+        // One extra alignment unit so the returned pointer can be aligned by hand.
+        auto memory = std::unique_ptr<std::byte[]>(new (std::nothrow) std::byte[bytes + align]);
+        if (!memory) [[unlikely]] {
+            return nullptr;
+        }
+        const auto base = reinterpret_cast<std::uintptr_t>(memory.get());
+        const auto aligned = (base + (align - 1)) & ~static_cast<std::uintptr_t>(align - 1);
+        spill.push_back(Spill{std::move(memory), reinterpret_cast<std::byte*>(aligned), bytes});
+        return reinterpret_cast<void*>(aligned);
+    }
+
     struct CommandBase {
         virtual ~CommandBase() = default;
         virtual void Execute(vk::CommandBuffer cmdbuf) = 0;
+        /// Checked before the virtual call; see CommandMagic.
+        std::uint32_t magic = CommandMagic;
+        std::uint32_t reserved = 0;
         CommandBase* next{};
     };
     template <typename Func>
@@ -673,17 +727,28 @@ private:
     };
 
     /// Whether `command` points at a command slot inside this chunk: the loop in Execute() is
-    /// about to read its vtable, so the check is two integer comparisons and no dereference.
+    /// about to read its vtable, so the check is integer comparisons and no dereference.
     [[nodiscard]] bool InChunk(const CommandBase* command) const noexcept {
         const auto base = reinterpret_cast<std::uintptr_t>(storage);
         const auto addr = reinterpret_cast<std::uintptr_t>(command);
-        return addr >= base && addr + sizeof(CommandBase) <= base + used;
+        if (addr >= base && addr + sizeof(CommandBase) <= base + used) {
+            return true;
+        }
+        for (const auto& block : spill) {
+            const auto start = reinterpret_cast<std::uintptr_t>(block.data);
+            if (addr >= start && addr + sizeof(CommandBase) <= start + block.size) {
+                return true;
+            }
+        }
+        return false;
     }
 
     alignas(64) std::byte storage[Capacity];
     size_t used = 0;
     CommandBase* first{};
     CommandBase* last{};
+    /// Rare: only a batch that crosses the end of `storage` uses it. Cleared by Execute().
+    std::vector<Spill> spill;
 };
 class Scheduler {
 public:
@@ -760,10 +825,20 @@ public:
             func(current_cmdbuf);
             return;
         }
-        if (!CurrentChunk().Push(std::forward<Func>(func))) {
-            RetireChunk();
-            const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
-            ASSERT(pushed);
+        /* bbport: the chunk is bookkeeping shared by the threads allowed to record (the GPU
+         * command thread and the draw recording thread). Without this lock a RecordData() copy
+         * or a RetireChunk() on one thread can land on a command another thread just pushed -
+         * #185 read a buffer handle where the vtable of its command was. */
+        std::scoped_lock lk{record_mutex};
+        if (record_data_failed.load(std::memory_order_relaxed)) [[unlikely]] {
+            // A RecordData() of this batch could not be copied: the command would read a span
+            // that was never filled (or a null one). Skipping it leaves a frame wrong; running
+            // it crashes the driver.
+            return;
+        }
+        if (!CurrentChunk().Push(std::forward<Func>(func))) [[unlikely]] {
+            ReportRecordOutOfMemory(); // host OOM only: Push() spills instead of failing
+            return;
         }
     }
 
@@ -779,36 +854,47 @@ public:
         return direct_mode;
     }
 
-    /// Makes room for `bytes` of RecordData() plus the command that uses them in the current
-    /// chunk: data and command must share a chunk, which is recycled once executed.
+    /// Makes room for a batch of RecordData() plus the commands that read it, in one chunk.
+    /// Must be called before the batch's first RecordData(): retirement is only safe at batch
+    /// boundaries. Data and commands are never separated afterwards - RecordData() spills
+    /// instead of retiring, and Print/Push() spills instead of failing.
     void ReserveRecordData(size_t bytes) {
         if (!IsRecordingDeferred()) {
             return;
         }
-        ASSERT(bytes + 256 <= RecordChunk::Capacity);
-        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 256) {
+        std::scoped_lock lk{record_mutex};
+        record_data_failed.store(false, std::memory_order_relaxed);
+        if (bytes + RecordCommandHeadroom > RecordChunk::Capacity) {
+            // A batch larger than a chunk: retiring cannot make room, the spill carries it.
+            return;
+        }
+        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + RecordCommandHeadroom) {
             RetireChunk();
         }
     }
 
-    /// Copies data into recording storage that lives until the command that uses it has
-    /// been recorded (the same chunk). With threaded recording off, returns data itself.
+    /// Copies data into recording storage that lives until the command that uses it has been
+    /// recorded (the same chunk). With threaded recording off, returns data itself.
     template <typename T>
     std::span<const T> RecordData(std::span<const T> data) {
         if (!IsRecordingDeferred() || data.empty()) {
             return data;
         }
-        const size_t bytes = data.size_bytes();
-        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 256) {
-            RetireChunk();
+        std::scoped_lock lk{record_mutex};
+        /* bbport: this used to retire the chunk when the copy was close to the end. That split
+         * the batch: the data stayed in the retired chunk (executed and recycled first) while
+         * its command went to the next one, so the driver read freed memory (#185, "randomly
+         * closes after 10-60 min": nvoglv64 [rcx+0x130] with rcx=0). The chunk now keeps the
+         * copy - in its fixed block or in the spill that it frees only after Execute(). */
+        auto* dst = static_cast<T*>(CurrentChunk().Allocate(data.size_bytes(), alignof(T)));
+        if (!dst) [[unlikely]] {
+            /* Host OOM: there is no safe span to hand the command, so this batch's commands
+             * are dropped rather than run against a null/param pointer. */
+            record_data_failed.store(true, std::memory_order_relaxed);
+            ReportRecordOutOfMemory();
+            return {};
         }
-        auto* dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
-        if (!dst) {
-            RetireChunk();
-            dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
-            ASSERT(dst);
-        }
-        std::memcpy(dst, data.data(), bytes);
+        std::memcpy(dst, data.data(), data.size_bytes());
         return {dst, data.size()};
     }
 
@@ -909,11 +995,18 @@ public:
     static std::mutex submit_mutex;
 
 private:
+    /// Data bytes a batch may need plus room for the Record() calls that read them. The old
+    /// value (256) did not cover the two or three commands EmitVertexBuffers pushes after its
+    /// data, so the last one could be pushed into a new chunk (#185).
+    static constexpr size_t RecordCommandHeadroom = 4096;
+
     void AllocateWorkerCommandBuffers();
 
     std::unique_ptr<RecordChunk> AcquireChunk();
 
     /// Moves the full current chunk aside; a new one takes its place (swapped in: never null).
+    /// Callers must hold `record_mutex`: a chunk retired while another thread still records into
+    /// it is executed (and recycled) under that thread's writes.
     void RetireChunk() {
         auto full = AcquireChunk();
         record_chunk.swap(full);
@@ -963,6 +1056,12 @@ private:
     // bbport: threaded recording
     std::unique_ptr<RecordChunk> record_chunk;
     std::vector<std::unique_ptr<RecordChunk>> full_chunks;
+    /// Serializes the chunk bump allocator and its hand-off to the recorder (see Record()).
+    /// Order: record_mutex before recorder_mutex, never the other way round.
+    std::mutex record_mutex;
+    /// A RecordData() of the current batch could not be copied (host OOM); the batch's commands
+    /// are dropped until the next ReserveRecordData().
+    std::atomic<bool> record_data_failed{false};
     std::mutex recorder_mutex;
     std::condition_variable_any recorder_cv;
     std::condition_variable_any recorder_idle_cv;

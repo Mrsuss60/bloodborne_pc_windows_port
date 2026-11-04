@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -84,9 +88,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const auto device = instance.GetDevice();
     auto [descriptor_set_result, descriptor_set] =
         device.createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(descriptor_set_result == vk::Result::eSuccess,
-               "Failed to create compute descriptor set layout: {}",
-               vk::to_string(descriptor_set_result));
+    if (descriptor_set_result != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed to create compute descriptor set layout: " +
+                                 vk::to_string(descriptor_set_result));
+    }
     desc_layout = std::move(descriptor_set);
 
     const vk::DescriptorSetLayout set_layout = *desc_layout;
@@ -97,8 +102,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .pPushConstantRanges = &push_constants,
     };
     auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create compute pipeline layout: {}", vk::to_string(layout_result));
+    if (layout_result != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed to create compute pipeline layout: " +
+                                 vk::to_string(layout_result));
+    }
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
@@ -106,10 +113,22 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
-    auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
-               vk::to_string(pipeline_result));
+    /* bbport: a VkPipelineCache needs external synchronization; the async workers share this one
+     * with the GPU thread. Failure is raised to PipelineCache (which skips the pipeline) instead
+     * of aborting the process. */
+    vk::Result pipeline_result = vk::Result::eSuccess;
+    vk::UniquePipeline pipe;
+    {
+        std::scoped_lock lock{PipelineCreationMutex()};
+        auto created =
+            instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+        pipeline_result = created.result;
+        pipe = std::move(created.value);
+    }
+    if (pipeline_result != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed to create compute pipeline: " +
+                                 vk::to_string(pipeline_result));
+    }
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
 }

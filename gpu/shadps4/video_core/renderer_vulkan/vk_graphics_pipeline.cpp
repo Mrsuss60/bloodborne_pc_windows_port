@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 #include <mutex>
@@ -14,6 +16,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -70,8 +73,10 @@ GraphicsPipeline::GraphicsPipeline(
         .pPushConstantRanges = &push_constants,
     };
     auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
+    if (layout_result != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed to create graphics pipeline layout: " +
+                                 vk::to_string(layout_result));
+    }
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
 
@@ -231,7 +236,10 @@ GraphicsPipeline::GraphicsPipeline(
                         .pCode = sdata.tcs.data(),
                     };
                     auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
-                    ASSERT_MSG(res == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}", vk::to_string(res));
+                    if (res != vk::Result::eSuccess) {
+                        throw std::runtime_error("Failed to compile SPIR-V shader: " +
+                                                 vk::to_string(res));
+                    }
                     it = aux_tcs_cache.emplace(key, std::move(mod)).first;
                 }
                 return *it->second;
@@ -271,7 +279,10 @@ GraphicsPipeline::GraphicsPipeline(
                         .pCode = sdata.tes.data(),
                     };
                     auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
-                    ASSERT_MSG(res == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}", vk::to_string(res));
+                    if (res != vk::Result::eSuccess) {
+                        throw std::runtime_error("Failed to compile SPIR-V shader: " +
+                                                 vk::to_string(res));
+                    }
                     it = aux_tes_cache.emplace(key, std::move(mod)).first;
                 }
                 return *it->second;
@@ -308,7 +319,10 @@ GraphicsPipeline::GraphicsPipeline(
                         .pCode = sdata.fragment.data(),
                     };
                     auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
-                    ASSERT_MSG(res == vk::Result::eSuccess, "Failed to compile SPIR-V shader: {}", vk::to_string(res));
+                    if (res != vk::Result::eSuccess) {
+                        throw std::runtime_error("Failed to compile SPIR-V shader: " +
+                                                 vk::to_string(res));
+                    }
                     it = aux_frag_cache.emplace(key, std::move(mod)).first;
                 }
                 return *it->second;
@@ -486,10 +500,22 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
-    auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
+    /* bbport: Vulkan requires external synchronization on VkPipelineCache. The async pipeline
+     * workers and the GPU thread create pipelines at the same time otherwise, which RADV answers
+     * with ErrorUnknown; the old ASSERT_MSG then exited the process (exit code 23). Serializing
+     * the call fixes the cause, and a failure is reported to PipelineCache instead of aborting. */
+    vk::Result pipeline_result = vk::Result::eSuccess;
+    vk::UniquePipeline pipe;
+    {
+        std::scoped_lock lock{PipelineCreationMutex()};
+        auto created = device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+        pipeline_result = created.result;
+        pipe = std::move(created.value);
+    }
+    if (pipeline_result != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed to create graphics pipeline: " +
+                                 vk::to_string(pipeline_result));
+    }
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
@@ -599,8 +625,10 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     };
     auto [layout_result, layout] =
         instance.GetDevice().createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics descriptor set layout: {}", vk::to_string(layout_result));
+    if (layout_result != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed to create graphics descriptor set layout: " +
+                                 vk::to_string(layout_result));
+    }
     desc_layout = std::move(layout);
 }
 

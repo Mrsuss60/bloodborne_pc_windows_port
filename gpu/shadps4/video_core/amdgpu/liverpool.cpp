@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <pthread.h>
 #ifdef _WIN32
@@ -79,6 +81,35 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     }
 
     return span.subspan(offset);
+}
+
+/* bbport: a PM4 stream that cannot be parsed (wrong packet type, unknown opcode) is malformed or
+ * desynced: the following dwords are not packets, so parsing on executes garbage - that is the
+ * "Wrong PM4 type 1"/"5026 vs 3273" desync that used to end in UNREACHABLE_MSG (exit code 23) or
+ * a fault. Dump the packet head once per occurrence (rate limited) and let the caller abandon
+ * the submission or skip the packet; one wrong frame instead of a dead process. */
+static void ReportBadPm4(const char* what, u32 value, std::span<const u32> words, bool abandon) {
+    static std::atomic<u32> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 32) {
+        return;
+    }
+    std::array<u32, 8> dwords{};
+    const size_t count = words.size() < dwords.size() ? words.size() : dwords.size();
+    for (size_t i = 0; i < count; ++i) {
+        dwords[i] = words[i];
+    }
+    LOG_CRITICAL(Render,
+                 "PM4: {} ({:#x}){}; dwords: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} "
+                 "{:08x}",
+                 what, value, abandon ? " - abandoning the rest of the submission" : "", dwords[0],
+                 dwords[1], dwords[2], dwords[3], dwords[4], dwords[5], dwords[6], dwords[7]);
+}
+
+/// bbport: true while a malformed-packet message may still be logged (the packet loop can repeat
+/// the same issue every submission, and a log line per frame costs more than the skipped work).
+static bool ReportPm4Issue() {
+    static std::atomic<u32> reported{0};
+    return reported.fetch_add(1, std::memory_order_relaxed) < 16;
 }
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
@@ -371,8 +402,14 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
                                dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
                                false, false);
     } else {
-        UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
-                        u32(dma_data->dst_sel));
+        /* bbport: an unimplemented DMA source/destination pair. Skipping this one copy cannot
+         * corrupt unrelated state, while UNREACHABLE_MSG ended the process (exit code 23). */
+        static std::atomic<u32> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render,
+                      "WriteData: unsupported transfer src_sel = {}, dst_sel = {}; copy skipped",
+                      u32(dma_data->src_sel), u32(dma_data->dst_sel));
+        }
     }
 }
 
@@ -411,7 +448,15 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
         }
     });
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
-        ASSERT(event_eos.size == 1);
+        /* bbport: the GDS store below assumes one dword. Skipping it is safe; the old ASSERT
+         * ended the process. */
+        if (event_eos.size != 1) {
+            if (ReportPm4Issue()) {
+                LOG_ERROR(Render, "EventWriteEos GdsStore: unexpected size {}; store skipped",
+                          u32(event_eos.size));
+            }
+            return;
+        }
         rasterizer.Finish();
         const u32 value = rasterizer.ReadDataFromGds(event_eos.gds_index);
         *event_eos.Address() = value;
@@ -475,8 +520,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             continue;
         }
         if (type != 3) {
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", type);
+            // No other types of packets were spotted so far: the stream is desynced.
+            ReportBadPm4("Invalid PM4 type (CE)", type, ccb, true);
+            ccb = {};
+            break;
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
@@ -543,9 +590,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             break;
         }
         default:
-            const u32 count = header->type3.NumWords();
-            UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                            static_cast<u32>(opcode), count);
+            // The header is well formed (type 3 with a known length): skip this packet only.
+            ReportBadPm4("Unknown PM4 type 3 opcode (CE)", static_cast<u32>(opcode), ccb, false);
         }
         ccb = NextPacket(ccb, packet_words);
     }
@@ -812,7 +858,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 seq) {
 
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
+            // There is no length to trust for an unknown type: drop the rest of this submission.
+            ReportBadPm4("Wrong PM4 type (graphics)", type, dcb, true);
+            dcb = {};
             break;
         case 0: {
             // A zero dword is often padding (alignment or trailing) in command chunks.
@@ -941,9 +989,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 seq) {
                     ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
 
                     const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
+                    /* bbport: a missing trailing NOP hint only means the extent is unknown;
+                     * clear it instead of aborting the process (exit code 23). */
+                    if ((nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) &&
+                        payload[nop_offset] == 0xc0001000) {
                         last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
                     } else {
                         last_cb_extent[col_buf_id].raw = 0;
@@ -964,17 +1013,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 seq) {
                     ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
 
                     const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x04) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
+                    if (nop_offset == 0x04 && payload[nop_offset] == 0xc0001000) {
                         last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
                     }
                     break;
                 }
                 case ContextRegs::DbZInfo: {
-                    if (header->type3.count == 8) {
-                        ASSERT_MSG(payload[20] == 0xc0001000,
-                                   "NOP hint is missing in DB setup sequence");
+                    if (header->type3.count == 8 && payload[20] == 0xc0001000) {
                         last_db_extent.raw = payload[21];
                     } else {
                         last_db_extent.raw = 0;
@@ -992,7 +1037,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 seq) {
 
                 if (set_data->reg_offset >= 0x200 &&
                     set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                    ASSERT(set_size <= sizeof(ComputeProgram));
+                    /* bbport: never memcpy past cs_state. A packet claiming more than the
+                     * program block holds is malformed; skip it instead of overflowing. */
+                    if (set_size > sizeof(ComputeProgram)) {
+                        if (ReportPm4Issue()) {
+                            LOG_WARNING(Render,
+                                        "SetShReg (graphics): packet size {} exceeds the compute "
+                                        "program block; skipped",
+                                        set_size);
+                        }
+                        break;
+                    }
                     auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
                                  (set_data->reg_offset - 0x200);
                     std::memcpy(addr, header + 2, set_size);
@@ -1199,7 +1254,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 seq) {
             }
             case PM4ItOpcode::SetBase: {
                 const auto* set_base = reinterpret_cast<const PM4CmdSetBase*>(header);
-                ASSERT(set_base->base_index == PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable);
+                if (set_base->base_index != PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable) {
+                    if (ReportPm4Issue()) {
+                        LOG_WARNING(Render,
+                                    "SetBase: unexpected base index {}; packet skipped",
+                                    magic_enum::enum_name(set_base->base_index.Value()));
+                    }
+                    break;
+                }
                 indirect_args_addr = set_base->Address<u64>();
                 break;
             }
@@ -1264,8 +1326,28 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 seq) {
             }
             case PM4ItOpcode::WriteData: {
                 const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-                ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-                ASSERT(!write_data->wr_one_addr.Value());
+                /* bbport: only the two memory destination encodings and the "data in packet"
+                 * form below are understood. Anything else used to abort (exit code 23);
+                 * skipping one write keeps the process alive. */
+                if ((write_data->dst_sel.Value() != 2 && write_data->dst_sel.Value() != 5) ||
+                    write_data->wr_one_addr.Value()) {
+                    if (ReportPm4Issue()) {
+                        LOG_WARNING(Render,
+                                    "WriteData: unsupported dst_sel = {}, wr_one_addr = {}; packet "
+                                    "skipped",
+                                    write_data->dst_sel.Value(), write_data->wr_one_addr.Value());
+                    }
+                    break;
+                }
+                /* bbport: the data size below is (count - 2) dwords; a shorter packet would
+                 * underflow to a huge memcpy (access violation) - skip it. */
+                if (count < 2) {
+                    if (ReportPm4Issue()) {
+                        LOG_WARNING(Render, "WriteData: packet too short (count {}); skipped",
+                                    count);
+                    }
+                    break;
+                }
                 if (rasterizer) {
                     // In order with the draws (on the draw recording thread when in use).
                     BbWriteLog::NoteIntent(write_data->Address<u64>(), write_data->data,
@@ -1451,8 +1533,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, u64 seq) {
                 break;
             }
             default:
-                UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                                static_cast<u32>(opcode), count);
+                // Type-3 header with a known length: skip this packet and keep the submission.
+                ReportBadPm4("Unknown PM4 type 3 opcode (graphics)", static_cast<u32>(opcode), dcb,
+                             false);
             }
             // The size read before running the packet: a flip or an EOP interrupt lets the guest
             // reuse this buffer while we are still on it, so the header may be gone by now.
@@ -1563,8 +1646,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
                 break;
             }
-            // No other types of packets were spotted so far
-            UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
+            // No other types of packets were spotted so far: the stream is desynced.
+            ReportBadPm4("Invalid PM4 type (compute)", header->type.Value(), acb, true);
+            if constexpr (!is_indirect) {
+                *queue.read_addr += acb.size();
+                *queue.read_addr %= queue.ring_size_dw;
+            }
+            break;
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
@@ -1603,7 +1691,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                 break;
             }
-            ASSERT(dma_data->command.das == 0);
+            /* bbport: `das` selects an unsupported data-size/layout form. Skipping this one
+             * transfer is safe; the old ASSERT ended the process. */
+            if (dma_data->command.das != 0) {
+                if (ReportPm4Issue()) {
+                    LOG_WARNING(Render, "DmaData: unsupported data-size field {}; packet skipped",
+                                dma_data->command.das);
+                }
+                break;
+            }
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
                 rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
                                        true);
@@ -1639,8 +1735,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
                 }
             } else {
-                UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
-                                u32(dma_data->dst_sel));
+                // bbport: unimplemented transfer pair; skip it instead of exiting.
+                if (ReportPm4Issue()) {
+                    LOG_WARNING(Render,
+                                "DmaData: unsupported transfer src_sel = {}, dst_sel = {}; "
+                                "packet skipped",
+                                u32(dma_data->src_sel), u32(dma_data->dst_sel));
+                }
             }
             break;
         }
@@ -1663,7 +1764,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
             if (set_data->reg_offset >= 0x200 &&
                 set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                ASSERT(set_size <= sizeof(ComputeProgram));
+                /* bbport: never memcpy past cs_state; skip a malformed packet instead. */
+                if (set_size > sizeof(ComputeProgram)) {
+                    if (ReportPm4Issue()) {
+                        LOG_WARNING(Render,
+                                    "SetShReg (compute): packet size {} exceeds the compute "
+                                    "program block; skipped",
+                                    set_size);
+                    }
+                    break;
+                }
                 auto* addr = reinterpret_cast<u32*>(&mapped_queues[vqid + 1].cs_state) +
                              (set_data->reg_offset - 0x200);
                 std::memcpy(addr, header + 2, set_size);
@@ -1737,13 +1847,29 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer->WaitDeferredSignals();
             }
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-            ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-            const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
-            } else {
-                UNREACHABLE();
+            /* bbport: only the two memory destination encodings and the "data in packet" form
+             * are understood. Anything else used to abort; skip this write instead. */
+            if ((write_data->dst_sel.Value() != 2 && write_data->dst_sel.Value() != 5) ||
+                write_data->wr_one_addr.Value()) {
+                if (ReportPm4Issue()) {
+                    LOG_WARNING(Render,
+                                "WriteData (compute): unsupported dst_sel = {}, wr_one_addr = {}; "
+                                "packet skipped",
+                                write_data->dst_sel.Value(), write_data->wr_one_addr.Value());
+                }
+                break;
             }
+            /* bbport: the data size below is (count - 2) dwords; a shorter packet would
+             * underflow to a huge memcpy (access violation) - skip it. */
+            if (header->type3.count.Value() < 2) {
+                if (ReportPm4Issue()) {
+                    LOG_WARNING(Render, "WriteData (compute): packet too short (count {}); skipped",
+                                header->type3.count.Value());
+                }
+                break;
+            }
+            const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             break;
         }
         case PM4ItOpcode::MemSemaphore: {
@@ -1760,7 +1886,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
-            ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            /* bbport: Test() only reads the register file for engine Me; for any other engine
+             * the loop below would test the wrong state and could spin forever. Skip it. */
+            if (wait_reg_mem->engine.Value() != PM4CmdWaitRegMem::Engine::Me) {
+                if (ReportPm4Issue()) {
+                    LOG_WARNING(Render, "WaitRegMem: unsupported engine {}; packet skipped",
+                                magic_enum::enum_name(wait_reg_mem->engine.Value()));
+                }
+                break;
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
@@ -1796,8 +1930,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         default:
-            UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                            static_cast<u32>(opcode), header->type3.NumWords());
+            // Type-3 header with a known length: skip this packet and keep the submission.
+            ReportBadPm4("Unknown PM4 type 3 opcode (compute)", static_cast<u32>(opcode), acb,
+                         false);
         }
 
         acb = NextPacket(acb, next_dw_off);
@@ -1818,10 +1953,26 @@ void Liverpool::HandleGetLodStats(const PM4CmdGetLodStats* get_lod) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
+    /* bbport: the reserved capacity is sized for the largest submission the guest was seen to
+     * send, but it can exceed that. The assert ended the process; growing may reallocate these
+     * buffers, and the incoming spans can point into them, so copy the input first in that case. */
+    std::vector<u32> dcb_keep, ccb_keep;
+    if (queue.dcb_buffer.capacity() < queue.dcb_buffer_offset + dcb.size()) {
+        if (ReportPm4Issue()) {
+            LOG_WARNING(Render, "dcb copy buffer too small ({} > {}), growing",
+                        queue.dcb_buffer_offset + dcb.size(), queue.dcb_buffer.capacity());
+        }
+        dcb_keep.assign(dcb.begin(), dcb.end());
+        dcb = dcb_keep;
+    }
+    if (queue.ccb_buffer.capacity() < queue.ccb_buffer_offset + ccb.size()) {
+        if (ReportPm4Issue()) {
+            LOG_WARNING(Render, "ccb copy buffer too small ({} > {}), growing",
+                        queue.ccb_buffer_offset + ccb.size(), queue.ccb_buffer.capacity());
+        }
+        ccb_keep.assign(ccb.begin(), ccb.end());
+        ccb = ccb_keep;
+    }
 
     queue.dcb_buffer.resize(
         std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
@@ -1882,7 +2033,15 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
-    ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
+    /* bbport: the queue index comes from the guest; an out-of-range one used to abort and would
+     * otherwise index mapped_queues out of bounds. Drop that submission instead. */
+    if (gnm_vqid == 0 || gnm_vqid >= NumTotalQueues) {
+        if (ReportPm4Issue()) {
+            LOG_ERROR(Render, "SubmitAsc: invalid virtual queue {} (max {}), submission dropped",
+                      gnm_vqid, u32{NumTotalQueues});
+        }
+        return;
+    }
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;

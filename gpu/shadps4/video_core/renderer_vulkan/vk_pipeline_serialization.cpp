@@ -187,11 +187,22 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     }
 
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
-    ASSERT(is_new);
+    if (!is_new) {
+        return false;
+    }
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *sel.infos[0], sel.modules[0], sdata, true);
+    try {
+        it.value() = std::make_unique<ComputePipeline>(
+            instance, scheduler, desc_heap, profile, *pipeline_cache, compute_key, *sel.infos[0],
+            sel.modules[0], sdata, true);
+    } catch (const std::exception& e) {
+        /* bbport: a cached pipeline the driver refuses must not abort startup (the constructor
+         * now throws instead of asserting). Drop the entry; the shader compiles on demand. */
+        compute_pipelines.erase(compute_key);
+        LOG_WARNING(Render_Vulkan, "Cached compute pipeline {:#x} failed to create: {}",
+                    compute_key.value, e.what());
+        return false;
+    }
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -307,11 +318,21 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
-    ASSERT(is_new);
+    if (!is_new) {
+        return false;
+    }
 
-    it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
+    try {
+        it.value() = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
+            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
+    } catch (const std::exception& e) {
+        /* bbport: a cached pipeline the driver refuses must not abort startup (the constructor
+         * now throws instead of asserting). Drop the entry; the shader compiles on demand. */
+        graphics_pipelines.erase(sel.graphics_key);
+        LOG_WARNING(Render_Vulkan, "Cached graphics pipeline failed to create: {}", e.what());
+        return false;
+    }
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -698,9 +719,17 @@ void PipelineCache::WarmUp() {
             }
             const auto [it, is_new] = compute_pipelines.try_emplace(entry.key);
             if (is_new) {
-                it.value() = std::make_unique<ComputePipeline>(
-                    instance, scheduler, desc_heap, profile, *pipeline_cache, entry.key,
-                    *entry.info, mod, entry.sdata, true);
+                try {
+                    it.value() = std::make_unique<ComputePipeline>(
+                        instance, scheduler, desc_heap, profile, *pipeline_cache, entry.key,
+                        *entry.info, mod, entry.sdata, true);
+                } catch (const std::exception& e) {
+                    /* bbport: one driver-refused cached pipeline is skipped, not fatal. */
+                    compute_pipelines.erase(entry.key);
+                    LOG_WARNING(Render_Vulkan, "Cached compute pipeline failed to create: {}",
+                                e.what());
+                    continue;
+                }
                 ++num_pipelines;
             }
         }
@@ -771,9 +800,18 @@ void PipelineCache::WarmUp() {
                 }
                 const auto [it, is_new] = graphics_pipelines.try_emplace(entry.key);
                 if (is_new) {
-                    it.value() = std::make_unique<GraphicsPipeline>(
-                        instance, scheduler, desc_heap, profile, entry.key, *pipeline_cache,
-                        entry.infos, empty_runtime_infos, entry.fetch_shader, modules, entry.sdata, true);
+                    try {
+                        it.value() = std::make_unique<GraphicsPipeline>(
+                            instance, scheduler, desc_heap, profile, entry.key, *pipeline_cache,
+                            entry.infos, empty_runtime_infos, entry.fetch_shader, modules,
+                            entry.sdata, true);
+                    } catch (const std::exception& e) {
+                        /* bbport: one driver-refused cached pipeline is skipped, not fatal. */
+                        graphics_pipelines.erase(entry.key);
+                        LOG_WARNING(Render_Vulkan,
+                                    "Cached graphics pipeline failed to create: {}", e.what());
+                        continue;
+                    }
                     ++num_pipelines;
                 }
             }

@@ -40,6 +40,11 @@ using Shader::HwStage;
 using Shader::Output;
 using Shader::SwStage;
 
+std::mutex& PipelineCreationMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
 constexpr static std::array DescriptorHeapSizes = {
@@ -372,9 +377,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         LOG_WARNING(Render, "Failed to create pipeline cache from stored driver data ({}): recreating empty",
                     vk::to_string(cache_result));
         auto [empty_res, empty_cache] = instance.GetDevice().createPipelineCacheUnique({});
-        ASSERT_MSG(empty_res == vk::Result::eSuccess, "Failed to create empty pipeline cache: {}",
-                   vk::to_string(empty_res));
-        cache = std::move(empty_cache);
+        if (empty_res != vk::Result::eSuccess) {
+            /* bbport: VK_NULL_HANDLE is a legal pipeline cache, so pipeline creation can go on
+             * without one (no driver-side caching) instead of exiting the process. */
+            LOG_CRITICAL(Render,
+                         "Failed to create empty pipeline cache ({}); continuing without a "
+                         "driver pipeline cache",
+                         vk::to_string(empty_res));
+        } else {
+            cache = std::move(empty_cache);
+        }
     }
     pipeline_cache = std::move(cache);
 
@@ -590,6 +602,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     // bbport BB_ASYNC_PIPELINES: being compiled on a worker, or to be.
     const bool skippable = AsyncSkippable(sel, indirect);
+    /* bbport: a pipeline the driver refused `MaxPipelineFailures` times is not attempted again
+     * (the failure was logged then). Its draws are dropped, as they already were while it was
+     * pending; the rest of the frame keeps rendering. */
+    if (const auto failed = graphics_failures.find(sel.graphics_key);
+        failed != graphics_failures.end() && failed->second >= MaxPipelineFailures) {
+        return nullptr;
+    }
     if (const auto pending = pending_graphics.find(sel.graphics_key); pending != pending_graphics.end()) {
         const std::shared_ptr<PendingPipeline> job = pending->second;
         {
@@ -630,9 +649,18 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                           runtime_infos = sel.runtime_infos, fetch = sel.fetch_shader,
                           modules = sel.modules]() mutable {
             GraphicsPipeline::SerializationSupport sdata{};
-            auto pipeline = std::make_unique<GraphicsPipeline>(
-                instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos,
-                runtime_infos, fetch, modules, sdata, false);
+            std::unique_ptr<GraphicsPipeline> pipeline;
+            try {
+                pipeline = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, key, *pipeline_cache, infos,
+                    runtime_infos, fetch, modules, sdata, false);
+            } catch (const std::exception& e) {
+                /* bbport: the driver refused this pipeline. The job completes without one and
+                 * FinishPipeline() accounts and skips it; an exception must never escape a
+                 * worker thread (std::terminate). */
+                LOG_WARNING(Render_Vulkan, "Async graphics pipeline {:#x} failed: {}",
+                            std::hash<GraphicsPipelineKey>{}(key), e.what());
+            }
             std::scoped_lock lk{job->mutex};
             job->pipeline = std::move(pipeline);
             job->sdata = std::move(sdata);
@@ -649,9 +677,24 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         CompileTimer timer;
 
         GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+        try {
+            it.value() = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache,
+                sel.infos, sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+        } catch (const std::exception& e) {
+            /* bbport: the driver refused the pipeline (see PipelineCreationMutex). The empty map
+             * entry is removed and the draw skipped; the key is retried a bounded number of
+             * times by the next draws, then left out. Previously this aborted the process. */
+            graphics_pipelines.erase(sel.graphics_key);
+            const u32 failures = ++graphics_failures[sel.graphics_key];
+            if (failures <= MaxPipelineFailures) {
+                LOG_WARNING(Render_Vulkan,
+                            "Graphics pipeline {:#x} failed to create (attempt {} of {}): {}; "
+                            "the draw is skipped",
+                            pipeline_hash, failures, u32{MaxPipelineFailures}, e.what());
+            }
+            return nullptr;
+        }
 
         RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -671,6 +714,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
 const GraphicsPipeline* PipelineCache::FinishPipeline(const GraphicsPipelineKey& key,
                                                       PendingPipeline& job) {
+    if (!job.pipeline) {
+        /* bbport: the pipeline could not be created (the creator already logged the driver
+         * error). Account it and let the next draws retry up to the cap; a null pipeline is
+         * never stored, so a later attempt is possible and no draw dereferences it. */
+        const u32 failures = ++graphics_failures[key];
+        if (failures <= MaxPipelineFailures) {
+            LOG_WARNING(Render_Vulkan,
+                        "Graphics pipeline {:#x} is unavailable (attempt {} of {}): the draw is "
+                        "skipped",
+                        std::hash<GraphicsPipelineKey>{}(key), failures, u32{MaxPipelineFailures});
+        }
+        return nullptr;
+    }
     const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
     if (!job.saved) {
         RegisterPipelineData(key, pipeline_hash, job.sdata);
@@ -683,6 +739,7 @@ const GraphicsPipeline* PipelineCache::FinishPipeline(const GraphicsPipelineKey&
             }
         }
     }
+    graphics_failures.erase(key);
     auto& slot = graphics_pipelines[key];
     slot = std::move(job.pipeline);
     return slot.get();
@@ -758,6 +815,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
+    /// bbport: a compute pipeline the driver refused repeatedly is not attempted again.
+    if (const auto failed = compute_failures.find(compute_key);
+        failed != compute_failures.end() && failed->second >= MaxPipelineFailures) {
+        return nullptr;
+    }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
@@ -765,9 +827,23 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         CompileTimer timer;
 
         ComputePipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *sel.infos[0],
-                                                       sel.modules[0], sdata, false);
+        try {
+            it.value() = std::make_unique<ComputePipeline>(
+                instance, scheduler, desc_heap, profile, *pipeline_cache, compute_key,
+                *sel.infos[0], sel.modules[0], sdata, false);
+        } catch (const std::exception& e) {
+            /* bbport: the driver refused the pipeline. Remove the empty entry, account it and
+             * skip the dispatch; a bounded number of later dispatches retries it. */
+            compute_pipelines.erase(compute_key);
+            const u32 failures = ++compute_failures[compute_key];
+            if (failures <= MaxPipelineFailures) {
+                LOG_WARNING(Render_Vulkan,
+                            "Compute pipeline {:#x} failed to create (attempt {} of {}): {}; "
+                            "the dispatch is skipped",
+                            pipeline_hash, failures, u32{MaxPipelineFailures}, e.what());
+            }
+            return nullptr;
+        }
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 

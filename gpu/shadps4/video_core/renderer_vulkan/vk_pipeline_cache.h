@@ -58,6 +58,11 @@ class Instance;
 class Scheduler;
 class ShaderCache;
 
+/// bbport: Vulkan requires external synchronization on VkPipelineCache. The BB_ASYNC_PIPELINES
+/// workers and the GPU thread create pipelines at the same time otherwise, which RADV answers
+/// with ErrorUnknown ("constant crashes 23"). One mutex: a pipeline creation is ~18 ms anyway.
+std::mutex& PipelineCreationMutex();
+
 struct Program {
     struct Module {
         vk::ShaderModule module;
@@ -312,6 +317,12 @@ private:
     const GraphicsPipeline* FinishPipeline(const GraphicsPipelineKey& key, PendingPipeline& job);
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>> pending_graphics;
     u64 async_started = 0, async_skipped = 0, async_waited = 0; ///< statistics
+    /// bbport: pipelines the driver refused to create. A key is attempted a bounded number of
+    /// times and afterwards its draws are skipped: one bad shader/permutation must not exit the
+    /// process and must not be retried every frame either. GPU thread only.
+    static constexpr u32 MaxPipelineFailures = 32;
+    tsl::robin_map<GraphicsPipelineKey, u32> graphics_failures;
+    tsl::robin_map<ComputePipelineKey, u32> compute_failures;
     std::unique_ptr<PipelineCompiler> compiler; ///< last: its threads are joined first
 
     struct ShaderImport;

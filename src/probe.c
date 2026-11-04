@@ -1400,13 +1400,18 @@ static void copy_guest_string(uintptr_t ptr, char *out, size_t out_sz) {
  * A stub at the entry records these before the printer decides to print, return silently
  * (mode 2) or write to address 0 and abort. */
 static volatile LONG g_assert_hook_calls;
-static volatile uint64_t g_last_assert_id, g_last_assert_s1, g_last_assert_s2;
+static volatile uint64_t g_last_assert_id, g_last_assert_s1, g_last_assert_s2, g_last_assert_a4;
 
-static void guest_assert_hook(uint64_t s1, uint64_t id, uint64_t s2) {
+/* `a4` is the first variadic integer argument of the guest call (rcx under the SysV ABI, which
+ * the stub loads into the hook's r9). Assert id 0x61 comes from DLFixedAllocator (a failed
+ * allocation): its arguments say which request failed, which the three fixed arguments alone
+ * never showed. */
+static void guest_assert_hook(uint64_t s1, uint64_t id, uint64_t s2, uint64_t a4) {
     LONG seen = InterlockedIncrement(&g_assert_hook_calls);
     g_last_assert_id = id;
     g_last_assert_s1 = s1;
     g_last_assert_s2 = s2;
+    g_last_assert_a4 = a4;
     if (seen > 20) return; /* keep the first 20; the dump always has the latest */
     char a[256], b[512];
     copy_guest_string((uintptr_t)s1, a, sizeof(a));
@@ -1415,6 +1420,12 @@ static void guest_assert_hook(uint64_t s1, uint64_t id, uint64_t s2) {
             (unsigned long long)id, a, b, (void *)(uintptr_t)s1, (void *)(uintptr_t)s2,
             runtime_thread_current() ? runtime_thread_current()->name : "none",
             (unsigned long)GetCurrentThreadId());
+    if (id == 0x61) {
+        fprintf(stderr,
+                "[GAME ASSERT] id=0x61 (DLFixedAllocator): first variadic argument a4=0x%llx; "
+                "compare with the allocation failures reported in the crash dump\n",
+                (unsigned long long)a4);
+    }
     if (seen == 20) fprintf(stderr, "[GAME ASSERT] further assertions are recorded in the crash dump only\n");
     fflush(stderr);
 }
@@ -1429,6 +1440,12 @@ static void guest_assert_write_last(FILE *f) {
             (unsigned long long)g_last_assert_id, (long)g_assert_hook_calls);
     fprintf(f, "String 1:  \"%s\"  [%p]\n", a, (void *)(uintptr_t)g_last_assert_s1);
     fprintf(f, "String 2:  \"%s\"  [%p]\n", b, (void *)(uintptr_t)g_last_assert_s2);
+    fprintf(f, "First variadic argument: 0x%llx\n", (unsigned long long)g_last_assert_a4);
+    if (g_last_assert_id == 0x61) {
+        fprintf(f, "Note: assert 0x61 is DLFixedAllocator (allocation failed); the failure "
+                   "counters above say whether the guest allocator or the emulated memory layer "
+                   "refused the request.\n");
+    }
 }
 
 static void dump_loaded_modules(FILE *f) {
@@ -3491,8 +3508,13 @@ int main(int argc, char **argv) {
         *p++ = 0x49; *p++ = 0x89; *p++ = 0xd0;              /* mov r8, rdx  (string 2) */
         *p++ = 0x48; *p++ = 0x89; *p++ = 0xf2;              /* mov rdx, rsi (assert id) */
         *p++ = 0x48; *p++ = 0x89; *p++ = 0xf9;              /* mov rcx, rdi (string 1) */
-        /* Hook parameters are therefore (rcx=string 1, rdx=assert id, r8=string 2), which
-         * matches guest_assert_hook(uint64_t s1, uint64_t id, uint64_t s2). */
+        /* The guest uses the SysV ABI, so the first variadic integer argument is rcx at the
+         * printer's entry. The stub pushed it above; here rsp is 0xC8 bytes below that slot,
+         * so load it into r9, the hook's fourth parameter. */
+        *p++ = 0x4c; *p++ = 0x8b; *p++ = 0x4c; *p++ = 0x24; *p++ = 0xc8; /* mov r9,[rsp+0xc8] */
+        /* Hook parameters are therefore (rcx=string 1, rdx=assert id, r8=string 2, r9=first
+         * variadic argument), which matches
+         * guest_assert_hook(uint64_t s1, uint64_t id, uint64_t s2, uint64_t a4). */
         uint64_t hook = (uint64_t)(uintptr_t)guest_assert_hook;
         *p++ = 0x48; *p++ = 0xb8; memcpy(p, &hook, 8); p += 8; /* movabs rax, hook */
         *p++ = 0xff; *p++ = 0xd0;                           /* call rax */
