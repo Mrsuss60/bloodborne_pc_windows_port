@@ -86,6 +86,8 @@ enum : std::uint64_t {
     StableMotionHash = 1ull << 0,
     /// The crash guards added to the recorder and the guest fault handler (set: off).
     DefensiveGuards = 1ull << 1,
+    /// Pages written by the PS4 red-zone vertex generators stay writable (set: off).
+    StickyFaultPages = 1ull << 2,
 };
 inline bool Disabled(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & bit) != 0;
@@ -100,6 +102,8 @@ namespace BbStats {
 /// Guest writes caught by page protection, and pages currently left unprotected as hot.
 inline std::atomic<std::uint64_t> tracker_faults{0};
 inline std::atomic<std::int64_t> hot_pages{0};
+/// Pages permanently kept writable for the red-zone vertex generators (BB_STICKY_FAULT_PAGES).
+inline std::atomic<std::uint64_t> sticky_pages{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};

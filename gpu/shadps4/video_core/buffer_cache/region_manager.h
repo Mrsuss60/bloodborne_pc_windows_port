@@ -4,8 +4,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <algorithm>
 
 #include "bbport_toggles.h"
 #include "common/div_ceil.h"
@@ -29,6 +31,20 @@ using LockType = Common::AdaptiveMutex;
 #else
 using LockType = Common::SpinLock;
 #endif
+
+/// bbport: pages pinned by the red-zone generator workaround. A pinned page is never re-protected
+/// and counts as CPU modified, so it is uploaded on every binding; the cap (BB_STICKY_FAULT_PAGES,
+/// default 2048 pages = 8 MiB) keeps a runaway set from turning into the 14k-page hot set that
+/// cost 33 FPS (see RegionManager::HotPagesEnabled).
+inline std::atomic<u32> g_sticky_fault_pages{0};
+inline u32 StickyFaultPageBudget() {
+    static const u32 budget = [] {
+        const char* env = std::getenv("BB_STICKY_FAULT_PAGES");
+        const long value = env ? std::strtol(env, nullptr, 10) : 2048;
+        return static_cast<u32>(value > 0 ? value : 0);
+    }();
+    return budget;
+}
 
 /**
  * Allows tracking CPU and GPU modification of pages in a contigious 16MB virtual address region.
@@ -123,6 +139,59 @@ public:
             return;
         }
         cpu |= add;
+        UpdateProtection<false, false>();
+    }
+
+    /// bbport: keep the page a red-zone generator just wrote permanently writable. Windows x64
+    /// has no System V red zone: every exception dispatch writes its CONTEXT below RSP and
+    /// destroys the generator's locals, so each additional write-tracking fault on the same page
+    /// is a chance to corrupt the generator (the REDZONE GUARD HIT stutter). Pinned pages count
+    /// as CPU modified forever, so they are uploaded whenever bound instead of faulting again.
+    /// `size` is the faulting access size; only the touched page is pinned.
+    void MakeSticky(VAddr fault_addr, u64 size) {
+        if (BbToggle::Disabled2(BbToggle::StickyFaultPages)) {
+            return;
+        }
+        const size_t offset = fault_addr - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return;
+        }
+        RegionBits add(~sticky, start_page, end_page);
+        if (add.None()) {
+            return;
+        }
+        u32 num_new = 0;
+        for (const auto& [start, end] : add) {
+            num_new += static_cast<u32>(end - start);
+        }
+        const u32 budget = StickyFaultPageBudget();
+        const u32 used = g_sticky_fault_pages.load(std::memory_order_relaxed);
+        if (used >= budget) {
+            return;
+        }
+        if (num_new > budget - used) {
+            // Take as many of the new pages as the budget still allows.
+            const u32 remaining_budget = budget - used;
+            RegionBits limited{};
+            u32 remaining = remaining_budget;
+            for (const auto& [start, end] : add) {
+                const size_t take = std::min<size_t>(end - start, remaining);
+                limited.SetRange(start, start + take);
+                remaining -= static_cast<u32>(take);
+                if (remaining == 0) {
+                    break;
+                }
+            }
+            add = limited;
+            num_new = remaining_budget - remaining;
+        }
+        sticky |= add;
+        cpu |= add;
+        g_sticky_fault_pages.fetch_add(num_new, std::memory_order_relaxed);
+        BbStats::sticky_pages.fetch_add(num_new, std::memory_order_relaxed);
         UpdateProtection<false, false>();
     }
 
@@ -262,6 +331,12 @@ private:
     }
 
     void KeepHotPagesModified(size_t start_page, size_t end_page) {
+        // bbport: a pinned page must stay CPU modified; UpdateProtection (called right after this)
+        // re-protects every page whose CPU bit was cleared, and the next write from the red-zone
+        // generator would fault again on it.
+        if (!sticky.None()) {
+            cpu |= RegionBits(sticky, start_page, end_page);
+        }
         if (num_hot == 0) {
             return;
         }
@@ -281,6 +356,9 @@ private:
     RegionBits hot{};
     u32 num_hot = 0;
     std::chrono::steady_clock::time_point hot_since{};
+
+    /// Pages the red-zone generator workaround keeps writable for the rest of the session.
+    RegionBits sticky{};
 
     PageManager* tracker;
     VAddr cpu_addr = 0;

@@ -11,7 +11,10 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include <chrono>
+#include <filesystem>
 #include <future>
+#include <string>
+#include <unordered_set>
 #include "common/hash.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h" 
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -360,6 +363,22 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         return false;
     }
 
+    // bbport: the permutation index is only the name of the module in the store, not the
+    // shader's identity. Different sessions appended permutations in the order the game first
+    // used them, so the same specialization can be stored under another index. An equal
+    // specialization is the same SPIR-V, so reuse the module already in memory and keep the
+    // pipeline; refusing it dropped hundreds of otherwise valid preloads every launch.
+    auto it_pgm = program_cache.find(program->info.pgm_hash);
+    if (it_pgm != program_cache.end()) {
+        Program* live = it_pgm.value().get();
+        const auto it = std::ranges::find(live->modules, spec, &Program::Module::spec);
+        if (it != live->modules.end()) {
+            sel.infos[stage] = &live->info;
+            sel.modules[stage] = it->module;
+            return true;
+        }
+    }
+
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
                                        fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
@@ -370,43 +389,30 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         return false;
     }
 
-    // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
-    // at the exact position rather than append
-
-    vk::ShaderModule module{};
-
-    auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
-    if (new_program) {
-        module = CompileSPV(spv, instance.GetDevice());
-        if (!module) {
-            return false;
-        }
-        it_pgm.value() = std::move(program);
-    } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
-            // A matching permutation is valid only at its original index. A different index means
-            // the store holds entries from more than one cache generation, so this pipeline is
-            // left to compile at runtime.
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
-            if (perm_idx != idx) {
-                LOG_WARNING(Render_Vulkan,
-                            "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
-                            "preload",
-                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
-                return false;
-            }
-            module = it->module;
-        } else {
-            module = CompileSPV(spv, instance.GetDevice());
-            if (!module) {
-                return false;
-            }
-        }
+    vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
+    if (!module) {
+        return false;
     }
-    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
 
-    sel.infos[stage] = &it_pgm.value()->info;
+    if (it_pgm == program_cache.end()) {
+        Program* live = program.get();
+        live->InsertPermut(module, std::move(spec), perm_idx);
+        program_cache.emplace(live->info.pgm_hash, std::move(program));
+        sel.infos[stage] = &live->info;
+    } else {
+        Program* live = it_pgm.value().get();
+        // `spec` was built against the temporary program; point it at the live one before it is
+        // stored (the previous code left a dangling Shader::Info in the module list).
+        spec.info = &live->info;
+        if (perm_idx < live->modules.size() && live->modules[perm_idx].spec.Valid()) {
+            // The stored index is occupied by a different specialization. Appending keeps the
+            // modules referenced by pipelines loaded earlier in this warm-up valid.
+            live->AddPermut(module, std::move(spec));
+        } else {
+            live->InsertPermut(module, std::move(spec), perm_idx);
+        }
+        sel.infos[stage] = &live->info;
+    }
     sel.modules[stage] = module;
 
     return true;
@@ -420,6 +426,79 @@ void PipelineCache::SaveProfile() {
     std::memcpy(data.data() + sizeof(hdr), &profile, sizeof(profile));
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile", std::move(data));
 }
+
+namespace {
+/* bbport: metas stamped with a version this build cannot load (LoadShaderMeta rejects both a
+ * different meta and binary version) are dead weight. They are left behind by builds/tools that
+ * wrote an older constant; the keys that referenced them are dropped on the first warm-up that
+ * sees them. Delete the metas and their companion .spv/.in blobs so the cache converges instead
+ * of keeping dead copies and making "N stale metas" look like an active writer. A companion is
+ * named <pgm_hash>_<perm_idx>, and its meta's file name is exactly HashCombine(pgm_hash,
+ * perm_idx), so it is orphaned precisely when that hash is not one of the live metas. */
+void PurgeStaleShaderMetas() {
+    auto& db = Storage::DataBase::Instance();
+    if (!db.IsOpened() || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+
+    std::unordered_set<u64> live_metas;
+    const u32 removed = db.ForEachBlob(
+        Storage::BlobType::ShaderMeta, [&](std::vector<u8>&& data) {
+            if (data.size() < 16) {
+                return false;
+            }
+            u32 meta_version{};
+            u32 binary_version{};
+            u64 name{};
+            std::memcpy(&meta_version, data.data() + 0, sizeof(meta_version));
+            std::memcpy(&binary_version, data.data() + 4, sizeof(binary_version));
+            std::memcpy(&name, data.data() + 8, sizeof(name));
+            if (meta_version != Serialization::ShaderMetaVersion ||
+                binary_version != Serialization::ShaderBinaryVersion) {
+                return false;
+            }
+            live_metas.insert(name);
+            return true;
+        });
+    if (removed == 0) {
+        return;
+    }
+
+    u32 companions{};
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{db.Directory(), ec}) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const auto& path = entry.path();
+        const auto ext = path.extension().string();
+        if (ext != ".spv" && ext != ".in") {
+            continue;
+        }
+        const auto stem = path.stem().string();
+        const auto sep = stem.rfind('_');
+        if (sep == std::string::npos) {
+            continue;
+        }
+        u64 pgm_hash{};
+        u64 perm_idx{};
+        try {
+            pgm_hash = std::stoull(stem.substr(0, sep), nullptr, 16);
+            perm_idx = std::stoull(stem.substr(sep + 1), nullptr, 10);
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (!live_metas.contains(HashCombine(pgm_hash, perm_idx))) {
+            companions += std::filesystem::remove(path, ec) ? 1 : 0;
+        }
+    }
+    LOG_WARNING(Render,
+                "Removed {} shader metas stamped with an unsupported version and {} orphaned "
+                "shader blobs; every meta left is version {}/{}",
+                removed, companions, Serialization::ShaderMetaVersion,
+                Serialization::ShaderBinaryVersion);
+}
+} // namespace
 
 void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
@@ -515,6 +594,7 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     u32 num_removed{};
+    u32 num_reused_permutations{};
 
     if (!warmup_async) {
         try {
@@ -621,42 +701,44 @@ void PipelineCache::WarmUp() {
             out_info = &program_ptr->info;
             spec.info = &program_ptr->info;
 
+            // A permutation index is only the name of the module in the store; the specialization
+            // is the shader's identity. Earlier sessions appended permutations in a different
+            // order, so an equal specialization can be staged under another index. Reuse it and
+            // keep the pipeline; this used to discard several hundred preloads per launch.
             auto it = std::ranges::find_if(staged_permutations, [&](const StagedPermut& p) {
                 return p.program == program_ptr && p.spec == spec;
             });
             if (it != staged_permutations.end()) {
                 if (it->perm_idx != perm_idx) {
-                    LOG_WARNING(Render_Vulkan,
-                                "Cached permutation {} of {}_{:x} conflicts with index {}, skipping preload",
-                                perm_idx, program_ptr->info.hw_stage, program_ptr->info.pgm_hash, it->perm_idx);
-                    return false;
+                    ++num_reused_permutations;
                 }
                 out_future = it->future;
-            } else {
-                auto conflict_it = std::ranges::find_if(staged_permutations, [&](const StagedPermut& p) {
-                    return p.program == program_ptr && p.perm_idx == perm_idx;
-                });
-                if (conflict_it != staged_permutations.end()) {
-                    LOG_WARNING(Render_Vulkan,
-                                "Cached permutation index {} of {}_{:x} already used with different spec, skipping preload",
-                                perm_idx, program_ptr->info.hw_stage, program_ptr->info.pgm_hash);
-                    return false;
-                }
-
-                auto task = std::make_shared<std::packaged_task<vk::ShaderModule()>>(
-                    [device = instance.GetDevice(), spv_data = std::move(spv)]() {
-                        return CompileSPV(spv_data, device);
-                    });
-                out_future = task->get_future().share();
-                spv_futures.emplace(perm_hash, out_future);
-                GetCompiler().Submit([task]() { (*task)(); });
-                staged_permutations.push_back(StagedPermut{
-                    .program = program_ptr,
-                    .perm_idx = perm_idx,
-                    .spec = std::move(spec),
-                    .future = out_future,
-                });
+                return true;
             }
+
+            auto conflict_it = std::ranges::find_if(staged_permutations, [&](const StagedPermut& p) {
+                return p.program == program_ptr && p.perm_idx == perm_idx;
+            });
+            if (conflict_it != staged_permutations.end()) {
+                LOG_WARNING(Render_Vulkan,
+                            "Cached permutation index {} of {}_{:x} already used with different spec, skipping preload",
+                            perm_idx, program_ptr->info.hw_stage, program_ptr->info.pgm_hash);
+                return false;
+            }
+
+            auto task = std::make_shared<std::packaged_task<vk::ShaderModule()>>(
+                [device = instance.GetDevice(), spv_data = std::move(spv)]() {
+                    return CompileSPV(spv_data, device);
+                });
+            out_future = task->get_future().share();
+            spv_futures.emplace(perm_hash, out_future);
+            GetCompiler().Submit([task]() { (*task)(); });
+            staged_permutations.push_back(StagedPermut{
+                .program = program_ptr,
+                .perm_idx = perm_idx,
+                .spec = std::move(spec),
+                .future = out_future,
+            });
             return true;
         };
 
@@ -867,6 +949,13 @@ void PipelineCache::WarmUp() {
         }
     }
 
+    /* bbport: drop metas left by builds/tools that wrote an older binary version. This runs after
+     * the preload pass on purpose: LoadShaderMeta rejects an unsupported version silently, so the
+     * keys that referenced those metas are dropped and their metas can then be deleted in one go.
+     * Purging first would make the preload hit deleted files and log an io_file error per key.
+     * Runs only when the profile above is compatible. */
+    PurgeStaleShaderMetas();
+
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
     sel.fetch_shader.reset();
@@ -880,6 +969,12 @@ void PipelineCache::WarmUp() {
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} cached pipelines could not be loaded: removed {} keys, kept {}",
                     num_total_pipelines - num_pipelines, num_removed, num_pipelines);
+    }
+    if (num_reused_permutations != 0) {
+        LOG_INFO(Render,
+                 "{} cached shader stages reused a permutation already staged under a different "
+                 "index (same specialization, so the preload was kept)",
+                 num_reused_permutations);
     }
 
     Storage::DataBase::Instance().FinishPreload();

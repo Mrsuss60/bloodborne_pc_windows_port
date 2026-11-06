@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include <xxhash.h>
 #include "shim/bb_env.h"
+#include "shim/bbgpu_fault_hint.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
 #include "bbport_button_prompts.h"
@@ -3309,6 +3310,12 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
         return false;
     }
     buffer_cache.ExtendWriteFault(addr);
+    if (BbFaultHint::redzone) {
+        // A PS4 vertex generator keeps locals in the System V red zone, which the Windows
+        // exception frame destroys on every handled fault. Keep this page writable so this
+        // routine does not fault on it again.
+        buffer_cache.MakeWriteFaultSticky(addr);
+    }
     return true;
 }
 

@@ -148,6 +148,12 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
+void BufferCache::MakeWriteFaultSticky(VAddr device_addr) {
+    // One byte: pin only the page the faulting access touched, even when the address is not
+    // page aligned (the caller passes the fault address itself).
+    memory_tracker->MakeSticky(device_addr, 1);
+}
+
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
     gpu_modified_ranges.Subtract(device_addr, size);

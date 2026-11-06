@@ -2276,8 +2276,6 @@ static void log_redzone_guard_hit(uintptr_t off, uintptr_t rip, uintptr_t rsp, G
             pos += snprintf(buf + pos, sizeof(buf) - pos, "    (RSP invalid or unreadable)\n");
         }
         veh_write(buf);
-        fprintf(stderr, "%s", buf);
-        fflush(stderr);
     }
 }
 
@@ -2350,13 +2348,28 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
             }
             /* fall through to the fatal path (no infinite retry) */
         }
-        if (gpu_enabled && bbgpu_handle_fault(ep, fault_addr)) {
+        const ULONG_PTR access_type =
+            (ep->ExceptionRecord && ep->ExceptionRecord->NumberParameters >= 1) ?
+                ep->ExceptionRecord->ExceptionInformation[0] : 0;
+        /* The PS4 particle/splatter/cloth vertex generators keep locals in the System V red
+         * zone. Windows x64 has none: every exception dispatch writes its CONTEXT below RSP and
+         * destroys them, so each repeated write-tracking fault inside these ranges can corrupt
+         * the generator. Tell the tracker to keep the faulting page writable (bounded, and only
+         * for these routines) instead of re-protecting it after every upload. */
+        const int redzone_fault =
+            access_type == 1 /* write */ && is_guest_address(rip) &&
+            (rip - (uintptr_t)image) >= 0x28ce7ba && (rip - (uintptr_t)image) < 0x28d064e;
+        int fault_handled = 0;
+        if (gpu_enabled) {
+            if (redzone_fault) bbgpu_set_redzone_fault(1);
+            fault_handled = bbgpu_handle_fault(ep, fault_addr);
+            if (redzone_fault) bbgpu_set_redzone_fault(0);
+        }
+        if (fault_handled) {
             if (cur) cur->exception_count++;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Camera update thunk DEP or unmapped jump safeguard (Discord crash 204614)
-        ULONG_PTR access_type = (ep->ExceptionRecord && ep->ExceptionRecord->NumberParameters >= 1) ?
-                                ep->ExceptionRecord->ExceptionInformation[0] : 0;
         if (access_type == 8 /* EXECUTE violation */ || rip < 0x10000 || rip == (uintptr_t)orig_cam_update) {
             uintptr_t expected_orig = (uintptr_t)image + 0x143ac60;
             uintptr_t rsp = ep->ContextRecord->Rsp;

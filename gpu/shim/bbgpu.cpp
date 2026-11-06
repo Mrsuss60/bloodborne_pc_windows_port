@@ -6,6 +6,7 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_toggles.h"
+#include "bbgpu_fault_hint.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -278,6 +279,10 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
 }
 
+extern "C" void bbgpu_set_redzone_fault(int active) {
+    BbFaultHint::redzone = active != 0;
+}
+
 extern "C" unsigned bbgpu_symbol_count(void) {
     return unsigned(g_symbols.size());
 }
@@ -324,6 +329,10 @@ extern "C" void bbgpu_dump_host_threads_hang(void* file_handle) {
     std::fprintf(f, "  Page Protection Revoke Calls: %llu (%llu pages)\n",
                  (unsigned long long)BbStats::protect_revoke_calls.load(std::memory_order_relaxed),
                  (unsigned long long)BbStats::protect_revoke_pages.load(std::memory_order_relaxed));
+    std::fprintf(f, "  Write Faults Tracked: %llu, Hot Pages: %lld, Sticky Pages: %llu\n",
+                 (unsigned long long)BbStats::tracker_faults.load(std::memory_order_relaxed),
+                 (long long)BbStats::hot_pages.load(std::memory_order_relaxed),
+                 (unsigned long long)BbStats::sticky_pages.load(std::memory_order_relaxed));
     std::fprintf(f, "====================================\n\n");
     std::fflush(f);
 }

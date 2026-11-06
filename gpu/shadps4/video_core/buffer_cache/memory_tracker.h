@@ -62,6 +62,15 @@ public:
                             });
     }
 
+    /// bbport: see RegionManager::MakeSticky (red-zone vertex generators).
+    void MakeSticky(VAddr fault_addr, u64 size) {
+        IteratePages<false>(fault_addr, size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->MakeSticky(manager->GetCpuAddr() + offset, size);
+                            });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,
