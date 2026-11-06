@@ -412,13 +412,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                     top_lay.addWidget(sep1)
 
                     # Level
-                    lbl_lvl = QLabel(str(char["level"]))
-                    lbl_lvl.setFixedWidth(50)
+                    lbl_lvl = QLabel(f"Lvl: {char['level']}")
                     lbl_lvl.setAlignment(Qt.AlignCenter)
                     lbl_lvl.setStyleSheet(
                         "color: #dcd2ba;"
                         "font-family: 'Cinzel', 'Garamond', 'Georgia', serif;"
-                        "font-size: 15px;"
+                        "font-size: 14px;"
                         "font-weight: 600;"
                         "background: transparent;"
                     )
@@ -431,13 +430,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                     top_lay.addWidget(sep2)
 
                     # Playtime (HH:MM:SS)
-                    lbl_time = QLabel(char.get("playtime_clock", char.get("playtime_str", "")))
-                    lbl_time.setFixedWidth(75)
+                    playtime_val = char.get("playtime_clock", char.get("playtime_str", ""))
+                    lbl_time = QLabel(f"Playtime: {playtime_val}")
                     lbl_time.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     lbl_time.setStyleSheet(
                         "color: #dcd2ba;"
                         "font-family: 'Cinzel', 'Garamond', 'Georgia', serif;"
-                        "font-size: 15px;"
+                        "font-size: 14px;"
                         "font-weight: 600;"
                         "background: transparent;"
                     )
