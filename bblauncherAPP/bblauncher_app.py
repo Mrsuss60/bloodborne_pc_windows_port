@@ -64,6 +64,7 @@ from bblauncher_Utils import (
     connected_gpus,
     create_save_backup,
     delete_save_backup,
+    display_name_to_scancode_label,
     export_backup_to_zip,
     find_active_save_dir,
     find_character_portrait,
@@ -1684,9 +1685,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                            "key.move_backward", "key.move_right"):
             btn = self.keybind_buttons.get(action_key)
             if btn is not None:
-                # Store the printed letter as-is (AZERTY -> Z/Q/S/D, QWERTY -> W/A/S/D) so
-                # bbport.ini matches what the button shows.
-                self._assign_keybind(action_key, preset[action_key], btn.current_binding)
+                # The preset holds printed labels. Convert each one to the physical
+                # SDL scancode name expected by the C engine before saving.
+                stored = display_name_to_scancode_label(preset[action_key])
+                self._assign_keybind(action_key, stored, btn.current_binding)
         self.save_bbport_ini()
         keys = "WASD" if layout == "qwerty" else "ZQSD"
         self.log(f"[Keybinds] Applied {layout.upper()} movement preset ({keys}).")

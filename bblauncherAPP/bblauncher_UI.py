@@ -203,10 +203,6 @@ class KeybindButton(QPushButton):
         same key positions.  The label is looked up through the active layout.
         """
         key = event.key()
-        # Letters: store the character printed on the key for the active layout, so a
-        # manual bind matches the AZERTY/QWERTY presets (AZERTY "Z" key -> "Z").
-        if Qt.Key_A <= key <= Qt.Key_Z:
-            return chr(key), chr(key)
         scan_code = int(event.nativeScanCode()) & 0xFF
         stored = win_scan_to_scancode_name(scan_code)
         text = event.text()

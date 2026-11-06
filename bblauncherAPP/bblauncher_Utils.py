@@ -364,8 +364,7 @@ def scancode_display_name(stored_name: str) -> str:
         return stored_name
     if len(stored_name) != 1 or not stored_name.isascii():
         return stored_name
-    if stored_name.isdigit() or stored_name.isalpha():
-        # Letters are stored as the printed label (Z stays Z on AZERTY), so show them as-is.
+    if stored_name.isdigit():
         return stored_name
     scan_code = _SDL_NAME_TO_WIN_SCAN.get(stored_name.upper())
     if scan_code is None:
