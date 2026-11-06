@@ -539,6 +539,61 @@ QPushButton#SecondaryBtn:hover {
     background-color: #2d2d38;
     color: #ffffff;
 }
+QPushButton#BackupRestoreBtn {
+    background-color: #99141a;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 0 14px;
+    min-height: 28px;
+    max-height: 28px;
+    border: none;
+    border-radius: 4px;
+}
+QPushButton#BackupRestoreBtn:hover {
+    background-color: #b51920;
+}
+QPushButton#BackupActionBtn {
+    background-color: #22222a;
+    color: #dcdce0;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 0 12px;
+    min-height: 28px;
+    max-height: 28px;
+    border: 1px solid #2e2e38;
+    border-radius: 4px;
+}
+QPushButton#BackupActionBtn:hover {
+    background-color: #2d2d38;
+    color: #ffffff;
+    border-color: #3e3e4c;
+}
+QPushButton#BackupDeleteBtn {
+    background-color: #24191c;
+    color: #f87171;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 0 12px;
+    min-height: 28px;
+    max-height: 28px;
+    border: 1px solid #451a20;
+    border-radius: 4px;
+}
+QPushButton#BackupDeleteBtn:hover {
+    background-color: #3b181e;
+    color: #fca5a5;
+    border-color: #652028;
+}
+QFrame#CharSlotCard {
+    background-color: #151720;
+    border: 1px solid #282a36;
+    border-radius: 4px;
+}
+QFrame#CharSlotCard:hover {
+    background-color: #181a24;
+    border: 1px solid #8a7a54;
+}
 QPushButton#StopBtn {
     background-color: #361718;
     color: #e65555;
@@ -795,6 +850,7 @@ class LauncherUI:
         self.btn_patches = QPushButton("  PATCHES")
         self.btn_display = QPushButton("  DISPLAY && GRAPHICS")
         self.btn_mk = QPushButton("  MOUSE && KEYBOARD")
+        self.btn_saves = QPushButton("  SAVE MANAGER")
         self.btn_advanced = QPushButton("  ADVANCED SETTINGS")
 
         self.nav_buttons = [
@@ -802,6 +858,7 @@ class LauncherUI:
             self.btn_patches,
             self.btn_display,
             self.btn_mk,
+            self.btn_saves,
             self.btn_advanced,
         ]
         for b in self.nav_buttons:
@@ -814,7 +871,8 @@ class LauncherUI:
         self.btn_patches.clicked.connect(lambda: self.switch_tab(1))
         self.btn_display.clicked.connect(lambda: self.switch_tab(2))
         self.btn_mk.clicked.connect(lambda: self.switch_tab(3))
-        self.btn_advanced.clicked.connect(lambda: self.switch_tab(4))
+        self.btn_saves.clicked.connect(lambda: self.switch_tab(4))
+        self.btn_advanced.clicked.connect(lambda: self.switch_tab(5))
 
         sb_layout.addStretch()
 
@@ -869,10 +927,12 @@ class LauncherUI:
         self.patches_placeholder = QWidget()
         self.display_placeholder = QWidget()
         self.mk_placeholder = QWidget()
+        self.saves_placeholder = QWidget()
         self.advanced_placeholder = QWidget()
         self.stack.addWidget(self.patches_placeholder)
         self.stack.addWidget(self.display_placeholder)
         self.stack.addWidget(self.mk_placeholder)
+        self.stack.addWidget(self.saves_placeholder)
         self.stack.addWidget(self.advanced_placeholder)
         right_layout.addWidget(self.stack, 1)
 
@@ -904,7 +964,11 @@ class LauncherUI:
             self._build_display_tab_now()
         elif idx == 3 and hasattr(self, "_build_mk_tab_now"):
             self._build_mk_tab_now()
-        elif idx == 4 and hasattr(self, "_build_advanced_tab_now"):
+        elif idx == 4 and hasattr(self, "_build_saves_tab_now"):
+            self._build_saves_tab_now()
+            if hasattr(self, "refresh_save_manager"):
+                self.refresh_save_manager()
+        elif idx == 5 and hasattr(self, "_build_advanced_tab_now"):
             self._build_advanced_tab_now()
         for i, btn in enumerate(self.nav_buttons):
             btn.setChecked(i == idx)
@@ -1904,6 +1968,161 @@ class LauncherUI:
 
         c_layout.addWidget(card_mk)
         c_layout.addStretch()
+        return w
+
+    # ------------------------------------------------------------------
+    # SAVE GAME MANAGER
+    # ------------------------------------------------------------------
+    def create_saves_tab(self) -> QWidget:
+        w, c_layout = self._create_page("Save Game Manager")
+        s = self.settings
+
+        # ---- Active Save Card ----
+        card_active, l_active = self._new_card(
+            "Active Game Save",
+            "The save data Bloodborne loads and writes to during gameplay.",
+        )
+
+        row_active_top = QHBoxLayout()
+        row_active_top.setSpacing(12)
+
+        v_info = QVBoxLayout()
+        v_info.setSpacing(4)
+        self.lbl_active_save_path = QLabel("Checking save directory...")
+        self.lbl_active_save_path.setStyleSheet("color: #d8d8e0; font-size: 13px; font-weight: 600;")
+        self.lbl_active_save_meta = QLabel("-")
+        self.lbl_active_save_meta.setStyleSheet("color: #8c8c9e; font-size: 11px;")
+        v_info.addWidget(self.lbl_active_save_path)
+        v_info.addWidget(self.lbl_active_save_meta)
+        row_active_top.addLayout(v_info, 1)
+
+        self.btn_create_backup = QPushButton("  Create Backup")
+        self.btn_create_backup.setObjectName("PrimaryBtn")
+        self.btn_create_backup.setFixedHeight(34)
+        if hasattr(self, "handle_create_backup"):
+            self.btn_create_backup.clicked.connect(self.handle_create_backup)
+        row_active_top.addWidget(self.btn_create_backup)
+
+        self.btn_open_saves_folder = QPushButton("Open Folder")
+        self.btn_open_saves_folder.setObjectName("SecondaryBtn")
+        self.btn_open_saves_folder.setFixedHeight(34)
+        if hasattr(self, "handle_open_saves_folder"):
+            self.btn_open_saves_folder.clicked.connect(self.handle_open_saves_folder)
+        row_active_top.addWidget(self.btn_open_saves_folder)
+
+        self.btn_export_active = QPushButton("Export ZIP")
+        self.btn_export_active.setObjectName("SecondaryBtn")
+        self.btn_export_active.setFixedHeight(34)
+        if hasattr(self, "handle_export_active_save"):
+            self.btn_export_active.clicked.connect(self.handle_export_active_save)
+        row_active_top.addWidget(self.btn_export_active)
+
+        self.btn_import_save = QPushButton("Import Save")
+        self.btn_import_save.setObjectName("SecondaryBtn")
+        self.btn_import_save.setFixedHeight(34)
+        if hasattr(self, "handle_import_save"):
+            self.btn_import_save.clicked.connect(self.handle_import_save)
+        row_active_top.addWidget(self.btn_import_save)
+
+        l_active.addLayout(row_active_top)
+
+        # Character Slots Display for Active Save
+        self.frame_active_characters = QFrame()
+        self.frame_active_characters.setStyleSheet(
+            "background: transparent; border: none; padding: 0px;"
+        )
+        self.layout_active_characters = QVBoxLayout(self.frame_active_characters)
+        self.layout_active_characters.setContentsMargins(0, 8, 0, 0)
+        self.layout_active_characters.setSpacing(8)
+        l_active.addWidget(self.frame_active_characters)
+
+        c_layout.addWidget(card_active)
+
+        # ---- Backups List Card ----
+        card_backups, l_backups = self._new_card(
+            "Saved Backups",
+            "Restoring any backup will automatically snapshot your current active save first to prevent progress loss.",
+        )
+
+        row_b_header = QHBoxLayout()
+        row_b_header.setSpacing(8)
+        self.lbl_backup_count = QLabel("0 Backups available")
+        self.lbl_backup_count.setStyleSheet("color: #8c8c9e; font-size: 11px;")
+        row_b_header.addWidget(self.lbl_backup_count)
+        row_b_header.addStretch()
+
+        self.btn_refresh_backups = QPushButton("Refresh")
+        self.btn_refresh_backups.setObjectName("SecondaryBtn")
+        self.btn_refresh_backups.setFixedHeight(28)
+        if hasattr(self, "refresh_save_manager"):
+            self.btn_refresh_backups.clicked.connect(self.refresh_save_manager)
+        row_b_header.addWidget(self.btn_refresh_backups)
+        l_backups.addLayout(row_b_header)
+
+        # Container for backup items
+        self.backups_container = QWidget()
+        self.backups_container.setObjectName("ScrollContent")
+        self.layout_backups_list = QVBoxLayout(self.backups_container)
+        self.layout_backups_list.setContentsMargins(0, 4, 0, 4)
+        self.layout_backups_list.setSpacing(8)
+        l_backups.addWidget(self.backups_container)
+
+        self.lbl_no_backups = QLabel(
+            "No backups saved yet. Click 'Create Backup' above or launch the game with auto-backup enabled."
+        )
+        self.lbl_no_backups.setStyleSheet(
+            "color: #6a6a78; font-size: 12px; font-style: italic; padding: 16px 0;"
+        )
+        self.lbl_no_backups.setAlignment(Qt.AlignCenter)
+        l_backups.addWidget(self.lbl_no_backups)
+
+        c_layout.addWidget(card_backups)
+
+        # ---- Safeguards & Automations Card ----
+        card_auto, l_auto = self._new_card(
+            "Automatic Safeguards",
+            "Protection against accidental New Game+ transitions, save file corruption, or lost progress.",
+        )
+
+        grid_auto = QGridLayout()
+        grid_auto.setHorizontalSpacing(16)
+        grid_auto.setVerticalSpacing(10)
+
+        self.chk_auto_backup_launch = QCheckBox("Auto-backup before game launch")
+        self.chk_auto_backup_launch.setChecked(s.get("auto_backup_on_launch", True))
+        self.chk_auto_backup_launch.toggled.connect(lambda: self.save_settings())
+        grid_auto.addWidget(self.chk_auto_backup_launch, 0, 0)
+
+        row_prune = QHBoxLayout()
+        row_prune.setSpacing(8)
+        row_prune.addWidget(QLabel("Keep last:"))
+        self.cmb_max_backups = QComboBox()
+        for count in [5, 10, 20, 50]:
+            self.cmb_max_backups.addItem(f"{count} pre-launch backups", count)
+        cur_max = s.get("max_rolling_backups", 10)
+        idx_max = self.cmb_max_backups.findData(cur_max)
+        self.cmb_max_backups.setCurrentIndex(idx_max if idx_max >= 0 else 1)
+        self.cmb_max_backups.currentIndexChanged.connect(lambda: self.save_settings())
+        row_prune.addWidget(self.cmb_max_backups)
+        row_prune.addStretch()
+        grid_auto.addLayout(row_prune, 0, 1)
+
+        self.chk_engine_safepoint = QCheckBox("Engine-level Safepoint Auto-backup")
+        self.chk_engine_safepoint.setToolTip(
+            "Instructs the C runtime to automatically snapshot save data before triggering NG+ ending sequences."
+        )
+        ini_opts = self.load_bbport_ini() if hasattr(self, "load_bbport_ini") else {}
+        self.chk_engine_safepoint.setChecked(
+            ini_opts.get("save_auto_backup", "1").strip().lower() in ("1", "true")
+        )
+        if hasattr(self, "_sync_save_auto_backup_to_ini"):
+            self.chk_engine_safepoint.toggled.connect(self._sync_save_auto_backup_to_ini)
+        grid_auto.addWidget(self.chk_engine_safepoint, 1, 0, 1, 2)
+
+        l_auto.addLayout(grid_auto)
+        c_layout.addWidget(card_auto)
+        c_layout.addStretch()
+
         return w
 
     # ------------------------------------------------------------------

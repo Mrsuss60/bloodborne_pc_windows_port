@@ -127,6 +127,7 @@ struct Values {
     std::atomic<int> prep_workers{-1}; ///< -1 default (Available/2), 0 off, 1..16 explicit workers
     std::atomic<int> async_pipelines{-1}; ///< -1 default (auto), 0 off (sync on GPU thread), 1..16 workers
     std::atomic<int> texture_quality{TqAuto}; ///< auto, full, half, quarter
+    std::atomic<bool> save_auto_backup{true}; ///< auto-backup safepoint on save unmount
     /// Live engine clock (probe.c hook). live_fps/target_fps/max_dt_hz persist; the rest is
     /// runtime status for the overlay.
     std::atomic<bool> live_fps{true};

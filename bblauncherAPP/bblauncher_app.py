@@ -23,12 +23,14 @@ import threading
 import time
 from datetime import datetime
 from PySide6.QtCore import QEvent, QTimer, Qt
-from PySide6.QtGui import QIcon, QTextCursor
+from PySide6.QtGui import QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -60,10 +62,25 @@ from bblauncher_Utils import (
     acquire_single_instance,
     build_stamp,
     connected_gpus,
+    create_save_backup,
+    delete_save_backup,
+    export_backup_to_zip,
+    find_active_save_dir,
+    find_character_portrait,
+    format_playtime,
+    format_size,
+    get_active_save_summary,
     get_bb_guard,
+    get_game_save_title_id,
+    get_save_backups_root,
+    get_save_data_root,
+    import_save_from_zip_or_dir,
     kill_tree,
+    list_save_backups,
     load_xml_patches,
+    prune_rolling_backups,
     resolve_game_dir,
+    restore_save_backup,
     rotate_log,
     running_instances,
     verify_prelaunch,
@@ -117,6 +134,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self._display_built = False
         self._mk_built = False
         self._advanced_built = False
+        self._saves_built = False
         self._syncing_ini = False
         self.all_xml_patches = []
         self.patch_checkboxes = {}
@@ -242,6 +260,507 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         finally:
             self._suppress_settings_save = previous
 
+    def _build_saves_tab_now(self):
+        if getattr(self, "_saves_built", False):
+            return
+        self._saves_built = True
+        previous = getattr(self, "_suppress_settings_save", False)
+        self._suppress_settings_save = True
+        try:
+            self._install_tab("saves_placeholder", self.create_saves_tab())
+        finally:
+            self._suppress_settings_save = previous
+        self.refresh_save_manager()
+
+    def _clear_layout(self, layout):
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            elif item.layout() is not None:
+                self._clear_layout(item.layout())
+
+    def _sync_save_auto_backup_to_ini(self, enabled: bool):
+        val = "1" if enabled else "0"
+        self._write_ini_values({"save_auto_backup": val})
+        self.save_settings()
+
+    def refresh_save_manager(self):
+        if not getattr(self, "_saves_built", False):
+            return
+
+        # 1. Active Save Summary
+        eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
+        active_summary = get_active_save_summary(APP_DIR, eboot_path=eboot)
+        self._clear_layout(self.layout_active_characters)
+
+        if active_summary and active_summary.get("found"):
+            title_text = f"Active Save: {active_summary['rel_path']}"
+            self.lbl_active_save_path.setText(title_text)
+            meta_text = (
+                f"Last Modified: {active_summary['mtime_str']}  |  "
+                f"Size: {active_summary['size_str']}  ({active_summary['file_count']} files)"
+            )
+            self.lbl_active_save_meta.setText(meta_text)
+
+            characters = active_summary.get("characters", [])
+            active_save_dir = active_summary.get("path")
+            if characters:
+                for char in characters:
+                    card = QFrame()
+                    card.setObjectName("CharSlotCard")
+                    card.setFixedHeight(84)
+                    card.setStyleSheet(
+                        "QFrame#CharSlotCard {"
+                        "  background-color: #13151d;"
+                        "  border: 1px solid #282a36;"
+                        "  border-radius: 4px;"
+                        "}"
+                        "QFrame#CharSlotCard:hover {"
+                        "  background-color: #171923;"
+                        "  border: 1px solid #9c8b60;"
+                        "}"
+                    )
+                    h_layout = QHBoxLayout(card)
+                    h_layout.setContentsMargins(6, 6, 8, 6)
+                    h_layout.setSpacing(10)
+
+                    # 1. Left: Character Portrait (Square 72x72)
+                    lbl_portrait = QLabel()
+                    lbl_portrait.setFixedSize(72, 72)
+                    lbl_portrait.setAlignment(Qt.AlignCenter)
+                    lbl_portrait.setStyleSheet(
+                        "background-color: #0b0c10;"
+                        "border: 1.5px solid #a39366;"
+                        "border-radius: 2px;"
+                    )
+
+                    portrait_path = find_character_portrait(
+                        slot_idx=char["slot"],
+                        char_name=char["name"],
+                        save_dir=active_save_dir,
+                        base_dir=APP_DIR,
+                    )
+                    if portrait_path and portrait_path.is_file():
+                        pixmap = QPixmap(str(portrait_path))
+                        if not pixmap.isNull():
+                            lbl_portrait.setPixmap(
+                                pixmap.scaled(
+                                    69, 69,
+                                    Qt.KeepAspectRatioByExpanding,
+                                    Qt.SmoothTransformation,
+                                )
+                            )
+                            lbl_portrait.setScaledContents(True)
+
+                    h_layout.addWidget(lbl_portrait)
+
+                    # 2. Right: Two-row details panel
+                    right_panel = QFrame()
+                    right_panel.setStyleSheet("background: transparent; border: none;")
+                    v_right = QVBoxLayout(right_panel)
+                    v_right.setContentsMargins(0, 0, 0, 0)
+                    v_right.setSpacing(0)
+
+                    # --- Top Row (Header band) ---
+                    top_bar = QFrame()
+                    top_bar.setFixedHeight(34)
+                    top_bar.setStyleSheet(
+                        "background-color: #101219;"
+                        "border-radius: 2px;"
+                        "padding: 0 4px;"
+                    )
+                    top_lay = QHBoxLayout(top_bar)
+                    top_lay.setContentsMargins(8, 0, 8, 0)
+                    top_lay.setSpacing(12)
+
+                    # Character Name (Warm ivory/gold serif font)
+                    lbl_name = QLabel(char["name"])
+                    lbl_name.setStyleSheet(
+                        "color: #e2d7ba;"
+                        "font-family: 'Cinzel', 'Garamond', 'Georgia', serif;"
+                        "font-size: 16px;"
+                        "font-weight: 700;"
+                        "background: transparent;"
+                    )
+                    top_lay.addWidget(lbl_name)
+                    top_lay.addStretch()
+
+                    # Vertical separator 1
+                    sep1 = QFrame()
+                    sep1.setFixedSize(1, 18)
+                    sep1.setStyleSheet("background-color: #2e3140;")
+                    top_lay.addWidget(sep1)
+
+                    # Level
+                    lbl_lvl = QLabel(str(char["level"]))
+                    lbl_lvl.setFixedWidth(50)
+                    lbl_lvl.setAlignment(Qt.AlignCenter)
+                    lbl_lvl.setStyleSheet(
+                        "color: #dcd2ba;"
+                        "font-family: 'Cinzel', 'Garamond', 'Georgia', serif;"
+                        "font-size: 15px;"
+                        "font-weight: 600;"
+                        "background: transparent;"
+                    )
+                    top_lay.addWidget(lbl_lvl)
+
+                    # Vertical separator 2
+                    sep2 = QFrame()
+                    sep2.setFixedSize(1, 18)
+                    sep2.setStyleSheet("background-color: #2e3140;")
+                    top_lay.addWidget(sep2)
+
+                    # Playtime (HH:MM:SS)
+                    lbl_time = QLabel(char.get("playtime_clock", char.get("playtime_str", "")))
+                    lbl_time.setFixedWidth(75)
+                    lbl_time.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    lbl_time.setStyleSheet(
+                        "color: #dcd2ba;"
+                        "font-family: 'Cinzel', 'Garamond', 'Georgia', serif;"
+                        "font-size: 15px;"
+                        "font-weight: 600;"
+                        "background: transparent;"
+                    )
+                    top_lay.addWidget(lbl_time)
+
+                    v_right.addWidget(top_bar)
+
+                    # Hairline divider
+                    hline = QFrame()
+                    hline.setFixedHeight(1)
+                    hline.setStyleSheet("background-color: #282b37;")
+                    v_right.addWidget(hline)
+
+                    # --- Bottom Row ---
+                    bot_bar = QFrame()
+                    bot_bar.setFixedHeight(34)
+                    bot_bar.setStyleSheet("background: transparent;")
+                    bot_lay = QHBoxLayout(bot_bar)
+                    bot_lay.setContentsMargins(8, 0, 8, 0)
+                    bot_lay.setSpacing(12)
+
+                    # Blood Echoes on left
+                    lbl_echoes = QLabel(f"Blood Echoes:  {char['echoes']:,}")
+                    lbl_echoes.setStyleSheet(
+                        "color: #c5a059;"
+                        "font-size: 11px;"
+                        "font-weight: 600;"
+                        "background: transparent;"
+                    )
+                    bot_lay.addWidget(lbl_echoes)
+                    bot_lay.addStretch()
+
+                    # Location Name on right
+                    lbl_loc = QLabel(char.get("location", "Hunter's Dream"))
+                    lbl_loc.setStyleSheet(
+                        "color: #9c978b;"
+                        "font-family: 'Cinzel', 'Garamond', 'Georgia', serif;"
+                        "font-size: 13px;"
+                        "font-weight: 500;"
+                        "background: transparent;"
+                    )
+                    bot_lay.addWidget(lbl_loc)
+
+                    v_right.addWidget(bot_bar)
+                    h_layout.addWidget(right_panel, 1)
+
+                    self.layout_active_characters.addWidget(card)
+            else:
+                lbl_none = QLabel("No character data found (slot table uninitialized or empty).")
+                lbl_none.setStyleSheet("color: #707080; font-size: 11px; font-style: italic;")
+                self.layout_active_characters.addWidget(lbl_none)
+        else:
+            self.lbl_active_save_path.setText("No active save found")
+            self.lbl_active_save_meta.setText("Game save directory user/savedata has not been initialized.")
+            lbl_none = QLabel("Launch Bloodborne once to generate active save data.")
+            lbl_none.setStyleSheet("color: #707080; font-size: 11px; font-style: italic;")
+            self.layout_active_characters.addWidget(lbl_none)
+
+        # 2. Backups List
+        backups = list_save_backups(APP_DIR)
+        self.lbl_backup_count.setText(f"{len(backups)} Backup(s) available")
+        self._clear_layout(self.layout_backups_list)
+
+        if not backups:
+            self.lbl_no_backups.setVisible(True)
+            return
+
+        self.lbl_no_backups.setVisible(False)
+
+        type_badges = {
+            "manual": ("MANUAL", "#818cf8", "#1e1b4b"),
+            "pre_launch": ("PRE-LAUNCH", "#34d399", "#064e3b"),
+            "pre_restore": ("SAFETY SNAPSHOT", "#fbbf24", "#451a03"),
+            "safepoint": ("SAFEPOINT", "#38bdf8", "#082f49"),
+            "imported": ("IMPORTED", "#e879f9", "#4a044e"),
+        }
+
+        for b in backups:
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background: #141419; border: 1px solid #23232c; border-radius: 6px; padding: 6px;"
+                " margin-bottom: 2px; }"
+                "QFrame:hover { border-color: #353544; }"
+            )
+            v_box = QVBoxLayout(card)
+            v_box.setContentsMargins(10, 8, 10, 8)
+            v_box.setSpacing(8)
+
+            top_line = QHBoxLayout()
+            top_line.setSpacing(8)
+
+            b_type = b.get("backup_type", "manual")
+            badge_text, badge_fg, badge_bg = type_badges.get(b_type, ("BACKUP", "#9ca3af", "#1f2937"))
+            lbl_badge = QLabel(f" {badge_text} ")
+            lbl_badge.setStyleSheet(
+                f"color: {badge_fg}; background: {badge_bg}; border: 1px solid {badge_fg}44; "
+                f"border-radius: 3px; font-size: 9px; font-weight: 700; padding: 1px 4px;"
+            )
+            top_line.addWidget(lbl_badge)
+
+            lbl_label = QLabel(b.get("name") or b.get("folder_name", "Backup"))
+            lbl_label.setStyleSheet("color: #ffffff; font-size: 13px; font-weight: 600;")
+            top_line.addWidget(lbl_label)
+
+            lbl_time = QLabel(b.get("timestamp_str", ""))
+            lbl_time.setStyleSheet("color: #8c8c9e; font-size: 11px;")
+            top_line.addWidget(lbl_time)
+
+            lbl_size = QLabel(f"({b.get('size_str', '')})")
+            lbl_size.setStyleSheet("color: #707080; font-size: 10px;")
+            top_line.addWidget(lbl_size)
+
+            top_line.addStretch()
+
+            btn_restore = QPushButton("Restore")
+            btn_restore.setObjectName("BackupRestoreBtn")
+            btn_restore.setFixedHeight(28)
+            btn_restore.setCursor(Qt.PointingHandCursor)
+            b_path = b["folder_path"]
+            btn_restore.clicked.connect(lambda checked=False, p=b_path: self.handle_restore_backup(p))
+            top_line.addWidget(btn_restore)
+
+            btn_export = QPushButton("Export ZIP")
+            btn_export.setObjectName("BackupActionBtn")
+            btn_export.setFixedHeight(28)
+            btn_export.setCursor(Qt.PointingHandCursor)
+            btn_export.clicked.connect(lambda checked=False, p=b_path: self.handle_export_backup(p))
+            top_line.addWidget(btn_export)
+
+            btn_del = QPushButton("Delete")
+            btn_del.setObjectName("BackupDeleteBtn")
+            btn_del.setFixedHeight(28)
+            btn_del.setCursor(Qt.PointingHandCursor)
+            btn_del.clicked.connect(lambda checked=False, p=b_path: self.handle_delete_backup(p))
+            top_line.addWidget(btn_del)
+
+            v_box.addLayout(top_line)
+
+            chars = b.get("characters", [])
+            if chars:
+                char_flow = QHBoxLayout()
+                char_flow.setSpacing(8)
+                for c in chars:
+                    p_clock = c.get("playtime_clock", c.get("playtime_str", ""))
+                    loc = c.get("location", "")
+                    chip_text = f"<b>{c['name']}</b> (Lv {c['level']} &middot; {p_clock}" + (f" &middot; {loc})" if loc else ")")
+                    lbl_c = QLabel(chip_text)
+                    lbl_c.setTextFormat(Qt.RichText)
+                    lbl_c.setStyleSheet(
+                        "color: #cfc7b4; background-color: #171922; border: 1px solid #292c3a; "
+                        "border-radius: 4px; padding: 3px 8px; font-size: 11px;"
+                    )
+                    char_flow.addWidget(lbl_c)
+                char_flow.addStretch()
+                v_box.addLayout(char_flow)
+
+            self.layout_backups_list.addWidget(card)
+
+    def handle_create_backup(self):
+        eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
+        active_save, _ = find_active_save_dir(APP_DIR, eboot_path=eboot)
+        if not active_save:
+            QMessageBox.warning(self, "Backup Save", "No active save data found to backup.")
+            return
+
+        label, ok = QInputDialog.getText(
+            self,
+            "Create Backup",
+            "Enter a description or label for this backup:",
+            text=f"Manual Backup {datetime.now():%b %d %H:%M}",
+        )
+        if not ok or not label:
+            return
+
+        label = label.strip()
+        backup_info = create_save_backup(base_dir=APP_DIR, label=label, backup_type="manual", eboot_path=eboot)
+        if backup_info:
+            self.log(f"[SAVE MANAGER] Created manual backup '{label}' in: {backup_info['folder_name']}")
+            self.refresh_save_manager()
+        else:
+            QMessageBox.critical(self, "Backup Failed", "Failed to create save backup. Check launcher logs.")
+
+    def handle_restore_backup(self, folder_path, confirm: bool = True):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Restore Save",
+                "Cannot restore save data while Bloodborne is currently running. Please stop the game first.",
+            )
+            return
+
+        if confirm:
+            reply = QMessageBox.question(
+                self,
+                "Restore Save Confirmation",
+                "Are you sure you want to restore this backup?\n\n"
+                "A safety snapshot of your current active save will be created automatically before restoring.",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
+        success = restore_save_backup(folder_path, base_dir=APP_DIR, eboot_path=eboot)
+        if success:
+            msg = f"Save backup restored successfully from: {Path(folder_path).name}"
+            self.log(f"[SAVE MANAGER] {msg}")
+            QMessageBox.information(self, "Save Restored", msg)
+        else:
+            msg = f"Failed to restore backup from: {Path(folder_path).name}"
+            self.log(f"[SAVE MANAGER ERROR] {msg}")
+            QMessageBox.critical(self, "Restore Failed", msg)
+        self.refresh_save_manager()
+
+    def handle_delete_backup(self, folder_path):
+        reply = QMessageBox.question(
+            self,
+            "Delete Backup",
+            "Are you sure you want to permanently delete this save backup?\n\nThis action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        success = delete_save_backup(folder_path)
+        if success:
+            self.log(f"[SAVE MANAGER] Deleted backup: {Path(folder_path).name}")
+        else:
+            self.log(f"[SAVE MANAGER ERROR] Could not delete backup: {Path(folder_path).name}")
+            QMessageBox.critical(self, "Delete Failed", f"Could not delete backup directory:\n{folder_path}")
+        self.refresh_save_manager()
+
+    def handle_open_saves_folder(self):
+        eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
+        active_save, _ = find_active_save_dir(APP_DIR, eboot_path=eboot)
+        if active_save and active_save.parent.is_dir():
+            target = active_save.parent
+        else:
+            target_title = get_game_save_title_id(APP_DIR, eboot)
+            target = get_save_data_root(APP_DIR) / "1" / target_title
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(target))
+            else:
+                subprocess.Popen(["explorer", str(target)])
+        except Exception:
+            try:
+                subprocess.Popen(["explorer", str(target)])
+            except Exception as e:
+                self.log(f"[SAVE MANAGER ERROR] Could not open save folder: {e}")
+
+    def handle_export_active_save(self):
+        eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
+        active_save, sce_sys = find_active_save_dir(APP_DIR, eboot_path=eboot)
+        if not active_save:
+            QMessageBox.warning(self, "Export Save", "No active save data found to export.")
+            return
+
+        default_zip_name = f"bloodborne_save_{datetime.now():%Y%m%d_%H%M%S}.zip"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Active Save Data as ZIP",
+            str(APP_DIR / default_zip_name),
+            "ZIP Archives (*.zip)",
+        )
+        if not file_path:
+            return
+
+        success = export_backup_to_zip(active_save, Path(file_path), companion_sce=sce_sys)
+        if success:
+            self.log(f"[SAVE MANAGER] Exported active save to: {file_path}")
+            QMessageBox.information(self, "Export Complete", f"Save data exported successfully to:\n{file_path}")
+        else:
+            self.log(f"[SAVE MANAGER ERROR] Failed to export active save to {file_path}")
+            QMessageBox.critical(self, "Export Failed", f"Failed to compress active save to:\n{file_path}")
+
+    def handle_export_backup(self, folder_path):
+        p = Path(folder_path)
+        default_zip_name = f"{p.name}.zip"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Save Backup as ZIP",
+            str(APP_DIR / default_zip_name),
+            "ZIP Archives (*.zip)",
+        )
+        if not file_path:
+            return
+
+        success = export_backup_to_zip(p, Path(file_path))
+        if success:
+            self.log(f"[SAVE MANAGER] Exported backup to: {file_path}")
+            QMessageBox.information(self, "Export Complete", f"Backup exported successfully to:\n{file_path}")
+        else:
+            self.log(f"[SAVE MANAGER ERROR] Failed to export backup to {file_path}")
+            QMessageBox.critical(self, "Export Failed", f"Failed to compress backup to:\n{file_path}")
+
+    def handle_import_save(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Import Save",
+                "Cannot import save data while Bloodborne is currently running. Please stop the game first.",
+            )
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Save Archive",
+            str(APP_DIR),
+            "Supported Archives (*.zip);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+
+        src_path = Path(file_path)
+        eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
+        imported_info = import_save_from_zip_or_dir(src_path, base_dir=APP_DIR, eboot_path=eboot)
+        if not imported_info:
+            QMessageBox.critical(
+                self,
+                "Import Failed",
+                "Failed to import save. Verify that the ZIP archive contains userdata0010 or a valid save directory structure.",
+            )
+            return
+
+        self.log(f"[SAVE MANAGER] Imported save to backups: {imported_info['folder_name']}")
+        self.refresh_save_manager()
+
+        reply = QMessageBox.question(
+            self,
+            "Import Successful",
+            f"Save successfully imported into backups:\n{imported_info['folder_name']}\n\n"
+            "Would you like to restore this imported save to your active game save right now?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.handle_restore_backup(imported_info["folder_path"], confirm=False)
+
     def load_settings(self) -> dict:
         merged = dict(DEFAULT_SETTINGS)
         try:
@@ -304,6 +823,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             })
         else:
             cfg["mods"] = bool(cfg.get("mods", False))
+
+        if getattr(self, "_saves_built", False):
+            cfg.update({
+                "auto_backup_on_launch": self.chk_auto_backup_launch.isChecked(),
+                "max_rolling_backups": self.cmb_max_backups.currentData() or 10,
+                "save_auto_backup": self.chk_engine_safepoint.isChecked(),
+            })
 
         return cfg
 
@@ -1049,6 +1575,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if self._advanced_built:
             keys_to_update["language"] = self.cmb_menu_lang.currentData() or "en"
 
+        if getattr(self, "_saves_built", False) and hasattr(self, "chk_engine_safepoint"):
+            keys_to_update["save_auto_backup"] = "1" if self.chk_engine_safepoint.isChecked() else "0"
+
         if not keys_to_update:
             return
         if self._write_ini_values(keys_to_update):
@@ -1399,7 +1928,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
     def sync_bbport_ini_to_ui(self):
         self._sync_external_patch_settings()
-        if not (self._display_built or self._mk_built or self._advanced_built or self._patches_built):
+        if not (self._display_built or self._mk_built or self._advanced_built or self._patches_built or getattr(self, "_saves_built", False)):
             return
         ini_path = APP_DIR / "bbport.ini"
         if not ini_path.is_file():
@@ -1420,6 +1949,11 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                     self._set_combo_data(self.cmb_menu_lang, ini_opts.get("language", "en").strip().lower())
                 if self._patches_built:
                     self._sync_patches_from_ini(ini_opts, persist=True)
+                if getattr(self, "_saves_built", False) and hasattr(self, "chk_engine_safepoint"):
+                    val = ini_opts.get("save_auto_backup", "1").strip().lower() in ("1", "true")
+                    self.chk_engine_safepoint.blockSignals(True)
+                    self.chk_engine_safepoint.setChecked(val)
+                    self.chk_engine_safepoint.blockSignals(False)
             finally:
                 self._syncing_ini = False
         except Exception:
@@ -1821,6 +2355,31 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         else:
             env.pop("BB_PATCHES", None)
 
+        # Save Game auto-backup before game launch
+        if cfg.get("auto_backup_on_launch", True):
+            try:
+                eboot_target = cfg.get("eboot", "")
+                active_save, _ = find_active_save_dir(APP_DIR, eboot_path=eboot_target)
+                if active_save:
+                    backup_info = create_save_backup(
+                        base_dir=APP_DIR,
+                        label="Pre-Launch Session",
+                        backup_type="pre_launch",
+                        eboot_path=eboot_target,
+                    )
+                    if backup_info:
+                        self.log(f"[SAVE MANAGER] Created pre-launch backup: {backup_info['folder_name']}")
+                        max_backups = int(cfg.get("max_rolling_backups", 10))
+                        pruned = prune_rolling_backups(max_keep=max_backups, base_dir=APP_DIR)
+                        if pruned > 0:
+                            self.log(f"[SAVE MANAGER] Pruned {pruned} old rolling backup(s).")
+            except Exception as e:
+                self.log(f"[SAVE MANAGER] Warning: Pre-launch auto-backup encountered: {e}")
+
+        # Propagate engine-level safepoint setting
+        engine_safepoint = cfg.get("save_auto_backup", True)
+        env["BB_SAVE_AUTO_BACKUP"] = "1" if engine_safepoint else "0"
+
         rotate_log()
         try:
             self.log_fh = open(LOG_FILE, "w", encoding="utf-8")
@@ -1934,6 +2493,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
         self.save_settings()
         self.update_last_run()
+        if getattr(self, "_saves_built", False):
+            self.refresh_save_manager()
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

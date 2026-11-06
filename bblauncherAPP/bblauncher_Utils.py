@@ -3,11 +3,16 @@
 
 import ctypes
 import hashlib
+import json
 import locale
 import os
+import re
+import shutil
+import struct
 import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
@@ -201,6 +206,9 @@ DEFAULT_SETTINGS = {
     "prep_workers": PREP_WORKER_CHOICES[0][0],
     "async_pipelines": "auto",
     "texture_quality": "auto",
+    "auto_backup_on_launch": True,
+    "max_rolling_backups": 10,
+    "save_auto_backup": True,
     "anti_aliasing": AA_CHOICES[0],
     "gpu": "",
     "language": "1",
@@ -823,3 +831,775 @@ class ProcessWorker(QThread):
     def terminate_proc(self):
         self._stop_requested = True
         kill_tree(self.proc)
+
+
+# ==============================================================================
+# Save Game Manager Utilities
+# ==============================================================================
+
+def format_playtime(seconds: int) -> str:
+    """Format total seconds into human-readable hours and minutes."""
+    h = max(0, seconds) // 3600
+    m = (max(0, seconds) % 3600) // 60
+    if h > 0:
+        return f"{h}h {m:02d}m"
+    s = max(0, seconds) % 60
+    return f"{m}m {s:02d}s"
+
+
+def format_size(size_bytes: int) -> str:
+    """Format byte count into human-readable KB or MB."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+BLOODBORNE_MAP_NAMES = {
+    2000: "1st Floor Sickroom",
+    2100: "Hunter's Dream",
+    2101: "Hunter's Nightmare",
+    2200: "Research Hall",
+    2300: "Fishing Hamlet",
+    2400: "Central Yharnam",
+    2410: "Central Yharnam",
+    2420: "Cathedral Ward",
+    2421: "Grand Cathedral",
+    2500: "Forsaken Cainhurst Castle",
+    2600: "Hemwick Charnel Lane",
+    2700: "Yahar'gul, Unseen Village",
+    2800: "Upper Cathedral Ward",
+    2900: "Castle Cainhurst",
+    3200: "Old Yharnam",
+    3300: "Healing Church Workshop",
+    3400: "Forbidden Woods",
+    3500: "Byrgenwerth",
+    3600: "Yahar'gul (Blood Moon)",
+    3700: "Nightmare of Mensis",
+    3800: "Lecture Building",
+    3900: "Nightmare Frontier",
+}
+
+
+def find_character_portrait(
+    slot_idx: int,
+    char_name: str = "",
+    save_dir: Path = None,
+    base_dir: Path = None,
+) -> Path | None:
+    """Find a character portrait image file for a given save slot.
+
+    Priority:
+      1. Specific portrait for this slot or character inside the save folder
+      2. Authentic slot or character portrait from resource directories
+      3. Companion icon0.png from sce_sys metadata
+      4. Default hunter portrait fallback
+    """
+    clean_name = re.sub(r'[\\/*?:"<>|]', "", char_name).strip() if char_name else ""
+
+    # 1. Check inside save_dir
+    if save_dir:
+        sd = Path(save_dir)
+        direct_cands = [
+            sd / f"slot_{slot_idx}.png",
+            sd / f"slot_{slot_idx}.jpg",
+        ]
+        if clean_name:
+            direct_cands.extend([
+                sd / f"{clean_name}.png",
+                sd / f"{clean_name}.jpg",
+                sd / f".{clean_name}.png",
+                sd / f".{clean_name}.jpg",
+            ])
+        for c in direct_cands:
+            if c.is_file():
+                return c
+
+        try:
+            for f in sd.iterdir():
+                if f.is_file() and f.suffix.lower() in [".png", ".jpg", ".jpeg"] and not f.name.startswith("icon0"):
+                    if clean_name and clean_name.lower() in f.stem.lower():
+                        return f
+        except OSError:
+            pass
+
+    # 2. Check bundled portrait directories for slot or character match
+    root = (base_dir or APP_DIR)
+    portrait_dirs = [
+        root / "bblauncherAPP" / "resources" / "portraits",
+        root / "resources" / "portraits",
+        Path(__file__).resolve().parent / "resources" / "portraits",
+    ]
+    for pdir in portrait_dirs:
+        slot_cands = [
+            pdir / f"slot_{slot_idx}.png",
+            pdir / f"slot_{slot_idx}.jpg",
+        ]
+        if clean_name:
+            slot_cands.extend([
+                pdir / f"{clean_name.lower()}.png",
+                pdir / f"{clean_name}.png",
+            ])
+        for c in slot_cands:
+            if c.is_file():
+                return c
+
+    # 3. Companion icon0.png from sce_sys if available
+    if save_dir:
+        sd = Path(save_dir)
+        for cp in [
+            sd.parent / f"{sd.name}.sce_sys" / "icon0.png",
+            sd / "sce_sys" / "icon0.png",
+            sd.parent / "SPRJ0005.sce_sys" / "icon0.png",
+        ]:
+            if cp.is_file():
+                return cp
+
+    # 4. Fallback default hunter portrait
+    for pdir in portrait_dirs:
+        def_img = pdir / "default_hunter.png"
+        if def_img.is_file():
+            return def_img
+
+    return None
+
+
+def parse_userdata0010(file_path: Path) -> list[dict]:
+    """Parse character slot table from unencrypted Bloodborne userdata0010 file.
+
+    Layout:
+      Table base: 0x1080 (10 slots, 0x192 / 402 bytes stride)
+      Slot relative offsets:
+        +0x16: Character Name (UTF-16LE, up to 32 bytes / 16 chars)
+        +0x38: Level (uint32)
+        +0x3C: Playtime in seconds (uint32)
+        +0x40: Blood Echoes (uint32)
+        +0x48: Map / Location ID (uint32)
+    """
+    slots = []
+    try:
+        p = Path(file_path)
+        if not p.is_file():
+            return []
+        data = p.read_bytes()
+        # Verify minimal size to hold 10 slot entries (0x1EA2 + 0x4C = 7918 bytes)
+        if len(data) < 0x2000:
+            return []
+
+        for i in range(10):
+            base = 0x1080 + i * 0x192
+            if base + 0x4C > len(data):
+                break
+            name_raw = (
+                data[base + 0x16 : base + 0x16 + 32]
+                .decode("utf-16le", errors="ignore")
+                .split("\x00")[0]
+                .strip()
+            )
+            name_clean = "".join(ch for ch in name_raw if ch.isprintable()).strip()
+            level, playtime_secs, echoes = struct.unpack_from("<III", data, base + 0x38)
+            area_id = struct.unpack_from("<I", data, base + 0x48)[0] if base + 0x4C <= len(data) else 0
+            if name_clean and (level > 0 or playtime_secs > 0):
+                h = int(playtime_secs) // 3600
+                m = (int(playtime_secs) % 3600) // 60
+                s = int(playtime_secs) % 60
+                location = BLOODBORNE_MAP_NAMES.get(
+                    int(area_id),
+                    f"Area {area_id}" if area_id else "Hunter's Dream",
+                )
+                slots.append({
+                    "slot": i,
+                    "name": name_clean,
+                    "level": int(level),
+                    "playtime_secs": int(playtime_secs),
+                    "playtime_str": format_playtime(int(playtime_secs)),
+                    "playtime_clock": f"{h}:{m:02d}:{s:02d}",
+                    "echoes": int(echoes),
+                    "area_id": int(area_id),
+                    "location": location,
+                })
+    except Exception as ex:
+        # Corrupted or incomplete file: fail gracefully
+        return []
+    return slots
+
+
+def parse_sfo(sfo_path: Path | str) -> dict[str, str]:
+    """Parse a PlayStation 4 param.sfo file and return string key-value pairs."""
+    try:
+        path = Path(sfo_path)
+        if not path.is_file():
+            return {}
+        data = path.read_bytes()
+        if len(data) < 20:
+            return {}
+        magic, ver, k_off, d_off, count = struct.unpack("<4sIIII", data[:20])
+        if magic != b"\x00PSF":
+            return {}
+        entries = {}
+        for i in range(count):
+            e = 20 + i * 16
+            k_pos, fmt, length, max_len, d_pos = struct.unpack("<HHIII", data[e:e + 16])
+            k_end = data.find(b"\x00", k_off + k_pos)
+            k = data[k_off + k_pos:k_end].decode("utf-8", "ignore")
+            val = data[d_off + d_pos:d_off + d_pos + length]
+            if b"\x00" in val:
+                val = val[:val.find(b"\x00")]
+            entries[k] = val.decode("utf-8", "ignore")
+        return entries
+    except Exception:
+        return {}
+
+
+def get_game_save_title_id(base_dir: Path = None, eboot_path: Path | str = None) -> str:
+    """Determine the active title ID used for save data.
+
+    In Bloodborne, all editions (GOTY CUSA03173, Old Hunters CUSA03014, US CUSA00207,
+    EU CUSA00900) map save data to CUSA00207 via INSTALL_DIR_SAVEDATA in param.sfo.
+    """
+    candidates_sfo = []
+    if eboot_path:
+        ep = Path(eboot_path)
+        candidates_sfo.extend([
+            ep.parent / "sce_sys" / "param.sfo",
+            ep.parent.parent / "sce_sys" / "param.sfo",
+        ])
+
+    settings_file = (base_dir or APP_DIR) / "bblauncher_settings.json"
+    if settings_file.is_file():
+        try:
+            cfg = json.loads(settings_file.read_text(encoding="utf-8"))
+            if cfg.get("eboot"):
+                ep = Path(cfg["eboot"])
+                candidates_sfo.extend([
+                    ep.parent / "sce_sys" / "param.sfo",
+                    ep.parent.parent / "sce_sys" / "param.sfo",
+                ])
+        except Exception:
+            pass
+
+    if DEFAULT_GAME:
+        candidates_sfo.append(DEFAULT_GAME / "sce_sys" / "param.sfo")
+
+    for sfo in candidates_sfo:
+        if sfo.is_file():
+            meta = parse_sfo(sfo)
+            install_dir = meta.get("INSTALL_DIR_SAVEDATA", "").strip()
+            if install_dir.startswith("CUSA"):
+                return install_dir
+            title_id = meta.get("TITLE_ID", "").strip()
+            if title_id.startswith("CUSA"):
+                return title_id
+
+    return "CUSA00207"
+
+
+def _find_sce_sys(sprj_dir: Path) -> Path | None:
+    """Find companion .sce_sys folder next to or inside a save folder."""
+    check_paths = [
+        sprj_dir.parent / f"{sprj_dir.name}.sce_sys",
+        sprj_dir.parent / "SPRJ0005.sce_sys",
+        sprj_dir / "sce_sys",
+        sprj_dir.parent / "sce_sys",
+    ]
+    for cp in check_paths:
+        if cp.is_dir():
+            return cp
+    return None
+
+
+def get_save_data_root(base_dir: Path = None) -> Path:
+    """Return root directory where game save folders live (user/savedata)."""
+    root = (base_dir or APP_DIR) / "user" / "savedata"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def get_save_backups_root(base_dir: Path = None) -> Path:
+    """Return root directory where backup folders live (user/savedata_backups)."""
+    root = (base_dir or APP_DIR) / "user" / "savedata_backups"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def find_active_save_dir(base_dir: Path = None, eboot_path: Path | str = None) -> tuple[Path | None, Path | None]:
+    """Locate active SPRJ0005 folder and companion .sce_sys folder.
+
+    Prioritizes the canonical save directory matching the game's save title ID
+    (user/savedata/<user_id>/<target_title_id>/SPRJ0005, e.g. CUSA00207).
+    If a legacy or incorrect CUSA folder (such as CUSA03173) exists with save files while
+    the canonical directory is empty, it automatically migrates the save data to CUSA00207.
+    """
+    save_root = get_save_data_root(base_dir)
+    target_title = get_game_save_title_id(base_dir, eboot_path)
+
+    # 1. First check canonical path: user/savedata/1/<target_title>/SPRJ0005
+    canonical_sprj = save_root / "1" / target_title / "SPRJ0005"
+    if canonical_sprj.is_dir() and (canonical_sprj / "userdata0010").is_file():
+        return canonical_sprj, _find_sce_sys(canonical_sprj)
+
+    # Check across any user IDs for target_title (e.g. user/savedata/*/<target_title>/SPRJ0005)
+    candidates = []
+    try:
+        for p in save_root.glob(f"*/{target_title}/SPRJ0005"):
+            if p.is_dir() and (p / "userdata0010").is_file():
+                candidates.append((p.stat().st_mtime, p))
+    except OSError:
+        pass
+
+    if candidates:
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        sprj_dir = candidates[0][1]
+        return sprj_dir, _find_sce_sys(sprj_dir)
+
+    # 2. Check if a non-canonical CUSA save directory exists (e.g. CUSA03173 created by mistake)
+    legacy_candidates = []
+    try:
+        for p in save_root.rglob("SPRJ0005"):
+            if p.is_dir() and (p / "userdata0010").is_file():
+                legacy_candidates.append((p.stat().st_mtime, p))
+    except OSError:
+        pass
+
+    if legacy_candidates:
+        legacy_candidates.sort(key=lambda c: c[0], reverse=True)
+        old_sprj = legacy_candidates[0][1]
+        old_title = old_sprj.parent.name
+        # If the save was placed under an incorrect title ID (like CUSA03173 instead of CUSA00207),
+        # migrate it to the canonical target_title directory
+        if old_title != target_title:
+            user_id = old_sprj.parent.parent.name if old_sprj.parent.parent != save_root else "1"
+            new_sprj = save_root / user_id / target_title / "SPRJ0005"
+            new_sprj.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copytree(old_sprj, new_sprj, dirs_exist_ok=True)
+                old_sce = _find_sce_sys(old_sprj)
+                if old_sce and old_sce.is_dir():
+                    new_sce = new_sprj.parent / f"{new_sprj.name}.sce_sys"
+                    shutil.copytree(old_sce, new_sce, dirs_exist_ok=True)
+                    shutil.rmtree(old_sce, ignore_errors=True)
+                shutil.rmtree(old_sprj.parent, ignore_errors=True)
+                return new_sprj, _find_sce_sys(new_sprj)
+            except OSError:
+                return old_sprj, _find_sce_sys(old_sprj)
+        return old_sprj, _find_sce_sys(old_sprj)
+
+    return None, None
+
+
+def get_active_save_summary(base_dir: Path = None, eboot_path: Path | str = None) -> dict:
+    """Return structured status and character slots for the currently active save."""
+    sprj_dir, sce_sys_dir = find_active_save_dir(base_dir, eboot_path)
+    if not sprj_dir:
+        return {
+            "found": False,
+            "path": None,
+            "rel_path": "No save file found",
+            "characters": [],
+            "mtime_str": "-",
+            "size_str": "-",
+            "file_count": 0,
+        }
+
+    u10 = sprj_dir / "userdata0010"
+    characters = parse_userdata0010(u10) if u10.is_file() else []
+
+    total_bytes = 0
+    file_count = 0
+    latest_mtime = 0
+    try:
+        for f in sprj_dir.iterdir():
+            if f.is_file():
+                st = f.stat()
+                total_bytes += st.st_size
+                file_count += 1
+                if st.st_mtime > latest_mtime:
+                    latest_mtime = st.st_mtime
+    except OSError:
+        pass
+
+    mtime_dt = datetime.fromtimestamp(latest_mtime) if latest_mtime > 0 else datetime.now()
+    save_root = (base_dir or APP_DIR)
+    try:
+        rel_path = sprj_dir.relative_to(save_root)
+    except ValueError:
+        rel_path = sprj_dir
+
+    return {
+        "found": True,
+        "path": sprj_dir,
+        "sce_sys_path": sce_sys_dir,
+        "rel_path": str(rel_path),
+        "characters": characters,
+        "mtime": latest_mtime,
+        "mtime_str": mtime_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "size_bytes": total_bytes,
+        "size_str": format_size(total_bytes),
+        "file_count": file_count,
+    }
+
+
+def list_save_backups(base_dir: Path = None) -> list[dict]:
+    """Enumerate all available backups from user/savedata_backups."""
+    backups_root = get_save_backups_root(base_dir)
+    results = []
+
+    try:
+        for entry in backups_root.iterdir():
+            if not entry.is_dir():
+                continue
+            sprj_dir = entry / "SPRJ0005"
+            if not sprj_dir.is_dir():
+                # Allow flat backup directories if userdata0010 is directly in folder
+                if (entry / "userdata0010").is_file():
+                    sprj_dir = entry
+                else:
+                    continue
+
+            meta_file = entry / "meta.json"
+            meta = {}
+            if meta_file.is_file():
+                try:
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    meta = {}
+
+            u10 = sprj_dir / "userdata0010"
+            characters = meta.get("characters")
+            if characters is None:
+                characters = parse_userdata0010(u10) if u10.is_file() else []
+
+            # Compute folder size and file count
+            total_bytes = 0
+            file_count = 0
+            latest_mtime = entry.stat().st_mtime
+            try:
+                for f in entry.rglob("*"):
+                    if f.is_file():
+                        st = f.stat()
+                        total_bytes += st.st_size
+                        file_count += 1
+                        if st.st_mtime > latest_mtime:
+                            latest_mtime = st.st_mtime
+            except OSError:
+                pass
+
+            tag = meta.get("backup_type")
+            if not tag:
+                low_name = entry.name.lower()
+                if "safepoint" in low_name:
+                    tag = "safepoint"
+                elif "pre_launch" in low_name:
+                    tag = "pre_launch"
+                elif "pre_restore" in low_name:
+                    tag = "pre_restore"
+                elif "imported" in low_name:
+                    tag = "imported"
+                else:
+                    tag = "manual"
+
+            name = meta.get("name")
+            if not name:
+                if tag == "safepoint":
+                    name = "Engine Auto-Safepoint"
+                else:
+                    name = entry.name
+
+            ts_str = meta.get("timestamp")
+            if not ts_str:
+                ts_str = datetime.fromtimestamp(entry.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+            results.append({
+                "folder_name": entry.name,
+                "folder_path": str(entry),
+                "name": name,
+                "backup_type": tag,
+                "timestamp_str": ts_str,
+                "mtime": latest_mtime,
+                "characters": characters,
+                "size_bytes": total_bytes,
+                "size_str": format_size(total_bytes),
+                "file_count": file_count,
+            })
+    except OSError:
+        pass
+
+    results.sort(key=lambda b: b["mtime"], reverse=True)
+    return results
+
+
+def create_save_backup(base_dir: Path = None, label: str = "", backup_type: str = "manual", eboot_path: Path | str = None) -> dict | None:
+    """Create a full snapshot of the active save directory into user/savedata_backups."""
+    sprj_dir, sce_sys_dir = find_active_save_dir(base_dir, eboot_path)
+    if not sprj_dir or not sprj_dir.is_dir():
+        return None
+
+    now = datetime.now()
+    ts_slug = now.strftime("%Y-%m-%d_%H-%M-%S")
+    clean_label = re.sub(r'[\\/*?:"<>| ]', "_", label.strip())
+    folder_name = f"{ts_slug}_{backup_type}" + (f"_{clean_label}" if clean_label else "")
+
+    backups_root = get_save_backups_root(base_dir)
+    target_dir = backups_root / folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    dst_sprj = target_dir / "SPRJ0005"
+    shutil.copytree(sprj_dir, dst_sprj, dirs_exist_ok=True)
+
+    if sce_sys_dir and sce_sys_dir.is_dir():
+        dst_sce = target_dir / "SPRJ0005.sce_sys"
+        shutil.copytree(sce_sys_dir, dst_sce, dirs_exist_ok=True)
+
+    u10 = dst_sprj / "userdata0010"
+    characters = parse_userdata0010(u10) if u10.is_file() else []
+
+    meta = {
+        "name": label.strip() if label.strip() else f"Backup {ts_slug}",
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "backup_type": backup_type,
+        "characters": characters,
+        "source_path": str(sprj_dir),
+    }
+
+    try:
+        (target_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+    return {
+        "folder_name": folder_name,
+        "folder_path": str(target_dir),
+        "name": meta["name"],
+        "backup_type": backup_type,
+        "timestamp_str": meta["timestamp"],
+        "characters": characters,
+    }
+
+
+def restore_save_backup(backup_folder: Path | str, base_dir: Path = None, eboot_path: Path | str = None) -> bool:
+    """Restore save files from a backup directory into the active save location.
+
+    Takes a safety snapshot of the active save before applying any changes.
+    Always restores to the canonical save directory (user/savedata/1/CUSA00207/SPRJ0005).
+    """
+    bpath = Path(backup_folder)
+    src_sprj = bpath / "SPRJ0005"
+    if not src_sprj.is_dir():
+        if (bpath / "userdata0010").is_file():
+            src_sprj = bpath
+        else:
+            return False
+
+    target_title = get_game_save_title_id(base_dir, eboot_path)
+    save_root = get_save_data_root(base_dir)
+
+    sprj_dir, sce_sys_dir = find_active_save_dir(base_dir, eboot_path)
+    if not sprj_dir:
+        sprj_dir = save_root / "1" / target_title / "SPRJ0005"
+        sprj_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # Pre-restore safety snapshot so progress is never lost
+        create_save_backup(base_dir, label="Pre-Restore Safety Snapshot", backup_type="pre_restore", eboot_path=eboot_path)
+        # Ensure destination is the canonical target_title directory
+        if sprj_dir.parent.name != target_title:
+            user_id = sprj_dir.parent.parent.name if sprj_dir.parent.parent != save_root else "1"
+            old_parent = sprj_dir.parent
+            sprj_dir = save_root / user_id / target_title / "SPRJ0005"
+            sprj_dir.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(old_parent, ignore_errors=True)
+
+    # Clear active save files and copy backup in
+    try:
+        for f in sprj_dir.iterdir():
+            if f.is_file():
+                f.unlink(missing_ok=True)
+            elif f.is_dir():
+                shutil.rmtree(f, ignore_errors=True)
+        for f in src_sprj.iterdir():
+            if f.is_file():
+                shutil.copy2(f, sprj_dir / f.name)
+
+        src_sce = bpath / "SPRJ0005.sce_sys"
+        if not src_sce.is_dir() and (src_sprj / "sce_sys").is_dir():
+            src_sce = src_sprj / "sce_sys"
+        if not src_sce.is_dir() and (bpath / "sce_sys").is_dir():
+            src_sce = bpath / "sce_sys"
+
+        if src_sce.is_dir():
+            dst_sce = sprj_dir.parent / f"{sprj_dir.name}.sce_sys"
+            dst_sce.mkdir(parents=True, exist_ok=True)
+            for f in dst_sce.iterdir():
+                if f.is_file():
+                    f.unlink(missing_ok=True)
+                elif f.is_dir():
+                    shutil.rmtree(f, ignore_errors=True)
+            for f in src_sce.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, dst_sce / f.name)
+        return True
+    except (OSError, shutil.Error):
+        return False
+
+
+def delete_save_backup(backup_folder: Path | str) -> bool:
+    """Safely delete a backup directory."""
+    try:
+        p = Path(backup_folder)
+        if p.is_dir():
+            shutil.rmtree(p)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def export_backup_to_zip(source_dir: Path | str, zip_dest: Path | str, companion_sce: Path | str = None) -> bool:
+    """Compress a save or backup directory into a clean .zip file."""
+    try:
+        src = Path(source_dir)
+        dst = Path(zip_dest)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zf:
+            if src.name == "SPRJ0005":
+                for root, _, files in os.walk(src):
+                    for file in files:
+                        full_path = Path(root) / file
+                        arcname = Path("SPRJ0005") / full_path.relative_to(src)
+                        zf.write(full_path, arcname)
+                sce = Path(companion_sce) if companion_sce else _find_sce_sys(src)
+                if sce and sce.is_dir():
+                    for root, _, files in os.walk(sce):
+                        for file in files:
+                            full_path = Path(root) / file
+                            arcname = Path("SPRJ0005.sce_sys") / full_path.relative_to(sce)
+                            zf.write(full_path, arcname)
+            else:
+                for root, _, files in os.walk(src):
+                    for file in files:
+                        full_path = Path(root) / file
+                        arcname = full_path.relative_to(src)
+                        zf.write(full_path, arcname)
+        return True
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def import_save_from_zip_or_dir(import_path: Path | str, base_dir: Path = None, eboot_path: Path | str = None) -> dict | None:
+    """Import a save from a .zip archive or an existing folder into user/savedata_backups."""
+    src = Path(import_path)
+    if not src.exists():
+        return None
+
+    now = datetime.now()
+    ts_slug = now.strftime("%Y-%m-%d_%H-%M-%S")
+    clean_name = re.sub(r'[\\/*?:"<>| ]', "_", src.stem)
+    target_folder = get_save_backups_root(base_dir) / f"{ts_slug}_imported_{clean_name}"
+    target_sprj = target_folder / "SPRJ0005"
+
+    try:
+        if src.is_file() and src.suffix.lower() == ".zip":
+            # Extract to temporary folder first
+            temp_extract = get_save_backups_root(base_dir) / f"_temp_{ts_slug}"
+            temp_extract.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(src, "r") as zf:
+                    zf.extractall(temp_extract)
+
+                # Find SPRJ0005 or userdata0010 inside extracted archive
+                found_sprj = None
+                for p in temp_extract.rglob("*"):
+                    if p.is_dir() and p.name == "SPRJ0005" and (p / "userdata0010").is_file():
+                        found_sprj = p
+                        break
+                    if p.is_file() and p.name == "userdata0010":
+                        found_sprj = p.parent
+                        break
+
+                if not found_sprj:
+                    shutil.rmtree(temp_extract, ignore_errors=True)
+                    return None
+
+                target_folder.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(found_sprj, target_sprj, dirs_exist_ok=True)
+
+                # Check if companion .sce_sys exists
+                for cp in [
+                    found_sprj / "sce_sys",
+                    found_sprj.parent / f"{found_sprj.name}.sce_sys",
+                    found_sprj.parent / "SPRJ0005.sce_sys",
+                    found_sprj.parent / "sce_sys",
+                ]:
+                    if cp.is_dir():
+                        shutil.copytree(cp, target_folder / "SPRJ0005.sce_sys", dirs_exist_ok=True)
+                        break
+            finally:
+                shutil.rmtree(temp_extract, ignore_errors=True)
+        elif src.is_dir():
+            # Directory import
+            found_sprj = None
+            if (src / "userdata0010").is_file():
+                found_sprj = src
+            elif (src / "SPRJ0005" / "userdata0010").is_file():
+                found_sprj = src / "SPRJ0005"
+
+            if not found_sprj:
+                return None
+
+            target_folder.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(found_sprj, target_sprj, dirs_exist_ok=True)
+
+            for cp in [
+                found_sprj / "sce_sys",
+                found_sprj.parent / f"{found_sprj.name}.sce_sys",
+                found_sprj.parent / "SPRJ0005.sce_sys",
+                found_sprj.parent / "sce_sys",
+            ]:
+                if cp.is_dir():
+                    shutil.copytree(cp, target_folder / "SPRJ0005.sce_sys", dirs_exist_ok=True)
+                    break
+        else:
+            return None
+
+        u10 = target_sprj / "userdata0010"
+        characters = parse_userdata0010(u10) if u10.is_file() else []
+
+        meta = {
+            "name": f"Imported: {src.stem}",
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "backup_type": "imported",
+            "characters": characters,
+            "source_import": str(src),
+        }
+        (target_folder / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        return {
+            "folder_name": target_folder.name,
+            "folder_path": str(target_folder),
+            "name": meta["name"],
+            "backup_type": "imported",
+            "timestamp_str": meta["timestamp"],
+            "characters": characters,
+        }
+    except Exception:
+        if target_folder.exists():
+            shutil.rmtree(target_folder, ignore_errors=True)
+        return None
+
+
+def prune_rolling_backups(base_dir: Path = None, max_keep: int = 10) -> int:
+    """Retain only the newest max_keep pre_launch rolling backups."""
+    if max_keep <= 0:
+        return 0
+
+    backups = list_save_backups(base_dir)
+    rolling = [b for b in backups if b.get("backup_type") == "pre_launch"]
+    if len(rolling) <= max_keep:
+        return 0
+
+    to_delete = rolling[max_keep:]
+    count = 0
+    for b in to_delete:
+        if delete_save_backup(b["folder_path"]):
+            count += 1
+    return count

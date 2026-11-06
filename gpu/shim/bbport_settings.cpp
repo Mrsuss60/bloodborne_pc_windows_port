@@ -199,6 +199,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         for (int q = 0; q < TqCount; ++q) {
             if (value == TextureQualityName(q)) v.texture_quality = q;
         }
+    } else if (key == "save_auto_backup") {
+        v.save_auto_backup = i != 0;
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "language") {
@@ -301,6 +303,7 @@ void Load() {
         {"BB_PREP_WORKERS", "prep_workers"},
         {"BB_ASYNC_PIPELINES", "async_pipelines"},
         {"BB_TEXTURE_QUALITY", "texture_quality"},
+        {"BB_SAVE_AUTO_BACKUP", "save_auto_backup"},
         {"BB_FPS", "target_fps"},                   {"BB_LIVE_FPS", "live_fps"},
         {"BB_TARGET_FPS", "target_fps"},            {"BB_MAX_DT_HZ", "max_dt_hz"},
         {"BB_LANG", "language"},
@@ -456,6 +459,7 @@ void Save() {
         std::fprintf(file, "async_pipelines=%d\n", v.async_pipelines.load());
     }
     std::fprintf(file, "texture_quality=%s\n", TextureQualityName(v.texture_quality.load()));
+    std::fprintf(file, "save_auto_backup=%d\n", v.save_auto_backup.load() ? 1 : 0);
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");

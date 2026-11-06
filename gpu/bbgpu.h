@@ -1,4 +1,4 @@
-/* C interface of the GPU library (gpu/): shadPS4's Liverpool/Vulkan video core,
+﻿/* C interface of the GPU library (gpu/): shadPS4's Liverpool/Vulkan video core,
  * GnmDriver, VideoOut and kernel event queues, adapted to the native loader. */
 #ifndef BBGPU_H
 #define BBGPU_H
@@ -120,6 +120,9 @@ enum BbAction {
 int bbgpu_get_action_binding(int action);
 void bbgpu_get_all_action_bindings(int *out_bindings, int count);
 void bbgpu_set_action_binding(int action, int code);
+
+/* Save data safeguards */
+int bbgpu_get_save_auto_backup(void);
 
 /* Shader recipes & cache rebuilds (Phase 2) */
 int bbgpu_rebuild_shader_caches(void);

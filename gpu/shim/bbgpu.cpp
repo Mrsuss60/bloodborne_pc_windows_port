@@ -1,4 +1,4 @@
-#include "bbport_write_log.h"
+﻿#include "bbport_write_log.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
@@ -476,6 +476,11 @@ extern "C" void bbgpu_get_mk_tuning(float* responsiveness, float* acceleration) 
 extern "C" int bbgpu_get_mk_native_mouse(void) {
     const auto& s = BbSettings::Get();
     return s.mk_enabled.load() ? 1 : 0;
+}
+
+extern "C" int bbgpu_get_save_auto_backup(void) {
+    const auto& s = BbSettings::Get();
+    return s.save_auto_backup.load() ? 1 : 0;
 }
 
 extern "C" void bbgpu_get_live_clock(int* mode, int* target_fps, int* max_dt_hz) {

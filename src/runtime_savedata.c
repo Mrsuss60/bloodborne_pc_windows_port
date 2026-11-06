@@ -6,6 +6,7 @@
  * Metadata lives beside the directory so the guest's own files are untouched. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -239,11 +240,107 @@ static int slot_of(const MountPoint *point) {
     return end && !*end && n>=0 && n<SLOTS && slots[n].used ? (int)n : -1;
 }
 
+static void runtime_savedata_safepoint_check(const char *host, const char *meta) {
+    if (!host || !*host) return;
+    const char *env = getenv("BB_SAVE_AUTO_BACKUP");
+    if (env && env[0] == '0') return;
+    if (!bbgpu_get_save_auto_backup()) return;
+
+    /* Check if userdata0010 exists in the mounted host directory */
+    char u10[800];
+    snprintf(u10, sizeof(u10), "%s/userdata0010", host);
+    struct stat st;
+    if (stat(u10, &st) != 0 || st.st_size < 0x2000) return;
+
+    /* Sum playtimes across all character slots (stride 0x192 from 0x1080) to gauge character progress */
+    FILE *f = fopen(u10, "rb");
+    if (!f) return;
+    uint32_t playtime = 0;
+    for (int s = 0; s < 10; ++s) {
+        uint32_t p = 0;
+        if (fseek(f, 0x1080 + s * 0x192 + 0x3C, SEEK_SET) == 0) {
+            if (fread(&p, sizeof(p), 1, f) == 1 && p > 0 && p < 10000000) {
+                playtime += p;
+            }
+        }
+    }
+    fclose(f);
+
+    /* Throttle: only create an auto-safepoint if at least 30s of gameplay progressed
+     * or at least 180s have passed since the last safepoint snapshot */
+    static uint32_t s_last_safepoint_playtime = 0;
+    static uint64_t s_last_safepoint_time = 0;
+    uint64_t now = (uint64_t)time(NULL);
+    if (s_last_safepoint_playtime && playtime <= s_last_safepoint_playtime + 30 && (now - s_last_safepoint_time) < 180) {
+        return;
+    }
+    s_last_safepoint_playtime = playtime;
+    s_last_safepoint_time = now;
+
+    /* Backup destination: <user_dir>/savedata_backups/auto_safepoint/SPRJ0005 */
+    char backup_root[800], backup_dir[850], backup_meta[850], meta_json[850];
+    snprintf(backup_root, sizeof(backup_root), "%s/savedata_backups", runtime_file_user_dir());
+    snprintf(backup_dir, sizeof(backup_dir), "%s/auto_safepoint/SPRJ0005", backup_root);
+    snprintf(backup_meta, sizeof(backup_meta), "%s/auto_safepoint/SPRJ0005.sce_sys", backup_root);
+    snprintf(meta_json, sizeof(meta_json), "%s/auto_safepoint/meta.json", backup_root);
+    make_dirs(backup_dir);
+    if (meta && *meta) make_dirs(backup_meta);
+
+    DIR *d = opendir(host);
+    if (d) {
+        for (struct dirent *e; (e = readdir(d));) {
+            if (e->d_name[0] == '.') continue;
+            char src_file[1024], dst_file[1024];
+            snprintf(src_file, sizeof(src_file), "%s/%s", host, e->d_name);
+            snprintf(dst_file, sizeof(dst_file), "%s/%s", backup_dir, e->d_name);
+#ifdef _WIN32
+            CopyFileA(src_file, dst_file, FALSE);
+#endif
+        }
+        closedir(d);
+    }
+    if (meta && *meta) {
+        DIR *dm = opendir(meta);
+        if (dm) {
+            for (struct dirent *e; (e = readdir(dm));) {
+                if (e->d_name[0] == '.') continue;
+                char src_file[1024], dst_file[1024];
+                snprintf(src_file, sizeof(src_file), "%s/%s", meta, e->d_name);
+                snprintf(dst_file, sizeof(dst_file), "%s/%s", backup_meta, e->d_name);
+#ifdef _WIN32
+                CopyFileA(src_file, dst_file, FALSE);
+#endif
+            }
+            closedir(dm);
+        }
+    }
+
+    FILE *fm = fopen(meta_json, "w");
+    if (fm) {
+        time_t t = (time_t)now;
+        struct tm tm_buf;
+#ifdef _WIN32
+        localtime_s(&tm_buf, &t);
+#else
+        localtime_r(&t, &tm_buf);
+#endif
+        char ts[64];
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+        fprintf(fm, "{\n  \"name\": \"Engine Auto-Safepoint\",\n  \"backup_type\": \"safepoint\",\n  \"timestamp\": \"%s\"\n}\n", ts);
+        fclose(fm);
+    }
+    printf("Runtime: auto safepoint backup updated in '%s'\n", backup_dir);
+}
+
 static ABI int32_t save_umount(const MountPoint *point) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     host_lock(&lock);
     int slot=slot_of(point);
-    if (slot>=0) { runtime_file_unmount(point->data); slots[slot].used=0; }
+    if (slot>=0) {
+        runtime_savedata_safepoint_check(slots[slot].host, slots[slot].meta);
+        runtime_file_unmount(point->data);
+        slots[slot].used=0;
+    }
     host_unlock(&lock);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
