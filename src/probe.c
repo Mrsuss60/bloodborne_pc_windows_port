@@ -3078,7 +3078,11 @@ int main(int argc, char **argv) {
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
 #ifdef _WIN32
-        SetEnvironmentVariableA("BB_SHADER_GAME_DIR", app0);
+        /* bbport: SetEnvironmentVariableA only updates the Win32 environment block. This
+         * executable is linked with the static CRT, so getenv() (bb_env in bb_env.h) reads a
+         * separate copy and never saw the value: StartShaderImport() could not find the game
+         * directory and never launched the recipe import. _putenv_s updates both. */
+        _putenv_s("BB_SHADER_GAME_DIR", app0);
 #else
         setenv("BB_SHADER_GAME_DIR", app0, 0);
 #endif
@@ -3092,7 +3096,8 @@ int main(int argc, char **argv) {
         if (rf) {
             fclose(rf);
 #ifdef _WIN32
-            SetEnvironmentVariableA("BB_SHADER_RECIPES", "shader_recipes.bin");
+            /* bbport: same CRT/Win32 split as BB_SHADER_GAME_DIR above. */
+            _putenv_s("BB_SHADER_RECIPES", "shader_recipes.bin");
 #else
             setenv("BB_SHADER_RECIPES", "shader_recipes.bin", 0);
 #endif

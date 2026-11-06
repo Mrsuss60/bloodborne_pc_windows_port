@@ -135,24 +135,25 @@ std::optional<Translated> Translate(BbShaderCapture::Input& in, const Shader::Pr
     return out;
 }
 
-std::vector<u8> RewriteMeta(std::vector<u8>&& meta, const std::vector<u8>& info,
-                            const std::pair<u64, u64>* motion = nullptr) {
+std::vector<u8> RewriteMeta(std::vector<u8>&& meta, const std::vector<u8>& info) {
     Serialization::Archive ar{std::move(meta)};
     Serialization::Reader reader{ar};
     u32 meta_version{}, binary_version{};
-    u64 perm_hash{}, perm_idx{}, motion_params{}, motion_positions{};
+    u64 perm_hash{}, perm_idx{};
     reader.Read(meta_version);
     reader.Read(binary_version);
     if (meta_version != Vulkan::PipelineStore::ShaderMetaVersion) {
         return {};
     }
+    /* bbport: the on-disk meta layout is exactly the one RegisterShaderMeta() writes and
+     * LoadShaderMeta() reads: meta version, binary version, perm hash, perm index, then
+     * StageSpecialization and Info. This function used to read and write two extra u64s (the
+     * object-motion buffer addresses) here, which shifted the specialization by 16 bytes and made
+     * every imported recipe unreadable. The motion addresses are passed to the importer on the
+     * command line and are not part of the saved meta. */
+    (void)binary_version; // the pack may predate the current compiler; it is re-emitted below
     reader.Read(perm_hash);
     reader.Read(perm_idx);
-    reader.Read(motion_params);
-    reader.Read(motion_positions);
-    if (motion) {
-        std::tie(motion_params, motion_positions) = *motion;
-    }
     Shader::Info old_info{};
     Shader::StageSpecialization spec{};
     spec.info = &old_info;
@@ -163,8 +164,6 @@ std::vector<u8> RewriteMeta(std::vector<u8>&& meta, const std::vector<u8>& info,
     writer.Write(Vulkan::PipelineStore::ShaderBinaryVersion);
     writer.Write(perm_hash);
     writer.Write(perm_idx);
-    writer.Write(motion_params);
-    writer.Write(motion_positions);
     spec.Serialize(out);
     auto bytes = out.TakeOff();
     bytes.insert(bytes.end(), info.begin(), info.end());
@@ -491,7 +490,7 @@ bool TranslateRecipe(const RecipeProgram& program, const GameShaders& game,
         const std::string name = HexName(program.hash) + "_" + std::to_string(perm_idx);
         std::vector<u8> meta;
         try {
-            meta = RewriteMeta(std::vector<u8>(perm.meta), program_info, &motion);
+            meta = RewriteMeta(std::vector<u8>(perm.meta), program_info);
         } catch (const std::exception&) {
             meta.clear();
         }
@@ -579,9 +578,28 @@ int RebuildCaches() {
         u32 versions[HeaderWords];
         std::memcpy(versions, header.data(), sizeof(versions));
         if (versions[0] != CacheMagic ||
-            versions[1] == Vulkan::PipelineStore::ShaderBinaryVersion ||
-            versions[2] != Vulkan::PipelineStore::ShaderMetaVersion ||
-            versions[3] != Vulkan::PipelineStore::PipelineKeyVersion) {
+            versions[1] == Vulkan::PipelineStore::ShaderBinaryVersion) {
+            continue;
+        }
+        /* bbport: before the versions were unified, the rebuild tool stamped profile.bin with its
+         * own stale copy of the binary version (24) after translating every shader with the
+         * current compiler. When the meta and key versions are current too, the shaders on disk
+         * are current as well and LoadShaderMeta checks each meta on its own, so the header is
+         * corrected here instead of re-translating the whole cache on the next launch. Any other
+         * mismatch keeps the old rebuild path. */
+        constexpr u32 StaleToolBinaryVersion = 24u;
+        if (versions[1] == StaleToolBinaryVersion &&
+            versions[2] == Vulkan::PipelineStore::ShaderMetaVersion &&
+            versions[3] == Vulkan::PipelineStore::PipelineKeyVersion) {
+            versions[1] = Vulkan::PipelineStore::ShaderBinaryVersion;
+            std::memcpy(header.data(), versions, sizeof(versions));
+            if (WriteFile(dir / "profile.bin", header)) {
+                std::printf("Shader cache %s: version header updated to %u without "
+                            "re-translating\n",
+                            dir.filename().string().c_str(),
+                            Vulkan::PipelineStore::ShaderBinaryVersion);
+                std::fflush(stdout);
+            }
             continue;
         }
         Shader::Profile profile{};
@@ -748,6 +766,24 @@ int MergeMetas(const char* cache_dir, const char* pack, const char* game_dir, co
     return 1; // Handled as fallback to standard pack import
 }
 
+/// True when every piece of guest code a recipe needs is present in this game build (program and
+/// all referenced shaders). TranslateRecipe() fails immediately when something is missing, and the
+/// answer cannot change until either the pack or the game build does.
+bool RecipeCodeAvailable(const RecipeProgram& program, const GameShaders& game) {
+    if (!game.Code(program.hash)) {
+        return false;
+    }
+    for (const auto& perm : program.perms) {
+        for (const auto& ref : perm.refs) {
+            const auto* ref_code = game.Code(ref.hash);
+            if (!ref_code || ref.size > ref_code->size() * sizeof(u32)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
                   u64 motion_params, u64 motion_positions) {
     const auto start = std::chrono::steady_clock::now();
@@ -860,6 +896,7 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
             TranslateRecipe(*program, game, profile, motion, staging);
         } else {
             std::ofstream{dir / "import.failed", std::ios::app} << HexName(hash) << '\n';
+            failed.insert(hash);
         }
     }
     std::signal(SIGABRT, old_abrt);
@@ -899,11 +936,13 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
             break;
         }
         std::ofstream{dir / "import.failed", std::ios::app} << HexName(todo[index]->hash) << '\n';
+        failed.insert(todo[index]->hash);
         next = index + 1;
     }
 #endif
     fs::remove(staging / "progress", ec);
     std::unordered_set<u64> perm_hashes;
+    std::vector<u64> silently_failed;
     u32 imported = 0, perms = 0;
     for (const auto* program : todo) {
         if (fs::exists(staging / (HexName(program->hash) + "_0.spv"), ec)) {
@@ -912,6 +951,19 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
             for (size_t perm_idx = 0; perm_idx < program->perms.size(); ++perm_idx) {
                 perm_hashes.insert(HashCombine(program->hash, u64(perm_idx)));
             }
+        } else if (!failed.contains(program->hash) && !RecipeCodeAvailable(*program, game)) {
+            /* bbport: TranslateRecipe() returns false for a program whose code is not in the
+             * running game build (and for a few other deterministic failures) without recording
+             * it, so the below-normal-priority import child retried the same hundreds of recipes
+             * on every single launch: 6+ seconds of CPU contention against the game. Record only
+             * the provably impossible ones; transient failures (I/O, translation) stay retryable. */
+            silently_failed.push_back(program->hash);
+        }
+    }
+    if (!silently_failed.empty()) {
+        std::ofstream list{dir / "import.failed", std::ios::app};
+        for (const u64 hash : silently_failed) {
+            list << HexName(hash) << '\n';
         }
     }
     u32 pipelines = 0;

@@ -30,6 +30,10 @@ public:
 
     void Open();
     void Close();
+    /// bbport: blocks until every queued blob write has reached the disk. Close() uses it before
+    /// stopping the IO worker, which otherwise could exit with writes still queued (the process
+    /// leaves through _Exit, so nothing else flushes them either).
+    void Flush();
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }

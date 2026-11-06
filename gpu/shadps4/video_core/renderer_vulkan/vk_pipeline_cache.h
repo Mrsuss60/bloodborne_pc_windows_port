@@ -4,6 +4,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <future>
@@ -260,6 +261,14 @@ private:
 
     std::string GetDriverCacheKey() const;
     void SaveDriverPipelineCache();
+    /// bbport: asks the driver-cache saver thread to write the native driver cache about once a
+    /// minute when new pipelines exist. The window thread ends the process with std::_Exit(0), so
+    /// the presenter destructor (the only other SaveDriverPipelineCache caller) never runs and the
+    /// .vkp would never be written. No-op when nothing new was compiled. The dump (10+ MB) and the
+    /// disk flush run on the saver thread, never on the GPU thread.
+    void MaybeSaveDriverPipelineCache();
+    void DriverCacheSaveLoop();
+    void StopDriverCacheSaver();
 
 private:
     const Instance& instance;
@@ -292,6 +301,14 @@ private:
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    std::chrono::steady_clock::time_point last_driver_cache_save{};
+    u32 num_new_pipelines_at_last_save{};
+    /// bbport: the periodic .vkp dump runs here, off the GPU thread (see MaybeSaveDriverPipelineCache).
+    std::mutex driver_save_mutex;
+    std::condition_variable driver_save_cv;
+    std::thread driver_save_thread;
+    bool driver_save_pending = false;
+    bool driver_save_stop = false;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

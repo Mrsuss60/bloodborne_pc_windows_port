@@ -14,6 +14,7 @@
 #include <miniz.h>
 
 #include <condition_variable>
+#include <atomic>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -29,7 +30,7 @@
 namespace {
 
 std::mutex submit_mutex{};
-u32 num_requests{};
+std::atomic<u32> num_requests{};
 std::condition_variable_any request_cv{};
 std::queue<std::packaged_task<void()>> req_queue{};
 std::mutex m_request{};
@@ -44,13 +45,14 @@ namespace Storage {
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
 
-    while (!stoken.stop_requested()) {
+    for (;;) {
         {
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
+            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests.load() != 0; });
         }
 
-        if (stoken.stop_requested()) {
+        // bbport: a stop request must not drop queued writes (Close() flushes through this queue).
+        if (stoken.stop_requested() && num_requests == 0) {
             break;
         }
 
@@ -138,6 +140,10 @@ void DataBase::Close() {
         return;
     }
 
+    // bbport: process everything that was queued (the driver pipeline cache in particular)
+    // before the worker is stopped; stopping first would drop those writes.
+    Flush();
+
     io_worker.request_stop();
     io_worker.join();
 
@@ -148,6 +154,27 @@ void DataBase::Close() {
 
     opened = false;
     LOG_INFO(Render, "Cache dumped");
+}
+
+void DataBase::Flush() {
+    if (!IsOpened()) {
+        return;
+    }
+
+    // The queue is FIFO, so this marker completing means every earlier write is on disk. A
+    // promise is used because the worker itself calls get_future() on each packaged task.
+    std::promise<void> marker;
+    auto done = marker.get_future();
+    {
+        std::scoped_lock lock{m_request};
+        req_queue.emplace([&marker] { marker.set_value(); });
+    }
+    {
+        std::scoped_lock lk{submit_mutex};
+        ++num_requests;
+    }
+    request_cv.notify_one();
+    done.wait();
 }
 
 template <typename T>

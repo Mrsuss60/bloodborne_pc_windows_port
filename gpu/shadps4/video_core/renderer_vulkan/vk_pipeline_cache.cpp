@@ -422,6 +422,10 @@ PipelineCompiler& PipelineCache::GetCompiler() {
 
 
 PipelineCache::~PipelineCache() {
+    // bbport: the saver thread touches the device and the cache storage; it must be joined while
+    // both are still alive. Sync() normally does this already; this covers teardown paths that
+    // skip it.
+    StopDriverCacheSaver();
     ClearAuxShaderCaches();
 }
 
@@ -557,6 +561,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                                                            const PreparedDraw* prepared,
                                                            bool indirect) {
     PollShaderImport();
+    MaybeSaveDriverPipelineCache();
     used_prepared = nullptr;
     NoteDrawTarget(liverpool->regs);
     if (prepared) {
@@ -812,6 +817,7 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    MaybeSaveDriverPipelineCache();
     if (!RefreshComputeKey()) {
         return nullptr;
     }

@@ -10,7 +10,11 @@
 namespace Vulkan {
 
 namespace PipelineStore {
-static constexpr u32 ShaderBinaryVersion = 24u;
+/* bbport: single source of truth for the cache version. The runtime constants in
+ * vk_pipeline_serialization.cpp used to be a separate copy, and when only one of them was
+ * bumped the launcher rewrote profile.bin to the other value on every start. WarmUp then saw
+ * a mismatching profile and wiped the whole cache, which is why shaders recompiled forever. */
+static constexpr u32 ShaderBinaryVersion = 25u;
 static constexpr u32 ShaderMetaVersion = 8u;
 static constexpr u32 PipelineKeyVersion = 5u;
 }

@@ -85,6 +85,9 @@ void PipelineCache::StartShaderImport() {
         import_ready.store(true, std::memory_order_relaxed);
     }
     SaveProfile();
+    // bbport: the import child validates <cache>/profile.bin before it imports any recipe, so the
+    // profile has to be on disk (not just queued) before CreateProcess runs.
+    store.Flush();
     std::string pack_str;
     const char* pack = bb_env("BB_SHADER_RECIPES");
     if (!pack || !*pack || !std::filesystem::exists(pack, ec)) {

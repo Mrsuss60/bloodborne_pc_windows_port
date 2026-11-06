@@ -3,6 +3,7 @@
 
 #include "common/serdes.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -13,12 +14,21 @@
 #include <future>
 #include "common/hash.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h" 
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 
 namespace Serialization {
-/* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 25u; // bbport: modernized recompiler & fast shader math (Phase 2)
-static constexpr u32 ShaderMetaVersion = 8u; // the object motion buffer addresses
-static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
+/* bbport: the versions live in vk_pipeline_serialization.h (PipelineStore) so the runtime, the
+ * shader-rebuild tool and the recipe importer cannot drift apart. When they did, the rebuild tool
+ * rewrote profile.bin to its own version after every start and WarmUp wiped the cache next time. */
+static_assert(Vulkan::PipelineStore::ShaderBinaryVersion == 25u,
+              "modernized recompiler & fast shader math (Phase 2)");
+static_assert(Vulkan::PipelineStore::ShaderMetaVersion == 8u,
+              "the object motion buffer addresses");
+static_assert(Vulkan::PipelineStore::PipelineKeyVersion == 5u,
+              "Info layout (ImageResource::needs_native)");
+static constexpr u32 ShaderBinaryVersion = Vulkan::PipelineStore::ShaderBinaryVersion;
+static constexpr u32 ShaderMetaVersion = Vulkan::PipelineStore::ShaderMetaVersion;
+static constexpr u32 PipelineKeyVersion = Vulkan::PipelineStore::PipelineKeyVersion;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -438,26 +448,65 @@ void PipelineCache::WarmUp() {
     }
     Shader::Profile cached_profile{};
     bool valid = false;
+    bool have_cached = false;
+    bool stale_version_header = false;
+    /* bbport: older builds of the shader-rebuild tool stamped profile.bin with their own copy of
+     * the binary version (24) while the runtime wrote 25. The profile contents and the meta/key
+     * versions are still current in that case, and every individual .meta is version-checked by
+     * LoadShaderMeta, so the header can be updated in place instead of deleting a valid cache.
+     * This stops the launcher<->WarmUp version flip from wiping all shaders on every launch. */
+    constexpr u32 StaleToolBinaryVersion = 24u;
     if (profile_data.size() == 16 + sizeof(Shader::Profile)) {
         u32 hdr[4];
         std::memcpy(hdr, profile_data.data(), sizeof(hdr));
         if (hdr[0] == CacheMagic &&
-            hdr[1] == Serialization::ShaderBinaryVersion &&
+            (hdr[1] == Serialization::ShaderBinaryVersion ||
+             hdr[1] == StaleToolBinaryVersion) &&
             hdr[2] == Serialization::ShaderMetaVersion &&
             hdr[3] == Serialization::PipelineKeyVersion) {
             std::memcpy(&cached_profile, profile_data.data() + 16, sizeof(cached_profile));
+            have_cached = true;
             valid = (cached_profile == profile);
+            stale_version_header = valid && hdr[1] != Serialization::ShaderBinaryVersion;
         }
     } else if (profile_data.size() == sizeof(Shader::Profile)) {
         std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+        have_cached = true;
         valid = (cached_profile == profile);
     }
     if (!valid) {
+        /* bbport: name the fields that differ. A wipe leaves no trace otherwise, so a cache that
+         * is rebuilt on every launch cannot be told apart from one that is merely cold. */
+        if (have_cached) {
+            const auto* cached = reinterpret_cast<const u8*>(&cached_profile);
+            const auto* current = reinterpret_cast<const u8*>(&profile);
+            std::string diff;
+            for (size_t i = 0; i < sizeof(Shader::Profile); ++i) {
+                if (cached[i] != current[i]) {
+                    if (!diff.empty()) {
+                        diff += ", ";
+                    }
+                    diff += fmt::format("[{}] {:#04x} -> {:#04x}", i, cached[i], current[i]);
+                }
+            }
+            LOG_WARNING(Render, "Cached shader profile differs from this system: {}", diff);
+        } else {
+            LOG_WARNING(Render,
+                        "Cached shader profile is unreadable ({} bytes, versions or magic differ)",
+                        profile_data.size());
+        }
         LOG_WARNING(Render, "Pipeline cache isn't compatible with current system: rebuilding it");
         Storage::DataBase::Instance().Clear();
         Storage::DataBase::Instance().FinishPreload();
         SaveProfile();
         return;
+    }
+    if (stale_version_header) {
+        LOG_INFO(Render,
+                 "Cached shader profile matches this system; updating its version header to {} "
+                 "without rebuilding the cache",
+                 Serialization::ShaderBinaryVersion);
+        save_profile();
     }
 
     const char* env_warmup = std::getenv("BB_WARMUP_ASYNC");
@@ -848,7 +897,16 @@ void PipelineCache::SaveDriverPipelineCache() {
         return;
     }
     try {
-        auto [res, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+        vk::Result res{vk::Result::eSuccess};
+        std::vector<u8> data;
+        {
+            /* Vulkan requires external synchronization on the VkPipelineCache handle, and the
+             * async compiler workers create pipelines concurrently (see vk_graphics_pipeline.cpp). */
+            std::scoped_lock lock{PipelineCreationMutex()};
+            auto result = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+            res = result.result;
+            data = std::move(result.value);
+        }
         if (res == vk::Result::eSuccess && !data.empty()) {
             LOG_INFO(Render, "Saving native Vulkan driver pipeline cache ({} bytes)", data.size());
             Storage::DataBase::Instance().Save(Storage::BlobType::PipelineBinary,
@@ -859,7 +917,64 @@ void PipelineCache::SaveDriverPipelineCache() {
     }
 }
 
+void PipelineCache::MaybeSaveDriverPipelineCache() {
+    if (num_new_pipelines == num_new_pipelines_at_last_save) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    /* The first new pipeline is written out at once (a small, cheap dump) so even an early crash
+     * leaves a cache behind; later dumps are spaced out so the .vkp loses at most a minute. */
+    if (last_driver_cache_save.time_since_epoch().count() != 0 &&
+        now - last_driver_cache_save < std::chrono::minutes(1)) {
+        return;
+    }
+    last_driver_cache_save = now;
+    num_new_pipelines_at_last_save = num_new_pipelines;
+    /* bbport: this is called from the GPU thread for every draw. Hand the work to a saver thread:
+     * getPipelineCacheData() copies the whole driver cache (10+ MB here) and the write/flush used
+     * to block the GPU thread, producing a periodic hitch every minute. */
+    std::scoped_lock lk{driver_save_mutex};
+    if (driver_save_stop) {
+        return;
+    }
+    if (!driver_save_thread.joinable()) {
+        driver_save_thread = std::thread([this] { DriverCacheSaveLoop(); });
+    }
+    driver_save_pending = true;
+    driver_save_cv.notify_one();
+}
+
+void PipelineCache::DriverCacheSaveLoop() {
+    Common::SetCurrentThreadName("bb:DriverCacheSave");
+    std::unique_lock lk{driver_save_mutex};
+    for (;;) {
+        driver_save_cv.wait(lk, [&] { return driver_save_stop || driver_save_pending; });
+        if (driver_save_stop) {
+            return;
+        }
+        driver_save_pending = false;
+        lk.unlock();
+        SaveDriverPipelineCache();
+        /* Make this dump durable here, off the GPU thread. The GPU thread only asked for it. */
+        Storage::DataBase::Instance().Flush();
+        lk.lock();
+    }
+}
+
+void PipelineCache::StopDriverCacheSaver() {
+    {
+        std::scoped_lock lk{driver_save_mutex};
+        if (!driver_save_thread.joinable()) {
+            return;
+        }
+        driver_save_stop = true;
+    }
+    driver_save_cv.notify_all();
+    driver_save_thread.join();
+}
+
 void PipelineCache::Sync() {
+    StopDriverCacheSaver();
     SaveDriverPipelineCache();
     Storage::DataBase::Instance().Close();
 }
