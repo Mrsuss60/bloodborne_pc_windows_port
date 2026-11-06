@@ -33,7 +33,7 @@ LOG_KEEP = 20
 SETTINGS_FILE = APP_DIR / "bblauncher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
-LAUNCHER_VERSION = "0.8.1"
+LAUNCHER_VERSION = "0.9.0"
 
 
 def build_stamp() -> str:
@@ -883,84 +883,48 @@ BLOODBORNE_MAP_NAMES = {
 
 
 def find_character_portrait(
-    slot_idx: int,
+    slot_idx: int = 0,
     char_name: str = "",
     save_dir: Path = None,
     base_dir: Path = None,
 ) -> Path | None:
-    """Find a character portrait image file for a given save slot.
+    """Find the universal character portrait image file for save game slot cards.
 
-    Priority:
-      1. Specific portrait for this slot or character inside the save folder
-      2. Authentic slot or character portrait from resource directories
-      3. Companion icon0.png from sce_sys metadata
-      4. Default hunter portrait fallback
+    Returns the universal Bloodborne Hunter cover artwork embedded in the launcher
+    or located in resources/portraits.
     """
-    clean_name = re.sub(r'[\\/*?:"<>|]', "", char_name).strip() if char_name else ""
-
-    # 1. Check inside save_dir
-    if save_dir:
-        sd = Path(save_dir)
-        direct_cands = [
-            sd / f"slot_{slot_idx}.png",
-            sd / f"slot_{slot_idx}.jpg",
-        ]
-        if clean_name:
-            direct_cands.extend([
-                sd / f"{clean_name}.png",
-                sd / f"{clean_name}.jpg",
-                sd / f".{clean_name}.png",
-                sd / f".{clean_name}.jpg",
-            ])
-        for c in direct_cands:
-            if c.is_file():
-                return c
-
-        try:
-            for f in sd.iterdir():
-                if f.is_file() and f.suffix.lower() in [".png", ".jpg", ".jpeg"] and not f.name.startswith("icon0"):
-                    if clean_name and clean_name.lower() in f.stem.lower():
-                        return f
-        except OSError:
-            pass
-
-    # 2. Check bundled portrait directories for slot or character match
     root = (base_dir or APP_DIR)
-    portrait_dirs = [
+
+    # Search candidates across bundled PyInstaller runtime and local directories
+    candidate_dirs: list[Path] = []
+
+    # 1. PyInstaller runtime unpacked directory
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        meipass_path = Path(sys._MEIPASS)
+        candidate_dirs.append(meipass_path / "resources" / "portraits")
+        candidate_dirs.append(meipass_path / "resources")
+        candidate_dirs.append(meipass_path)
+
+    # 2. Local app and script directories
+    this_dir = Path(__file__).resolve().parent
+    candidate_dirs.extend([
+        this_dir / "resources" / "portraits",
+        this_dir.parent / "resources" / "portraits",
         root / "bblauncherAPP" / "resources" / "portraits",
         root / "resources" / "portraits",
-        Path(__file__).resolve().parent / "resources" / "portraits",
+    ])
+
+    image_names = [
+        "default_hunter.png",
+        "default_hunter (2).png",
+        "default_hunter.jpg",
     ]
-    for pdir in portrait_dirs:
-        slot_cands = [
-            pdir / f"slot_{slot_idx}.png",
-            pdir / f"slot_{slot_idx}.jpg",
-        ]
-        if clean_name:
-            slot_cands.extend([
-                pdir / f"{clean_name.lower()}.png",
-                pdir / f"{clean_name}.png",
-            ])
-        for c in slot_cands:
-            if c.is_file():
-                return c
 
-    # 3. Companion icon0.png from sce_sys if available
-    if save_dir:
-        sd = Path(save_dir)
-        for cp in [
-            sd.parent / f"{sd.name}.sce_sys" / "icon0.png",
-            sd / "sce_sys" / "icon0.png",
-            sd.parent / "SPRJ0005.sce_sys" / "icon0.png",
-        ]:
-            if cp.is_file():
-                return cp
-
-    # 4. Fallback default hunter portrait
-    for pdir in portrait_dirs:
-        def_img = pdir / "default_hunter.png"
-        if def_img.is_file():
-            return def_img
+    for pdir in candidate_dirs:
+        for name in image_names:
+            img = pdir / name
+            if img.is_file():
+                return img
 
     return None
 

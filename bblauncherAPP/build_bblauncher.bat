@@ -30,6 +30,12 @@ if exist "icon.ico" (
     echo   [INFO]    icon.ico not found - building with default icon
 )
 
+set "DATA_ARGS="
+if exist "resources" (
+    echo   [OK]      resources folder found - will embed into executable
+    set "DATA_ARGS=--add-data "resources;resources""
+)
+
 if not exist "..\scripts\bb_guard.py" echo   [WARN]    ..\scripts\bb_guard.py not found - the exe will build without it
 if not exist "..\scripts\game_check.py" echo   [WARN]    ..\scripts\game_check.py not found - the exe will build without it
 echo.
@@ -92,6 +98,7 @@ echo.
 %PY% -m PyInstaller --noconfirm --onefile --windowed ^
     --name "BloodborneLauncher" ^
     %ICON_ARGS% ^
+    %DATA_ARGS% ^
     --distpath ".." ^
     --paths "." ^
     --paths "..\scripts" ^

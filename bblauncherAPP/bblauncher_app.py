@@ -102,6 +102,24 @@ EFFECT_PATCH_MAP = {
 }
 
 
+def get_launcher_icon() -> QIcon:
+    """Find and return launcher QIcon checking PyInstaller frozen bundle and local paths."""
+    candidates = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        candidates.append(Path(sys._MEIPASS) / "icon.ico")
+    candidates.extend([
+        Path(__file__).resolve().parent / "icon.ico",
+        APP_DIR / "icon.ico",
+        APP_DIR / "bblauncherAPP" / "icon.ico",
+    ])
+    for c in candidates:
+        if c.is_file():
+            ico = QIcon(str(c))
+            if not ico.isNull():
+                return ico
+    return QIcon()
+
+
 class BloodborneLauncher(LauncherUI, QMainWindow):
     def __init__(self):
         super().__init__()
@@ -114,11 +132,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self._wheel_guard = WheelGuard(self)
             app.installEventFilter(self._wheel_guard)
         
-        icon_file = APP_DIR / "icon.ico"
-        if not icon_file.is_file():
-            icon_file = Path(__file__).resolve().parent / "icon.ico"
-        if icon_file.is_file():
-            self.setWindowIcon(QIcon(str(icon_file)))
+        launcher_icon = get_launcher_icon()
+        if not launcher_icon.isNull():
+            self.setWindowIcon(launcher_icon)
 
         self.worker = None
         self.log_fh = None
@@ -2519,14 +2535,22 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Bloodborne.PC.Launcher")
+        except Exception:
+            pass
+
+    app = QApplication(sys.argv)
+    launcher_icon = get_launcher_icon()
+    if not launcher_icon.isNull():
+        app.setWindowIcon(launcher_icon)
+    install_dialog_styling(app)
+
     if not acquire_single_instance():
-        app = QApplication(sys.argv)
-        install_dialog_styling(app)
         QMessageBox.information(None, "Bloodborne PC Launcher", "The launcher is already open.")
         sys.exit(0)
 
-    app = QApplication(sys.argv)
-    install_dialog_styling(app)
     window = BloodborneLauncher()
     window.show()
     sys.exit(app.exec())
