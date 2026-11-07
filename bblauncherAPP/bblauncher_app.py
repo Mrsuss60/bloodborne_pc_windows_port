@@ -128,6 +128,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.setFixedSize(1200, 720)
         self.setStyleSheet(STYLE_SHEET)
 
+        # Deferred background warming for secondary tabs after window is already shown
+        QTimer.singleShot(100, self._build_display_tab_now)
+        QTimer.singleShot(300, self._build_patches_tab_now)
+        QTimer.singleShot(500, self._build_mk_tab_now)
+        QTimer.singleShot(700, self._build_advanced_tab_now)
+        QTimer.singleShot(900, self._build_saves_tab_now)
+
         app = QApplication.instance()
         if app is not None:
             self._wheel_guard = WheelGuard(self)
@@ -183,10 +190,6 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.update_home_summary()
         QTimer.singleShot(250, self.refresh_setup_status)
 
-        # Deferred background warming for secondary tabs after window is already shown
-        QTimer.singleShot(100, self._build_display_tab_now)
-        QTimer.singleShot(300, self._build_patches_tab_now)
-
         self._last_ini_mtime = 0
         try:
             ini_file = APP_DIR / "bbport.ini"
@@ -199,6 +202,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.ini_sync_timer.timeout.connect(self.sync_bbport_ini_to_ui)
         self.ini_sync_timer.start()
         self._suppress_settings_save = False
+
+        # Deferred background warming for secondary tabs after window is already shown
+        QTimer.singleShot(100, self._build_display_tab_now)
+        QTimer.singleShot(300, self._build_patches_tab_now)
+        QTimer.singleShot(500, self._build_mk_tab_now)
+        QTimer.singleShot(700, self._build_advanced_tab_now)
+        QTimer.singleShot(900, self._build_saves_tab_now)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -287,7 +297,8 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self._install_tab("saves_placeholder", self.create_saves_tab())
         finally:
             self._suppress_settings_save = previous
-        self.refresh_save_manager()
+        # Defer the file system scan to keep the UI responsive
+        QTimer.singleShot(50, self.refresh_save_manager)
 
     def _clear_layout(self, layout):
         if layout is None:
@@ -1987,6 +1998,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 cb.setChecked(False)
                 cb.setEnabled(False)
                 cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+                warn_lbl = getattr(self, "patch_warnings", {}).get(name)
+                if warn_lbl:
+                    warn_lbl.setVisible(True)
                 cb.blockSignals(False)
             self.enabled_patches.discard(name)
             self.update_patch_count_label()
@@ -2025,14 +2039,19 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             for name, cb in self.patch_checkboxes.items():
                 if name in LIVE_FPS_CONFLICTING_PATCHES:
                     cb.blockSignals(True)
+                    warn_lbl = getattr(self, "patch_warnings", {}).get(name)
                     if is_live:
                         cb.setChecked(False)
                         cb.setEnabled(False)
                         cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+                        if warn_lbl:
+                            warn_lbl.setVisible(True)
                     else:
                         cb.setEnabled(True)
                         cb.setChecked(name in self.enabled_patches)
                         cb.setToolTip("")
+                        if warn_lbl:
+                            warn_lbl.setVisible(False)
                     cb.blockSignals(False)
             self.update_patch_count_label()
         if changed:
@@ -2044,14 +2063,19 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
         for name, cb in self.patch_checkboxes.items():
             cb.blockSignals(True)
+            warn_lbl = getattr(self, "patch_warnings", {}).get(name)
             if is_live and name in LIVE_FPS_CONFLICTING_PATCHES:
                 cb.setChecked(False)
                 cb.setEnabled(False)
                 cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+                if warn_lbl:
+                    warn_lbl.setVisible(True)
             else:
                 cb.setEnabled(True)
                 cb.setChecked(name in self.enabled_patches)
                 cb.setToolTip("")
+                if warn_lbl:
+                    warn_lbl.setVisible(False)
             cb.blockSignals(False)
         self.update_patch_count_label()
 

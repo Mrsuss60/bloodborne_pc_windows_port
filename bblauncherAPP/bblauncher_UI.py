@@ -4,9 +4,10 @@
 import ctypes
 import os
 from pathlib import Path
-from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal, QTimer
 from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractScrollArea,
     QAbstractSlider,
     QAbstractSpinBox,
@@ -67,7 +68,7 @@ class KeybindButton(QPushButton):
                  keyboard_only=False, display_text=None):
         if display_text is None:
             display_text = scancode_display_name(binding_text)
-        super().__init__(display_text, parent)
+        super().__init__(display_text if display_text else "None", parent)
         self.action_key = action_key
         # current_binding is always the SDL scancode name written to bbport.ini.
         self.current_binding = binding_text
@@ -82,7 +83,10 @@ class KeybindButton(QPushButton):
         if keyboard_only:
             self.setToolTip("Keyboard-only system hotkey: press a key to assign.")
         self.clicked.connect(self.start_listening)
-        self.update_style()
+        
+        # Set the initial state without forcing a stylesheet polish.
+        # This prevents a UI freeze when creating all keybind buttons at once.
+        self.setProperty("listening", "false")
 
     def update_style(self):
         if self.listening:
@@ -387,12 +391,26 @@ class DialogStyler(QObject):
             apply_dwm_styling(hwnd)
         return False
 
+class CursorGuard(QObject):
+    """Ensures all clickable controls use the pointing hand cursor."""
+    CLICKABLE_WIDGETS = (QAbstractButton, QComboBox, QSlider)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Polish:
+            if isinstance(obj, self.CLICKABLE_WIDGETS):
+                if obj.cursor().shape() == Qt.ArrowCursor:
+                    obj.setCursor(Qt.PointingHandCursor)
+        return False
 
 def install_dialog_styling(app):
     app.setStyleSheet(STYLE_SHEET)
     styler = DialogStyler(app)
     app.installEventFilter(styler)
     app._dialog_styler = styler
+
+    cursor_guard = CursorGuard(app)
+    app.installEventFilter(cursor_guard)
+    app._cursor_guard = cursor_guard
 
 
 STYLE_SHEET = """
@@ -515,6 +533,7 @@ QPushButton#PrimaryBtn {
     padding: 10px 18px;
     border: none;
     border-radius: 6px;
+    min-height: 20px;
 }
 QPushButton#PrimaryBtn:hover {
     background-color: #b51920;
@@ -530,6 +549,7 @@ QPushButton#SecondaryBtn {
     padding: 7px 14px;
     border: 1px solid #2e2e38;
     border-radius: 5px;
+    min-height: 20px;
 }
 QPushButton#SecondaryBtn:hover {
     background-color: #2d2d38;
@@ -962,8 +982,6 @@ class LauncherUI:
             self._build_mk_tab_now()
         elif idx == 4 and hasattr(self, "_build_saves_tab_now"):
             self._build_saves_tab_now()
-            if hasattr(self, "refresh_save_manager"):
-                self.refresh_save_manager()
         elif idx == 5 and hasattr(self, "_build_advanced_tab_now"):
             self._build_advanced_tab_now()
         for i, btn in enumerate(self.nav_buttons):
@@ -1286,15 +1304,30 @@ class LauncherUI:
             top_row = QHBoxLayout()
             cb = QCheckBox(name.replace("&", "&&"))
             cb.setStyleSheet("font-weight: 700; color: #ffffff;")
+            # Create the warning label
+            warn_lbl = QLabel("(Disabled because Live FPS is On)")
+            warn_lbl.setStyleSheet("color: #f0b429; font-size: 11px; font-weight: 600; margin-left: 8px;")
+            warn_lbl.setVisible(False)
+            
+            if not hasattr(self, "patch_warnings"):
+                self.patch_warnings = {}
+            self.patch_warnings[name] = warn_lbl
+
             is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
             if is_live and name in LIVE_FPS_CONFLICTING_PATCHES:
                 cb.setChecked(False)
                 cb.setEnabled(False)
                 cb.setToolTip("Disabled: Conflicts with Live FPS Patching.")
+                warn_lbl.setVisible(True)
             else:
                 cb.setChecked(name in self.enabled_patches)
+                
             cb.stateChanged.connect(lambda state, p=name: self.on_patch_toggled(p, state))
-            top_row.addWidget(cb, 1)
+            
+            # Add checkbox, warning label, stretch, and then the meta label
+            top_row.addWidget(cb, 0)
+            top_row.addWidget(warn_lbl)
+            top_row.addStretch(1)
 
             meta_lbl = QLabel(f'<span style="color:#7b7b88;">by {author}</span> &nbsp;<span style="color:#d1b87a;font-weight:600;">[{cat}]</span>')
             meta_lbl.setTextFormat(Qt.RichText)
@@ -1992,30 +2025,32 @@ class LauncherUI:
         v_info.addWidget(self.lbl_active_save_meta)
         row_active_top.addLayout(v_info, 1)
 
-        self.btn_create_backup = QPushButton("  Create Backup")
+        ROW_BTN_HEIGHT = 38
+        
+        self.btn_create_backup = QPushButton("Create Backup")
         self.btn_create_backup.setObjectName("PrimaryBtn")
-        self.btn_create_backup.setFixedHeight(34)
+        self.btn_create_backup.setMinimumHeight(ROW_BTN_HEIGHT)
         if hasattr(self, "handle_create_backup"):
             self.btn_create_backup.clicked.connect(self.handle_create_backup)
         row_active_top.addWidget(self.btn_create_backup)
 
         self.btn_open_saves_folder = QPushButton("Open Folder")
         self.btn_open_saves_folder.setObjectName("SecondaryBtn")
-        self.btn_open_saves_folder.setFixedHeight(34)
+        self.btn_open_saves_folder.setMinimumHeight(ROW_BTN_HEIGHT)
         if hasattr(self, "handle_open_saves_folder"):
             self.btn_open_saves_folder.clicked.connect(self.handle_open_saves_folder)
         row_active_top.addWidget(self.btn_open_saves_folder)
 
         self.btn_export_active = QPushButton("Export ZIP")
         self.btn_export_active.setObjectName("SecondaryBtn")
-        self.btn_export_active.setFixedHeight(34)
+        self.btn_export_active.setMinimumHeight(ROW_BTN_HEIGHT)
         if hasattr(self, "handle_export_active_save"):
             self.btn_export_active.clicked.connect(self.handle_export_active_save)
         row_active_top.addWidget(self.btn_export_active)
 
         self.btn_import_save = QPushButton("Import Save")
         self.btn_import_save.setObjectName("SecondaryBtn")
-        self.btn_import_save.setFixedHeight(34)
+        self.btn_import_save.setMinimumHeight(ROW_BTN_HEIGHT)
         if hasattr(self, "handle_import_save"):
             self.btn_import_save.clicked.connect(self.handle_import_save)
         row_active_top.addWidget(self.btn_import_save)
@@ -2049,7 +2084,7 @@ class LauncherUI:
 
         self.btn_refresh_backups = QPushButton("Refresh")
         self.btn_refresh_backups.setObjectName("SecondaryBtn")
-        self.btn_refresh_backups.setFixedHeight(28)
+        self.btn_refresh_backups.setMinimumHeight(32)
         if hasattr(self, "refresh_save_manager"):
             self.btn_refresh_backups.clicked.connect(self.refresh_save_manager)
         row_b_header.addWidget(self.btn_refresh_backups)
@@ -2272,5 +2307,6 @@ class LauncherUI:
         c_layout.addWidget(card_files)
 
         c_layout.addStretch()
-        self.update_cache_info()
+        # Defer the slow I/O scan so the tab paints instantly
+        QTimer.singleShot(50, self.update_cache_info)
         return w
