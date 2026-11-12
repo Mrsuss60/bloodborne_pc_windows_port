@@ -412,6 +412,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         auto& image = texture_cache.GetImage(image_id);
         image_view = *image.FindView(view_info).image_view;
         image_size = vk::Extent2D{image.info.size.width, image.info.size.height};
+        // bbport: BB_PRESENT_DUMP_TRIGGER for the game's own display buffer too.
+        if (auto& upscaler = rasterizer->GetUpscaler(); upscaler.PresentDumpDue()) {
+            runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+                            vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+            upscaler.DumpPresented(image.GetImage(), image_size.width, image_size.height,
+                                   view_info.format);
+        }
         runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eFragmentShader,
                         vk::AccessFlagBits2::eShaderRead);

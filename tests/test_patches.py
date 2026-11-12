@@ -77,14 +77,23 @@ class NativeUiTests(unittest.TestCase):
     def test_output_other_than_1080p_scales_the_scene(self):
         self.assertIsNone(scaled_sizes({'output_res': '1920x1080', 'preset': '2'}))
         # Steam Deck: below 1080p the scene is still the preset's fraction of the output.
-        for preset, expected in [(0, (1280, 720)), (2, (752, 424)), (4, (426, 240))]:
+        for preset, expected in [(0, (1280, 720)), (2, (752, 424)), (4, (640, 360))]:
             with self.subTest(preset=preset):
                 self.assertEqual(scaled_sizes({'output_res': '1280x720', 'preset': str(preset)}),
                                  (expected, (1280, 720)))
         self.assertEqual(scaled_sizes({'output_res': '3840x2160', 'preset': '3'}),
-                         ((1916, 1078), (3840, 2160)))
+                         ((1916, 1076), (3840, 2160)))
+        # Custom scale (preset=5).
+        self.assertEqual(render_size({'upscaler': 'fsr3', 'preset': '5', 'render_scale': '1.5'}),
+                         (1280, 720))
         # TAA is native-only and uses the live host targets.
         self.assertIsNone(scaled_sizes({'output_res': '1280x720', 'upscaler': 'taa', 'preset': '3'}))
+
+    def test_upscalers_disable_game_aa_by_default(self):
+        for upscaler in ('fsr3', 'fsr31', 'fsr4', 'fsr411', 'taa', 'dlss', 'fsr', 'xess'):
+            with self.subTest(upscaler=upscaler):
+                self.assertIn('Disable AA', effect_patches({'upscaler': upscaler}))
+                self.assertNotIn('Disable AA', effect_patches({'upscaler': upscaler, 'effect_game_aa': '1'}))
 
 
 class DebugPatchTests(unittest.TestCase):

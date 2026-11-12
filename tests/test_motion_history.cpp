@@ -83,6 +83,23 @@ int main() {
     gated.NextFrame();
     assert(!gated.Moving(weapon, 4));     // after a skipped frame: no comparison
     assert(!gated.Moving(weapon, 5));     // second occurrence of the same draw
+
+    History held(1024);
+    held.SetHold(2);
+    const auto step = [&](uint64_t palette) {
+        held.NextFrame();
+        return held.Moving(weapon, palette);
+    };
+    assert(!held.Moving(weapon, 1));
+    assert(step(2));
+    assert(step(2) && held.stats.held == 1);
+    assert(step(3));
+    assert(step(3) && step(3));
+    assert(!step(3) && held.stats.held == 3);
+    held.NextFrame();
+    held.NextFrame();
+    assert(!held.Moving(weapon, 4));
+
     assert(ClassifyBuffer(864) == BufferRole::Other && ClassifyBuffer(416) == BufferRole::Other);
     assert(ClassifyBuffer(96) == BufferRole::SmallSkeleton &&
            ClassifyBuffer(384) == BufferRole::SmallSkeleton);

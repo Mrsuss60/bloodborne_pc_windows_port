@@ -18,7 +18,9 @@ layout(push_constant) uniform Params {
 
 void main() {
     const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(pixel, imageSize(scene)))) {
+    // The mask is the scene's render size; the scene image can be larger (the game's aligned
+    // targets): bounded by the mask, or the dispatch's last groups wrote past its edge.
+    if (any(greaterThanEqual(pixel, min(imageSize(scene), imageSize(reactive))))) {
         return;
     }
     const vec3 before = max(imageLoad(opaque, pixel).rgb, vec3(0.0));

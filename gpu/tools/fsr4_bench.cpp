@@ -28,6 +28,15 @@
 
 namespace {
 
+#ifdef _WIN32
+inline int setenv(const char* name, const char* value, int overwrite) {
+    if (!overwrite && std::getenv(name)) {
+        return 0;
+    }
+    return _putenv_s(name, value);
+}
+#endif
+
 #define CHECK(call)                                                                            \
     do {                                                                                       \
         const VkResult r_ = (call);                                                            \

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Exercises the production target/resolve path on Vulkan (Lavapipe works, no game/window).
-#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -11,6 +10,10 @@
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include <vk_mem_alloc.h>
+
+// Include after Vulkan-Hpp headers so DispatchLoaderBase matches bbgpu's NDEBUG ABI.
+#undef NDEBUG
+#include <cassert>
 
 int main() {
     using namespace Vulkan;
@@ -196,6 +199,21 @@ int main() {
         assert(result == 0xff00ff00);
     }
     std::puts("Scene targets: half-resolution mip level proxy roundtrip PASS");
+    targets.Attachment(color_id, cv);
+    targets.Attachment(depth_id, dv);
+    const std::size_t before_release = targets.ProxyCount();
+    assert(before_release == 3);
+    targets.Forget(images[half_id].image_uid);
+    const auto again_id = images.insert(instance, runtime, views, ci);
+    targets.Attachment(again_id, cv);
+    assert(targets.ProxyCount() == before_release);
+    assert(!targets.Tracks(images[half_id].image_uid));
+    targets.Forget(images[again_id].image_uid);
+    targets.Forget(images[color_id].image_uid);
+    targets.Attachment(depth_id, dv);
+    assert(targets.ProxyCount() == before_release - 2);
+    scheduler.Finish();
+    std::puts("Scene targets: proxies of freed images released PASS");
     scheduler.Finish();
     vmaDestroyBuffer(instance.GetAllocator(),readback,allocation);
 }

@@ -1,420 +1,592 @@
-// SPDX-FileCopyrightText: Copyright 2026 IFreemz, bbport contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
-#include <mutex>
-#include <optional>
 #include <string>
-#include <string_view>
 #include <vector>
 
-#include "video_core/renderer_vulkan/vk_dlss.h"
-
 #ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
-#include <winver.h>
-#include "../../../dlss_bridge/bbport_dlss_bridge.h"
-#elif defined(__linux__)
+#else
 #include <dlfcn.h>
-#include "../../../dlss_bridge/bbport_dlss_bridge.h"
 #endif
+
+#include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "bbport_settings.h"
 
 namespace Vulkan {
 
-int Dlss::QualityForScale(float scale) {
-    // DLAA only for equal sizes: any real upscale needs at least the Quality mode.
-    return scale >= 2.9f ? 4 : scale >= 1.95f ? 3 : scale >= 1.65f ? 2 : scale > 1.01f ? 1 : 0;
-}
-
-#if defined(_WIN32) || defined(__linux__)
-
 namespace {
+
+// The NGX interface, as the driver's core exports it (NVIDIA DLSS SDK 310.x, NGX API 1.5).
+// Calls are cdecl, which is the platform calling convention on x86-64.
+using NgxResult = unsigned int;
+constexpr bool Failed(NgxResult r) {
+    return (r & 0xFFF00000u) == 0xBAD00000u;
+}
+constexpr unsigned kNgxApiVersion = 0x15;
+constexpr int kFeatureSuperSampling = 1;
+constexpr unsigned long long kApplicationId = 231313132; // NVIDIA's id for unregistered apps
+constexpr const char* kProjectId = "5c1f3a9e-7b42-4d86-9e31-0f6a2b7cd481";
+constexpr const char* kEngineVersion = "0.6.3";
+constexpr int kEngineCustom = 0;
+constexpr unsigned kPresetF = 6;
+
+enum DlssFlags : int {
+    FlagIsHdr = 1 << 0,
+    FlagMvLowRes = 1 << 1,
+    FlagAutoExposure = 1 << 6,
+};
+// NVSDK_NGX_PerfQuality_Value
+enum PerfQuality : int { MaxPerf = 0, Balanced = 1, MaxQuality = 2, UltraPerformance = 3, Dlaa = 5 };
+
+struct NgxParameter; ///< NVSDK_NGX_Parameter: a C++ interface implemented by the core
+struct NgxHandle;
+
+struct PathListInfo {
+    const wchar_t* const* path;
+    unsigned int length;
+};
+using LogCallback = void (*)(const char* message, int level, int feature);
+struct LoggingInfo {
+    LogCallback callback;
+    int minimum_level; ///< 0 off, 1 on, 2 verbose
+    bool disable_other_sinks;
+};
+struct FeatureCommonInfo {
+    PathListInfo path_list;
+    void* internal_data;
+    LoggingInfo logging;
+};
+
+struct ImageViewInfoVk {
+    VkImageView image_view;
+    VkImage image;
+    VkImageSubresourceRange subresource_range;
+    VkFormat format;
+    unsigned int width;
+    unsigned int height;
+};
+struct BufferInfoVk {
+    VkBuffer buffer;
+    unsigned int size_in_bytes;
+};
+struct ResourceVk {
+    union {
+        ImageViewInfoVk image_view_info;
+        BufferInfoVk buffer_info;
+    } resource;
+    int type; ///< 0 image view, 1 buffer
+    bool read_write;
+};
+
+using PFN_InitExt2 = NgxResult (*)(unsigned long long app_id, const wchar_t* data_path,
+                                   VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr,
+                                   PFN_vkGetDeviceProcAddr, unsigned version,
+                                   const FeatureCommonInfo*);
+using PFN_InitProject = NgxResult (*)(const char* project_id, int engine, const char* engine_version,
+                                      const wchar_t* data_path, VkInstance, VkPhysicalDevice, VkDevice,
+                                      PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, unsigned version,
+                                      const FeatureCommonInfo*);
+using PFN_GetParameters = NgxResult (*)(NgxParameter**);
+using PFN_DestroyParameters = NgxResult (*)(NgxParameter*);
+using PFN_CreateFeature1 = NgxResult (*)(VkDevice, VkCommandBuffer, int feature, NgxParameter*,
+                                         NgxHandle**);
+using PFN_EvaluateFeature = NgxResult (*)(VkCommandBuffer, const NgxHandle*, const NgxParameter*,
+                                          void* progress_callback);
+using PFN_ReleaseFeature = NgxResult (*)(NgxHandle*);
+using PFN_Shutdown1 = NgxResult (*)(VkDevice);
+
+// NVSDK_NGX_Parameter declares Set and Get overloads for unsigned long long, float, double,
+// unsigned int, int, two D3D resource pointers and void*, then Reset. Calls go through its
+// vtable: MSVC (the Windows core) lays an overload set out in reverse order of declaration,
+// the Itanium ABI (Linux core) in declaration order. This build may use either ABI itself, so
+// the slots are fixed here rather than taken from a C++ declaration.
 #ifdef _WIN32
-constexpr wchar_t BridgeName[] = L"bbport_dlss.dll";
-constexpr wchar_t NgxName[] = L"nvngx_dlss.dll";
-using Module = HMODULE;
-
-std::filesystem::path ExecutableDirectory() {
-    std::wstring path(MAX_PATH, L'\0');
-    const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
-    path.resize(length);
-    return std::filesystem::path{path}.parent_path();
-}
-
-bool HasNgx(const std::filesystem::path& directory) {
-    return std::filesystem::is_regular_file(directory / NgxName);
-}
-
-Module LoadModule(const std::filesystem::path& path) {
-    return LoadLibraryW(path.c_str());
-}
-
-void* FindSymbol(Module module, const char* name) {
-    return reinterpret_cast<void*>(GetProcAddress(module, name));
-}
-
-/// "a.b.c.d" from the DLL's version resource (version.dll is loaded on demand, so the port
-/// keeps no extra import), or empty when the file has none.
-std::string FileVersion(const std::filesystem::path& path) {
-    const HMODULE version = LoadLibraryW(L"version.dll");
-    if (!version) {
-        return {};
-    }
-    using SizeFn = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
-    using InfoFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
-    using QueryFn = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
-    const auto size_fn = reinterpret_cast<SizeFn>(GetProcAddress(version, "GetFileVersionInfoSizeW"));
-    const auto info_fn = reinterpret_cast<InfoFn>(GetProcAddress(version, "GetFileVersionInfoW"));
-    const auto query_fn = reinterpret_cast<QueryFn>(GetProcAddress(version, "VerQueryValueW"));
-    std::string text;
-    if (size_fn && info_fn && query_fn) {
-        DWORD handle{};
-        const DWORD size = size_fn(path.c_str(), &handle);
-        std::vector<BYTE> data(size);
-        if (size && info_fn(path.c_str(), 0, size, data.data())) {
-            LPVOID value{};
-            UINT length{};
-            if (query_fn(data.data(), L"\\", &value, &length) && value &&
-                length >= sizeof(VS_FIXEDFILEINFO)) {
-                const auto* info = static_cast<const VS_FIXEDFILEINFO*>(value);
-                if (info->dwSignature == 0xFEEF04BDu) {
-                    char buffer[64];
-                    std::snprintf(buffer, sizeof(buffer), "%u.%u.%u.%u",
-                                  unsigned(HIWORD(info->dwFileVersionMS)),
-                                  unsigned(LOWORD(info->dwFileVersionMS)),
-                                  unsigned(HIWORD(info->dwFileVersionLS)),
-                                  unsigned(LOWORD(info->dwFileVersionLS)));
-                    text = buffer;
-                }
-            }
-        }
-    }
-    FreeLibrary(version);
-    return text;
-}
+enum ParamSlot : int { SetVoid = 0, SetInt = 3, SetUint = 4, SetFloat = 6,
+                       GetVoid = 8, GetInt = 11, GetUint = 12, GetFloat = 14 };
 #else
-// bbport (Linux): libbbport_dlss.so (gpu/dlss_bridge) and NVIDIA's libnvidia-ngx-dlss.so.<version>
-// next to bb-probe; NGX finds the latter through the bridge's path list.
-constexpr char BridgeName[] = "libbbport_dlss.so";
-using Module = void*;
-
-std::filesystem::path ExecutableDirectory() {
-    std::error_code error;
-    return std::filesystem::read_symlink("/proc/self/exe", error).parent_path();
-}
-
-bool HasNgx(const std::filesystem::path& directory) {
-    std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
-        if (entry.path().filename().string().starts_with("libnvidia-ngx-dlss.so.")) {
-            return true;
-        }
-    }
-    return false;
-}
-
-Module LoadModule(const std::filesystem::path& path) {
-    Module module = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!module) {
-        std::printf("DLSS: %s\n", dlerror());
-    }
-    return module;
-}
-
-void* FindSymbol(Module module, const char* name) {
-    return dlsym(module, name);
-}
+enum ParamSlot : int { SetFloat = 1, SetUint = 3, SetInt = 4, SetVoid = 7,
+                       GetFloat = 9, GetUint = 11, GetInt = 12, GetVoid = 15 };
 #endif
 
-/// The player's DLSS folder (<user>/dlss, BB_GPU_USER_DIR; beside bb-probe without it): NGX's
-/// logs, and NVIDIA's library when the player placed one there.
-std::filesystem::path UserDlssDirectory() {
-    if (const char* user = std::getenv("BB_GPU_USER_DIR"); user && user[0]) {
-        std::error_code error;
-        const auto absolute = std::filesystem::absolute(std::filesystem::path{user} / "dlss", error);
-        return error ? std::filesystem::path{user} / "dlss" : absolute;
+template <typename Fn>
+Fn Slot(NgxParameter* p, int slot) {
+    return reinterpret_cast<Fn>((*reinterpret_cast<void***>(p))[slot]);
+}
+void SetI(NgxParameter* p, const char* name, int v) {
+    Slot<void (*)(NgxParameter*, const char*, int)>(p, SetInt)(p, name, v);
+}
+void SetUI(NgxParameter* p, const char* name, unsigned v) {
+    Slot<void (*)(NgxParameter*, const char*, unsigned)>(p, SetUint)(p, name, v);
+}
+void SetF(NgxParameter* p, const char* name, float v) {
+    Slot<void (*)(NgxParameter*, const char*, float)>(p, SetFloat)(p, name, v);
+}
+void SetP(NgxParameter* p, const char* name, void* v) {
+    Slot<void (*)(NgxParameter*, const char*, void*)>(p, SetVoid)(p, name, v);
+}
+/// bbport: NVSDK_NGX_DLSS_Hint_Render_Preset (0 the DLL's default, 1 A ... 11 K): dlss_preset in
+/// bbport.ini, BB_DLSS_PRESET overrides it ("k" when neither); live from the menu.
+unsigned DlssPreset(int quality);
+/// The same preset for every quality mode: the feature is created again when the mode changes.
+void SetPreset(NgxParameter* p, unsigned preset) {
+    for (const char* name : {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+                             "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+                             "DLSS.Hint.Render.Preset.UltraPerformance",
+                             "DLSS.Hint.Render.Preset.UltraQuality"}) {
+        SetUI(p, name, preset);
     }
-    return ExecutableDirectory() / "dlss";
+}
+NgxResult GetI(NgxParameter* p, const char* name, int* v) {
+    return Slot<NgxResult (*)(NgxParameter*, const char*, int*)>(p, GetInt)(p, name, v);
+}
+NgxResult GetUI(NgxParameter* p, const char* name, unsigned* v) {
+    return Slot<NgxResult (*)(NgxParameter*, const char*, unsigned*)>(p, GetUint)(p, name, v);
+}
+NgxResult GetF(NgxParameter* p, const char* name, float* v) {
+    return Slot<NgxResult (*)(NgxParameter*, const char*, float*)>(p, GetFloat)(p, name, v);
 }
 
-/// Where NVIDIA's DLSS library is: the player's own first, then beside bb-probe; empty: nowhere.
-std::filesystem::path NgxDirectory() {
-    for (const auto& directory : {UserDlssDirectory(), ExecutableDirectory()}) {
-        if (HasNgx(directory)) {
-            return directory;
-        }
-    }
-    return {};
+void Log(const char* message, int, int) {
+    std::printf("DLSS: NGX %s%s", message,
+                *message && message[std::strlen(message) - 1] == '\n' ? "" : "\n");
 }
 
-/// Where the bridge is: beside bb-probe (the package, a build with DLSS_SDK_ROOT), else the
-/// player's DLSS folder; empty: nowhere.
-std::filesystem::path BridgeDirectory() {
-    for (const auto& directory : {ExecutableDirectory(), UserDlssDirectory()}) {
-        std::error_code error;
-        if (std::filesystem::is_regular_file(directory / BridgeName, error)) {
-            return directory;
-        }
+bool IsFloatFormat(vk::Format f) {
+    switch (f) {
+    case vk::Format::eR16G16B16A16Sfloat:
+    case vk::Format::eR32G32B32A32Sfloat:
+    case vk::Format::eB10G11R11UfloatPack32:
+    case vk::Format::eR16G16B16Sfloat:
+        return true;
+    default:
+        return false;
     }
-    return {};
 }
 
-void BridgeLog(int warning, const char* message) {
-    std::printf("DLSS: %s%s\n", warning ? "warning: " : "", message);
+int Quality(int preset) {
+    switch (preset) {
+    case BbSettings::NativeAA:
+        return Dlaa;
+    case BbSettings::Quality:
+        return MaxQuality;
+    case BbSettings::Balanced:
+        return Balanced;
+    case BbSettings::Performance:
+        return MaxPerf;
+    default:
+        return UltraPerformance;
+    }
 }
 
-bool CollectExtensions(const VkExtensionProperties* required, u32 count,
-                       const std::vector<vk::ExtensionProperties>& available,
-                       std::vector<std::string>& storage, std::vector<const char*>& enabled) {
-    storage.clear();
-    for (u32 i = 0; i < count; ++i) {
-        const auto& request = required[i];
-        const auto match = std::ranges::find_if(available, [&](const auto& extension) {
-            return std::strcmp(extension.extensionName.data(), request.extensionName) == 0 &&
-                   extension.specVersion >= request.specVersion;
-        });
-        if (match == available.end()) {
-            std::printf("DLSS: missing Vulkan extension %s\n", request.extensionName);
-            return false;
-        }
-        storage.emplace_back(request.extensionName);
+/// The preset for a quality mode: dlss_preset, or with "auto" the model NVIDIA's DLSS 4.5 pairs
+/// with the mode (M for Performance, L for Ultra Performance, K for the others).
+unsigned DlssPreset(int quality) {
+    const int preset = BbSettings::Get().dlss_preset.load(std::memory_order_relaxed);
+    if (preset == BbSettings::DlssPresetAuto) {
+        return unsigned(quality == MaxPerf            ? BbSettings::DlssPresetM
+                        : quality == UltraPerformance ? BbSettings::DlssPresetL
+                                                      : BbSettings::DlssPresetK);
     }
-    for (const auto& name : storage) {
-        if (std::ranges::none_of(enabled, [&](const char* current) { return name == current; })) {
-            enabled.push_back(name.c_str());
-        }
-    }
-    return true;
+    return unsigned(std::clamp(preset, BbSettings::DlssPresetDefault, BbSettings::DlssPresetMax));
 }
+
+ResourceVk Resource(const Fsr4Upscaler::Image& image, vk::ImageAspectFlags aspect, bool rw) {
+    ResourceVk r{};
+    r.resource.image_view_info = {
+        .image_view = static_cast<VkImageView>(image.view),
+        .image = static_cast<VkImage>(image.image),
+        .subresource_range = {static_cast<VkImageAspectFlags>(aspect), 0, 1, 0, 1},
+        .format = static_cast<VkFormat>(image.format),
+        .width = image.width,
+        .height = image.height,
+    };
+    r.type = 0;
+    r.read_write = rw;
+    return r;
+}
+
 } // namespace
 
-struct Dlss::Impl {
-    Module module{};
-    const BbDlssApi* api{};
-    std::vector<std::string> instance_extensions, device_extensions;
-    std::optional<FeatureDesc> feature;
+struct DlssUpscaler::Impl {
+    const Instance& instance;
+    Scheduler& scheduler;
+    bool available = false;
+    bool fatal = false;
     std::string problem;
-    bool eligible{true}, instance_ready{}, device_ready{}, initialized{}, available{};
+    unsigned applied_preset = 0; ///< the render preset the feature was created with (0: default)
 
-    void Disable(std::string_view reason) {
-        eligible = available = false;
-        problem = reason;
-        std::printf("DLSS: unavailable (%.*s)\n", int(reason.size()), reason.data());
+#ifdef _WIN32
+    HMODULE core = nullptr;
+#else
+    void* core = nullptr;
+#endif
+    PFN_InitExt2 init = nullptr;
+    PFN_InitProject init_project = nullptr;
+    PFN_GetParameters get_capability_parameters = nullptr;
+    PFN_GetParameters allocate_parameters = nullptr;
+    PFN_DestroyParameters destroy_parameters = nullptr;
+    PFN_CreateFeature1 create_feature = nullptr;
+    PFN_EvaluateFeature evaluate_feature = nullptr;
+    PFN_ReleaseFeature release_feature = nullptr;
+    PFN_Shutdown1 shutdown = nullptr;
+
+    bool initialized = false;
+    NgxParameter* capabilities = nullptr;
+    NgxParameter* params = nullptr;
+    NgxHandle* feature = nullptr;
+    struct Key {
+        u32 render_width, render_height, out_width, out_height;
+        int quality;
+        bool hdr;
+        unsigned preset; ///< the one asked for (a refused one stays the key: not retried each frame)
+        bool auto_exposure; ///< bbport: dlss_auto_exposure (HDR inputs have it regardless)
+        bool operator==(const Key&) const = default;
+    } key{};
+
+    Impl(const Instance& instance_, Scheduler& scheduler_)
+        : instance{instance_}, scheduler{scheduler_} {}
+
+    void Fail(std::string why, bool permanent) {
+        if (problem != why) {
+            std::printf("DLSS: %s\n", why.c_str());
+        }
+        problem = std::move(why);
+        fatal = fatal || permanent;
+    }
+
+    template <typename Fn>
+    bool Load(Fn& fn, const char* name) {
+#ifdef _WIN32
+        fn = reinterpret_cast<Fn>(GetProcAddress(core, name));
+#else
+        fn = reinterpret_cast<Fn>(dlsym(core, name));
+#endif
+        return fn != nullptr;
+    }
+
+    bool LoadCore() {
+#ifdef _WIN32
+        // The driver records its NGX core under this key (nvsdk_ngx_loader.h does the same).
+        wchar_t dir[MAX_PATH];
+        DWORD size = sizeof(dir);
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+                         L"FullPath", RRF_RT_REG_SZ, nullptr, dir, &size) == ERROR_SUCCESS) {
+            core = LoadLibraryW((std::wstring(dir) + L"\\_nvngx.dll").c_str());
+        }
+        // bbport: some driver installs (laptops) leave that key out; the core is then in the
+        // display driver's DriverStore folder (nv*.inf_amd64_*), the newest one in use.
+        if (!core) {
+            wchar_t windows[MAX_PATH];
+            const UINT length = GetSystemDirectoryW(windows, MAX_PATH);
+            if (length > 0 && length < MAX_PATH) {
+                const std::wstring repo = std::wstring(windows) + L"\\DriverStore\\FileRepository\\";
+                WIN32_FIND_DATAW found;
+                std::wstring newest;
+                FILETIME newest_time{};
+                const HANDLE find = FindFirstFileW((repo + L"nv*").c_str(), &found);
+                if (find != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                        const std::wstring file = repo + found.cFileName + L"\\_nvngx.dll";
+                        WIN32_FILE_ATTRIBUTE_DATA info;
+                        if (GetFileAttributesExW(file.c_str(), GetFileExInfoStandard, &info) &&
+                            CompareFileTime(&info.ftLastWriteTime, &newest_time) > 0) {
+                            newest = file;
+                            newest_time = info.ftLastWriteTime;
+                        }
+                    } while (FindNextFileW(find, &found));
+                    FindClose(find);
+                }
+                if (!newest.empty()) core = LoadLibraryW(newest.c_str());
+            }
+        }
+#else
+        core = dlopen("libnvidia-ngx.so.1", RTLD_NOW);
+#endif
+        if (!core) {
+            Fail("NVIDIA NGX core not found (an NVIDIA driver with DLSS support is needed)", true);
+            return false;
+        }
+        Load(init_project, "NVSDK_NGX_VULKAN_Init_ProjectID_Ext");
+        if (!Load(init, "NVSDK_NGX_VULKAN_Init_Ext2") ||
+            !Load(get_capability_parameters, "NVSDK_NGX_VULKAN_GetCapabilityParameters") ||
+            !Load(allocate_parameters, "NVSDK_NGX_VULKAN_AllocateParameters") ||
+            !Load(destroy_parameters, "NVSDK_NGX_VULKAN_DestroyParameters") ||
+            !Load(create_feature, "NVSDK_NGX_VULKAN_CreateFeature1") ||
+            !Load(evaluate_feature, "NVSDK_NGX_VULKAN_EvaluateFeature") ||
+            !Load(release_feature, "NVSDK_NGX_VULKAN_ReleaseFeature") ||
+            !Load(shutdown, "NVSDK_NGX_VULKAN_Shutdown1")) {
+            Fail("the NVIDIA NGX core lacks the Vulkan entry points", true);
+            return false;
+        }
+        return true;
+    }
+
+    /// Directories searched for nvngx_dlss: BB_DLSS_DIR, then the executable's directory.
+    std::vector<std::wstring> SearchPaths() {
+        std::vector<std::wstring> paths;
+        if (const char* env = std::getenv("BB_DLSS_DIR"); env && *env) {
+            paths.push_back(std::filesystem::path(env).wstring());
+        }
+#ifdef _WIN32
+        wchar_t exe[MAX_PATH];
+        if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+            paths.push_back(std::filesystem::path(exe).parent_path().wstring());
+        }
+#else
+        std::error_code ec;
+        const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            paths.push_back(exe.parent_path().wstring());
+        }
+#endif
+        return paths;
+    }
+
+    /// Checks the parameter vtable slots: values set through it read back unchanged.
+    bool ParameterAbiOk(NgxParameter* p) {
+        SetI(p, "bbport.Probe.I", 0x5A5A);
+        SetUI(p, "bbport.Probe.UI", 77u);
+        SetF(p, "bbport.Probe.F", 1.25f);
+        int i = 0;
+        unsigned ui = 0;
+        float f = 0.0f;
+        return !Failed(GetI(p, "bbport.Probe.I", &i)) && i == 0x5A5A &&
+               !Failed(GetUI(p, "bbport.Probe.UI", &ui)) && ui == 77u &&
+               !Failed(GetF(p, "bbport.Probe.F", &f)) && f == 1.25f;
+    }
+
+    void Initialize() {
+        if (!instance.IsDlssCapable()) {
+            Fail("the Vulkan device lacks VK_NVX_binary_import / VK_NVX_image_view_handle "
+                 "(DLSS needs an NVIDIA RTX GPU)",
+                 true);
+            return;
+        }
+        if (!LoadCore()) {
+            return;
+        }
+        std::error_code ec;
+        const auto data_dir = std::filesystem::temp_directory_path(ec) / "bbport-ngx";
+        std::filesystem::create_directories(data_dir, ec);
+        const std::wstring data_path = data_dir.wstring();
+        const auto paths = SearchPaths();
+        std::vector<const wchar_t*> path_ptrs;
+        for (const auto& p : paths) {
+            path_ptrs.push_back(p.c_str());
+        }
+        const FeatureCommonInfo info{
+            .path_list = {path_ptrs.data(), static_cast<unsigned>(path_ptrs.size())},
+            .internal_data = nullptr,
+            .logging = {&Log, std::getenv("BB_DLSS_LOG") ? 2 : 0, false},
+        };
+        const auto& dispatcher = VULKAN_HPP_DEFAULT_DISPATCHER;
+        const char* use_project_id = std::getenv("BB_DLSS_PROJECT_ID");
+        NgxResult r = 0xBAD00000u;
+        if (init_project && use_project_id && use_project_id[0] == '1') {
+            r = init_project(kProjectId, kEngineCustom, kEngineVersion, data_path.c_str(),
+                             VkInstance(instance.GetInstance()), VkPhysicalDevice(instance.GetPhysicalDevice()),
+                             VkDevice(instance.GetDevice()), dispatcher.vkGetInstanceProcAddr,
+                             dispatcher.vkGetDeviceProcAddr, kNgxApiVersion, &info);
+            std::printf("DLSS: NGX project id init: %#x\n", r);
+        }
+        if (Failed(r)) {
+            r = init(kApplicationId, data_path.c_str(), VkInstance(instance.GetInstance()),
+                     VkPhysicalDevice(instance.GetPhysicalDevice()), VkDevice(instance.GetDevice()),
+                     dispatcher.vkGetInstanceProcAddr, dispatcher.vkGetDeviceProcAddr, kNgxApiVersion,
+                     &info);
+        }
+        if (Failed(r)) {
+            Fail(fmt_hex("NGX initialization failed", r), true);
+            return;
+        }
+        initialized = true;
+        if (Failed(get_capability_parameters(&capabilities)) || !capabilities) {
+            Fail("NGX capability query failed", true);
+            return;
+        }
+        if (!ParameterAbiOk(capabilities)) {
+            Fail("NGX parameter interface mismatch (unexpected vtable layout)", true);
+            return;
+        }
+        int dlss_available = 0, needs_driver = 0;
+        GetI(capabilities, "SuperSampling.NeedsUpdatedDriver", &needs_driver);
+        if (Failed(GetI(capabilities, "SuperSampling.Available", &dlss_available)) ||
+            !dlss_available) {
+            int init_result = 0;
+            GetI(capabilities, "SuperSampling.FeatureInitResult", &init_result);
+            Fail(needs_driver ? "DLSS needs a newer NVIDIA driver"
+                              : fmt_hex("DLSS unavailable (nvngx_dlss not found next to the "
+                                        "executable or in BB_DLSS_DIR; tools/fetch_dlss.sh)",
+                                        unsigned(init_result)),
+                 true);
+            return;
+        }
+        if (Failed(allocate_parameters(&params)) || !params) {
+            Fail("NGX parameter allocation failed", true);
+            return;
+        }
+        available = true;
+        std::printf("DLSS: Super Resolution available (NGX core loaded)\n");
+    }
+
+    static std::string fmt_hex(const char* what, unsigned value) {
+        char text[256];
+        std::snprintf(text, sizeof(text), "%s (0x%08x)", what, value);
+        return text;
+    }
+
+    bool Record(const Fsr4Upscaler::Frame& f) {
+        if (!available) {
+            return false;
+        }
+        // bbport: a scene at the output size (a native scene) is DLAA, whatever the preset.
+        const bool native = f.render_width == f.output.width && f.render_height == f.output.height;
+        const int quality = native ? int(Dlaa) : Quality(f.preset);
+        const Key wanted{f.render_width, f.render_height, f.output.width, f.output.height,
+                         quality, IsFloatFormat(f.color.format),
+                         DlssPreset(quality),
+                         BbSettings::Get().dlss_auto_exposure.load(std::memory_order_relaxed)};
+        if (!feature || !(wanted == key)) {
+            if (feature) {
+                // bbport: the earlier submissions may still use the feature's resources; the open
+                // command buffer (f.cmdbuf, recorded into below) does not yet. Finish() submitted
+                // f.cmdbuf, and the new feature was then created and evaluated into a pending
+                // command buffer: the driver faulted on the next preset change.
+                scheduler.WaitSubmittedWork();
+                release_feature(feature);
+                feature = nullptr;
+            }
+            SetUI(params, "CreationNodeMask", 1);
+            SetUI(params, "VisibilityNodeMask", 1);
+            SetUI(params, "Width", wanted.render_width);
+            SetUI(params, "Height", wanted.render_height);
+            SetUI(params, "OutWidth", wanted.out_width);
+            SetUI(params, "OutHeight", wanted.out_height);
+            SetI(params, "PerfQualityValue", wanted.quality);
+            // Motion vectors at render resolution, without jitter; standard depth.
+            int flags = FlagMvLowRes;
+            if (wanted.hdr) {
+                flags |= FlagIsHdr | FlagAutoExposure;
+            } else if (wanted.auto_exposure) {
+                flags |= FlagAutoExposure; // bbport: the menu's DLSS auto exposure, LDR input too
+            }
+            SetI(params, "DLSS.Feature.Create.Flags", flags);
+            SetI(params, "DLSS.Enable.Output.Subrects", 0);
+            // bbport: the model is chosen, not left to the DLL's default per mode: preset K (the
+            // transformer model) keeps thin moving objects - a weapon on the back, railings -
+            // steadier than the CNN presets. dlss_preset / BB_DLSS_PRESET: a letter (e: the last CNN
+            // model) or "default". A preset the DLL refuses is retried with its default.
+            const unsigned preset = wanted.preset;
+            SetPreset(params, preset);
+            NgxResult r = create_feature(VkDevice(instance.GetDevice()), VkCommandBuffer(f.cmdbuf),
+                                         kFeatureSuperSampling, params, &feature);
+            if ((Failed(r) || !feature) && preset != 0) {
+                std::printf("DLSS: preset %c refused (%#x); the DLL's default\n", char('A' + preset - 1), r);
+                feature = nullptr;
+                applied_preset = 0;
+                SetPreset(params, 0);
+                r = create_feature(VkDevice(instance.GetDevice()), VkCommandBuffer(f.cmdbuf),
+                                   kFeatureSuperSampling, params, &feature);
+            } else if (!Failed(r) && feature) {
+                applied_preset = preset;
+            }
+            if (Failed(r) || !feature) {
+                feature = nullptr;
+                Fail(fmt_hex("DLSS feature creation failed", r), false);
+                return false;
+            }
+            key = wanted;
+            BbSettings::Get().dlss_applied_preset = int(applied_preset);
+            std::printf("DLSS: %ux%u -> %ux%u, quality mode %d, %s input, preset %s",
+                        key.render_width, key.render_height, key.out_width, key.out_height,
+                        key.quality, key.hdr ? "HDR" : "LDR",
+                        applied_preset ? std::string(1, char('A' + applied_preset - 1)).c_str() : "default");
+            std::putchar(10);
+        }
+        ResourceVk color = Resource(f.color, vk::ImageAspectFlagBits::eColor, false);
+        ResourceVk depth = Resource(f.depth, vk::ImageAspectFlagBits::eDepth, false);
+        ResourceVk motion = Resource(f.motion, vk::ImageAspectFlagBits::eColor, false);
+        ResourceVk output = Resource(f.output, vk::ImageAspectFlagBits::eColor, true);
+        SetP(params, "Color", &color);
+        SetP(params, "Depth", &depth);
+        SetP(params, "MotionVectors", &motion);
+        SetP(params, "Output", &output);
+        // bbport: the reactive mask (menu) as DLSS's bias towards the current colour: 1 trusts this
+        // frame alone where blended effects changed it. Null clears the previous frame's.
+        ResourceVk bias{};
+        const bool bias_mask = f.reactive.view && applied_preset == kPresetF;
+        if (bias_mask) {
+            bias = Resource(f.reactive, vk::ImageAspectFlagBits::eColor, false);
+        }
+        SetP(params, "DLSS.Input.Bias.Current.Color.Mask", bias_mask ? &bias : nullptr);
+        SetUI(params, "DLSS.Input.Bias.Current.Color.Subrect.Base.X", 0);
+        SetUI(params, "DLSS.Input.Bias.Current.Color.Subrect.Base.Y", 0);
+        SetF(params, "Jitter.Offset.X", f.jitter[0]);
+        SetF(params, "Jitter.Offset.Y", f.jitter[1]);
+        SetF(params, "Sharpness", 0.0f);
+        SetI(params, "Reset", f.reset ? 1 : 0);
+        SetF(params, "MV.Scale.X", 1.0f);
+        SetF(params, "MV.Scale.Y", 1.0f);
+        SetUI(params, "DLSS.Render.Subrect.Dimensions.Width", f.render_width);
+        SetUI(params, "DLSS.Render.Subrect.Dimensions.Height", f.render_height);
+        SetF(params, "FrameTimeDeltaInMsec", f.frame_ms);
+        const NgxResult r = evaluate_feature(VkCommandBuffer(f.cmdbuf), feature, params, nullptr);
+        if (Failed(r)) {
+            Fail(fmt_hex("DLSS evaluation failed", r), false);
+            return false;
+        }
+        problem.clear();
+        return true;
+    }
+
+    ~Impl() {
+        if (!initialized) {
+            return;
+        }
+        scheduler.Finish();
+        if (feature) {
+            release_feature(feature);
+        }
+        if (params) {
+            destroy_parameters(params);
+        }
+        if (capabilities) {
+            destroy_parameters(capabilities);
+        }
+        shutdown(VkDevice(instance.GetDevice()));
     }
 };
 
-Dlss* Dlss::Get() {
-    static Dlss* const dlss = []() -> Dlss* {
-        const char* setting = std::getenv("BB_DLSS");
-        if (setting && setting[0] == '0') {
-            return nullptr;
-        }
-        if (BridgeDirectory().empty()) {
-            return nullptr;
-        }
-        auto* created = new Dlss;
-        // The process may end through quick_exit/_exit paths: release NGX first when it can.
-        std::atexit([] {
-            if (Dlss* live = Get()) {
-                live->Shutdown();
-            }
-        });
-        return created;
-    }();
-    return dlss;
+DlssUpscaler::DlssUpscaler(const Instance& instance, Scheduler& scheduler)
+    : impl{std::make_unique<Impl>(instance, scheduler)} {
+    impl->Initialize();
 }
 
-Dlss::Dlss() : impl{std::make_unique<Impl>()} {
-    impl->module = LoadModule(BridgeDirectory() / BridgeName);
-    const auto get_api =
-        impl->module ? reinterpret_cast<BbDlssGetApiFn>(FindSymbol(impl->module, "BbDlssGetApi"))
-                     : nullptr;
-    impl->api = get_api ? get_api() : nullptr;
-    if (!impl->api || impl->api->abi != BBPORT_DLSS_BRIDGE_ABI) {
-        impl->Disable("the DLSS bridge library is missing or from another version");
-        return;
-    }
-    const auto ngx = NgxDirectory();
-    if (ngx.empty()) {
-        impl->Disable("NVIDIA's DLSS library is missing (nvngx_dlss.dll next to the game or in dlss/)");
-        return;
-    }
-    // NGX writes its logs and model updates here: beside the saves and shader caches.
-    const auto data = UserDlssDirectory();
-    std::error_code error;
-    std::filesystem::create_directories(data, error);
-    const auto version = FileVersion(ngx / NgxName);
-    if (version.empty()) {
-        std::printf("DLSS: NVIDIA's library from %s\n", ngx.string().c_str());
-    } else {
-        std::printf("DLSS: NVIDIA's library from %s (version %s)\n", ngx.string().c_str(),
-                    version.c_str());
-    }
-    if (!impl->api->Configure(ngx.wstring().c_str(), data.wstring().c_str(), BridgeLog)) {
-        impl->Disable("bridge configuration failed");
-    }
-}
+DlssUpscaler::~DlssUpscaler() = default;
 
-Dlss::~Dlss() {
-    Shutdown();
-}
-
-void Dlss::AppendInstanceExtensions(std::vector<const char*>& enabled) {
-    if (!impl->eligible) {
-        return;
-    }
-    u32 count{};
-    const VkExtensionProperties* required{};
-    if (!impl->api->InstanceExtensions(&count, &required)) {
-        return impl->Disable("instance extension query failed");
-    }
-    const auto [result, extensions] = vk::enumerateInstanceExtensionProperties();
-    if (result != vk::Result::eSuccess ||
-        !CollectExtensions(required, count, extensions, impl->instance_extensions, enabled)) {
-        return impl->Disable("required Vulkan instance extensions are missing");
-    }
-    impl->instance_ready = true;
-}
-
-void Dlss::AppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
-                                  std::vector<const char*>& enabled) {
-    if (!impl->eligible || !impl->instance_ready) {
-        return;
-    }
-    const auto properties = physical.getProperties();
-    if (properties.vendorID != 0x10de) {
-        return impl->Disable("not an NVIDIA GPU");
-    }
-    u32 count{};
-    const VkExtensionProperties* required{};
-    if (!impl->api->DeviceExtensions(instance, physical, &count, &required)) {
-        return impl->Disable("this GPU or driver does not support DLSS (GeForce RTX needed)");
-    }
-    const auto [result, extensions] = physical.enumerateDeviceExtensionProperties();
-    if (result != vk::Result::eSuccess ||
-        !CollectExtensions(required, count, extensions, impl->device_extensions, enabled)) {
-        return impl->Disable("required Vulkan device extensions are missing");
-    }
-    impl->device_ready = true;
-}
-
-void Dlss::Disable(std::string_view reason) {
-    impl->Disable(reason);
-}
-
-void Dlss::Initialize(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device) {
-    if (!impl->eligible || !impl->device_ready || impl->initialized) {
-        return;
-    }
-    impl->initialized = true;
-    if (!impl->api->Initialize(instance, physical, device,
-                               VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
-                               VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr)) {
-        return impl->Disable("NVIDIA NGX initialization failed (update the GPU driver)");
-    }
-    impl->available = true;
-    std::printf("DLSS: ready\n");
-}
-
-bool Dlss::Available() const {
+bool DlssUpscaler::Available() const noexcept {
     return impl->available;
 }
 
-std::string Dlss::Problem() const {
-    return impl->problem;
+bool DlssUpscaler::Record(const Fsr4Upscaler::Frame& frame) {
+    return impl->Record(frame);
 }
 
-bool Dlss::HasFeature(const FeatureDesc& desc) const {
-    return impl->feature && *impl->feature == desc;
+const char* DlssUpscaler::Problem() const noexcept {
+    return impl->problem.empty() ? nullptr : impl->problem.c_str();
 }
 
-bool Dlss::CreateFeature(vk::CommandBuffer command, const FeatureDesc& desc) {
-    if (!impl->available) {
-        return false;
-    }
-    impl->feature.reset();
-    const BbDlssFeature feature{desc.input_width,  desc.input_height, desc.output_width,
-                                desc.output_height, desc.quality,      0,
-                                desc.preset,        desc.hdr ? 1 : 0};
-    if (!impl->api->CreateFeature(command, &feature)) {
-        return false;
-    }
-    impl->feature = desc;
-    return true;
+bool DlssUpscaler::Fatal() const noexcept {
+    return impl->fatal;
 }
-
-bool Dlss::Evaluate(vk::CommandBuffer command, const Frame& frame) {
-    if (!impl->available || !impl->feature) {
-        return false;
-    }
-    const auto image = [](const Resource& r) {
-        const vk::ImageSubresourceRange range{r.aspect, 0, 1, 0, 1};
-        return BbDlssImage{r.image,
-                           r.view,
-                           static_cast<VkImageSubresourceRange>(range),
-                           static_cast<VkFormat>(r.format),
-                           r.width,
-                           r.height};
-    };
-    const BbDlssEvaluate parameters{image(frame.color),  image(frame.depth), image(frame.motion),
-                                    image(frame.output), frame.jitter_x,     frame.jitter_y,
-                                    frame.reset ? 1 : 0, frame.frame_ms,     frame.sharpness};
-    return impl->api->Evaluate(command, &parameters) != 0;
-}
-
-void Dlss::ReleaseFeature() {
-    impl->feature.reset();
-    if (impl->api) {
-        impl->api->ReleaseFeature();
-    }
-}
-
-void Dlss::Shutdown() {
-    impl->available = false;
-    impl->feature.reset();
-    if (impl->api && impl->initialized) {
-        impl->api->Shutdown();
-        impl->initialized = false;
-    }
-}
-
-#else
-
-struct Dlss::Impl {};
-Dlss::Dlss() = default;
-Dlss::~Dlss() = default;
-Dlss* Dlss::Get() {
-    return nullptr;
-}
-void Dlss::AppendInstanceExtensions(std::vector<const char*>&) {}
-void Dlss::AppendDeviceExtensions(vk::Instance, vk::PhysicalDevice, std::vector<const char*>&) {}
-void Dlss::Initialize(vk::Instance, vk::PhysicalDevice, vk::Device) {}
-void Dlss::Disable(std::string_view) {}
-void Dlss::Shutdown() {}
-bool Dlss::Available() const {
-    return false;
-}
-std::string Dlss::Problem() const {
-    return {};
-}
-bool Dlss::HasFeature(const FeatureDesc&) const {
-    return false;
-}
-bool Dlss::CreateFeature(vk::CommandBuffer, const FeatureDesc&) {
-    return false;
-}
-bool Dlss::Evaluate(vk::CommandBuffer, const Frame&) {
-    return false;
-}
-void Dlss::ReleaseFeature() {}
-
-#endif
 
 } // namespace Vulkan

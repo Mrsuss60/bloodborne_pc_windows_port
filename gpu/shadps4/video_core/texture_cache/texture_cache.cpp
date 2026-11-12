@@ -23,6 +23,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -1748,6 +1749,9 @@ void TextureCache::DeleteImage(ImageId image_id) {
             }
         }
         Image& image = slot_images[image_id];
+        if (image.scene_proxy && runtime.scene_targets) {
+            runtime.scene_targets->Forget(image.image_uid);
+        }
         for (auto& backing : image.backing_images) {
             for (const ImageViewId image_view_id : backing.image_view_ids) {
                 slot_image_views.erase(image_view_id);

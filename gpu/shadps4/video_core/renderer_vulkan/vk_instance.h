@@ -304,6 +304,49 @@ public:
         return IsFsr4Int8Supported() && mixed_float_dot_product;
     }
 
+    /// bbport: FSR 4.1.1 through the fsr4vk provider DLL (Windows): standard Vulkan features only,
+    /// requested at device creation when the DLL is installed (Fsr4Vk::FilesPresent).
+    bool IsFsr4VkSupported() const {
+        return fsr4vk;
+    }
+
+    bool IsFsrSdkAvailable() const {
+        return fsr_sdk;
+    }
+
+    /// bbport: FSR 4.1.1 can run, by the replay (IsFsr411Supported) or through fsr4vk.
+    bool IsFsr411Available() const {
+        return IsFsr4Int8Supported() && (mixed_float_dot_product || fsr4vk);
+    }
+
+    /// bbport: robustBufferAccess is on (fsr4vk sizes its descriptors by it).
+    bool IsRobustBufferAccessEnabled() const {
+        return features.robustBufferAccess;
+    }
+
+    /// The Vulkan extensions required by NVIDIA NGX are enabled.
+    bool IsDlssCapable() const {
+        return dlss_extensions;
+    }
+
+    /// bbport: libxess.dll is loaded and the extensions and features Intel XeSS-SR needs are enabled.
+    bool IsXessCapable() const {
+        return xess;
+    }
+
+    /// bbport: FSR 4.1.1's FP8 matrix variant (RDNA4): FP8 cooperative matrices, the Vulkan
+    /// memory model, wave32 in full subgroups.
+    bool IsFsr411Fp8Supported() const {
+        return IsFsr411MatrixSupported() && shader_float8;
+    }
+
+    /// bbport: the same passes with FP16 matrices (the FP8 variant emulated, for testing).
+    bool IsFsr411MatrixSupported() const {
+        return IsFsr411Supported() && cooperative_matrix && vk12_features.vulkanMemoryModel &&
+               vk13_features.subgroupSizeControl && vk13_features.computeFullSubgroups &&
+               vk12_features.storageBuffer8BitAccess;
+    }
+
     /// VK_KHR_shader_clock is supported.
     bool IsShaderSubgroupClockSupported() const {
         return shader_clock && shader_clock_features.shaderSubgroupClock;
@@ -364,6 +407,11 @@ public:
         return properties.limits.minUniformBufferOffsetAlignment;
     }
 
+    /// bbport: uniform blocks may use std430 rules (a scalar array with a 4-byte stride).
+    bool IsUniformBufferStandardLayoutSupported() const {
+        return vk12_features.uniformBufferStandardLayout;
+    }
+
     /// Returns the minimum required alignment for storage buffers
     vk::DeviceSize StorageMinAlignment() const {
         return properties.limits.minStorageBufferOffsetAlignment;
@@ -377,6 +425,16 @@ public:
     /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
         return vk11_props.subgroupSize;
+    }
+
+    /// Returns the largest storage buffer descriptor range.
+    u32 MaxStorageBufferRange() const {
+        return properties.limits.maxStorageBufferRange;
+    }
+
+    /// Returns the largest dispatch width (workgroups in X).
+    u32 MaxComputeWorkGroupCountX() const {
+        return properties.limits.maxComputeWorkGroupCount[0];
     }
 
     /// Returns the maximum size of compute shared memory.
@@ -586,6 +644,12 @@ private:
     bool shader_clock{};
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
+    bool fsr_sdk{};
+    bool fsr4vk{};          // bbport: the device features of the fsr4vk provider are enabled
+    bool dlss_extensions{}; // bbport: VK_NVX_binary_import + VK_NVX_image_view_handle
+    bool xess{};            // bbport: what Intel XeSS-SR needs is enabled (vk_xess.h)
+    bool cooperative_matrix{}; // bbport: VK_KHR_cooperative_matrix (FSR 4.1.1 FP8 variant)
+    bool shader_float8{};      // bbport: VK_EXT_shader_float8 with FP8 matrices (RDNA4)
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

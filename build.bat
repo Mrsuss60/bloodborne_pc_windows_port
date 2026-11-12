@@ -238,7 +238,7 @@ if exist "out\content-test.exe" (
     if errorlevel 1 exit /b 1
 )
 
-cmake --build out/gpu --target shader-user-data-test motion-history-test motion-shader-test ui-composition-test upscaler-support-test -- -j %BB_BUILD_JOBS%
+cmake --build out/gpu --target shader-user-data-test motion-history-test motion-shader-test ui-composition-test scene-proxy-release-test upscaler-support-test -- -j %BB_BUILD_JOBS%
 if errorlevel 1 exit /b 1
 
 out\gpu\shader-user-data-test.exe
@@ -246,6 +246,8 @@ if errorlevel 1 exit /b 1
 out\gpu\motion-history-test.exe
 if errorlevel 1 exit /b 1
 out\gpu\ui-composition-test.exe
+if errorlevel 1 exit /b 1
+out\gpu\scene-proxy-release-test.exe
 if errorlevel 1 exit /b 1
 out\gpu\upscaler-support-test.exe
 if errorlevel 1 exit /b 1

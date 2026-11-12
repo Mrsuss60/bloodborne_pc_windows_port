@@ -12,6 +12,7 @@
 #include "bbport_toggles.h"
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace Vulkan {
 SceneTargets::SceneTargets(const Instance& i, Scheduler& s, Runtime& r,
@@ -84,8 +85,9 @@ bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
 // Half resolution needs a scene size that halves exactly: the proxy keeps the scene's factor,
 // so the shaders' FragCoord conversion (1920 / scene width) stays correct for it.
 static u32 SizeDivisor(const VideoCore::ImageInfo& i, SceneResolution::Size scene) {
-    if (i.size.width == 1920 && i.size.height == 1080) return 1;
-    if (i.size.width == 960 && i.size.height == 540 && scene.width % 2 == 0 &&
+    const auto native = SceneResolution::Native();
+    if (i.size.width == native.width && i.size.height == native.height) return 1;
+    if (i.size.width == native.width / 2 && i.size.height == native.height / 2 && scene.width % 2 == 0 &&
         scene.height % 2 == 0 && !BbToggle::Disabled(BbToggle::SceneHalfRes)) {
         return 2;
     }
@@ -106,7 +108,8 @@ bool SceneTargets::Eligible(const VideoCore::Image& image) const {
     return Blittable(image.backing->image.image_ci.format) || ShaderResampled(image);
 }
 bool SceneTargets::EligibleScene(const VideoCore::Image& image) const {
-    return image.info.size.width == 1920 && image.info.size.height == 1080 && Eligible(image);
+    const auto native = SceneResolution::Native();
+    return image.info.size.width == native.width && image.info.size.height == native.height && Eligible(image);
 }
 SceneResolution::Size SceneTargets::ProxySize(const VideoCore::Image& image, u32 level) const {
     const u32 div = std::max(1u, SizeDivisor(image.info, size));
@@ -121,8 +124,9 @@ bool SceneTargets::SetSize(SceneResolution::Size next) {
     ++generation;
     recent = {};
     size = next;
-    std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI 1920x1080 "
-                "(live)\n", size.width, size.height, size.width / 2, size.height / 2);
+    std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, game targets %ux%u "
+                "(live)\n", size.width, size.height, size.width / 2, size.height / 2,
+                SceneResolution::Native().width, SceneResolution::Native().height);
     return true;
 }
 void SceneTargets::ResolveAll() {
@@ -131,6 +135,15 @@ void SceneTargets::ResolveAll() {
             if (auto* image = lookup(entry->source, entry->uid)) Copy(*entry, *image, true);
         }
     }
+}
+bool SceneTargets::NativeStale(const VideoCore::Image& image) const {
+    if (!image.scene_proxy) return false;
+    const u32 levels = std::min(16u, image.info.resources.levels);
+    for (u32 level = 0; level < levels; ++level) {
+        const auto it = entries.find(Key(image.image_uid, level));
+        if (it != entries.end() && it->second->state.dirty) return true;
+    }
+    return false;
 }
 void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access) {
     if (copying || !image.scene_proxy) return; // most images never had a proxy
@@ -212,6 +225,19 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
                               s32(std::max(1u, original.info.size.height >> e.level)), 1};
     const vk::Offset3D reduced{s32(e.image.image_ci.extent.width),
                                s32(e.image.image_ci.extent.height), 1};
+    // bbport: a resolve of color is a bilinear upscale where the format filters linearly (never
+    // integer formats): native-size passes after the upscaler read these images (effects,
+    // post-processing), and nearest made them blocky. Fills to the proxy and depth/stencil stay
+    // nearest. BB_SCENE_LINEAR_RESOLVE=0 (or experiment bit 1): nearest throughout, as before.
+    static const bool linear_resolve = [] {
+        const char* env = std::getenv("BB_SCENE_LINEAR_RESOLVE");
+        return !(env && env[0] == '0');
+    }();
+    const bool linear =
+        linear_resolve && !BbToggle::Experiment(2) && to_native &&
+        original.aspect_mask == vk::ImageAspectFlags{vk::ImageAspectFlagBits::eColor} &&
+        bool(Features(original.backing->image.image_ci.format) &
+             vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
     for (auto aspect : {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
                         vk::ImageAspectFlagBits::eStencil}) {
         if (!(original.aspect_mask & aspect)) continue;
@@ -223,9 +249,10 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
         };
         // Nearest preserves depth/stencil and avoids assuming linear blit support for
         // integer G-buffer formats. FSR reconstructs color at the HDR scene boundary.
-        scheduler.Record([src,dst,region](vk::CommandBuffer cmd) {
+        const vk::Filter filter = linear ? vk::Filter::eLinear : vk::Filter::eNearest;
+        scheduler.Record([src,dst,region,filter](vk::CommandBuffer cmd) {
             cmd.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
-                          vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
+                          vk::ImageLayout::eTransferDstOptimal, region, filter);
         });
     }
     if (to_native) e.state.Resolved(); else e.state.CopiedToProxy();
@@ -399,7 +426,42 @@ vk::Pipeline SceneTargets::ResamplePipeline(vk::Format format, bool stencil) {
     resample_pipelines.emplace_back(key, std::move(pipeline));
     return result;
 }
+void SceneTargets::DropForgotten() {
+    const auto uids = releases.Take();
+    if (uids.empty()) {
+        return;
+    }
+    std::vector<std::unique_ptr<Entry>> doomed;
+    for (const u64 uid : uids) {
+        if (!tracked.erase(uid)) {
+            continue;
+        }
+        TakeProxies(entries, uid, 16, Key, doomed);
+    }
+    if (doomed.empty()) {
+        return;
+    }
+    for (auto& slot : recent) {
+        for (const auto& entry : doomed) {
+            if (slot.second == entry.get()) {
+                slot = {};
+            }
+        }
+    }
+    for (const auto& entry : doomed) {
+        released_bytes += entry->image.size_bytes;
+    }
+    released_proxies += doomed.size();
+    scheduler.DeferOperation([doomed = std::move(doomed)]() mutable { doomed.clear(); });
+    if (released_proxies - release_report_proxies >= 256) {
+        release_report_proxies = released_proxies;
+        std::printf("Scene resolution: %llu proxies of freed images released (%llu MiB), %zu live\n",
+                    static_cast<unsigned long long>(released_proxies),
+                    static_cast<unsigned long long>(released_bytes >> 20), entries.size());
+    }
+}
 SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
+    DropForgotten();
     auto& original = *lookup(id, 0);
     const u64 key = Key(original.image_uid, level);
     // A draw has up to six targets, mostly the same as the previous draw's.

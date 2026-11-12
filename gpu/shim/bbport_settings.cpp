@@ -2,6 +2,8 @@
 #include "bbport_settings.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -150,7 +152,19 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "preset") {
         v.preset = std::clamp(i, 0, PresetCount - 1);
     } else if (key == "dlss_preset") {
-        v.dlss_preset = i == DlssModelJ || i == DlssModelK ? i : DlssModelDefault;
+        v.dlss_preset = DlssPresetFromText(value.c_str());
+    } else if (key == "dlss_mip_bias") {
+        v.dlss_mip_bias = i != 0;
+    } else if (key == "dlss_auto_exposure") {
+        v.dlss_auto_exposure = i != 0;
+    } else if (key == "dlss_jitter_fade") {
+        v.dlss_jitter_fade = i != 0;
+    } else if (key == "upscale_before_post") {
+        v.upscale_before_post = i != 0;
+    } else if (key == "render_scale") {
+        v.render_scale = Clamp(std::isfinite(f) && f > 0.0f ? f : 1.3f, RenderScaleMin, RenderScaleMax);
+    } else if (key == "mip_bias") {
+        v.mip_bias = Clamp(std::isfinite(f) ? f : 0.0f, MipBiasMin, MipBiasMax);
     } else if (key == "sharpen") {
         v.sharpen = i != 0;
     } else if (key == "sharpness") {
@@ -167,6 +181,16 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.reactive_threshold = Clamp(f, 0.0f, 1.0f);
     } else if (key == "reactive_max") {
         v.reactive_max = Clamp(f, 0.0f, 1.0f);
+    } else if (key == "fsr3_velocity_factor") {
+        v.fsr3_velocity_factor = Clamp(f, 0.0f, 1.0f);
+    } else if (key == "fsr3_reactiveness_scale") {
+        v.fsr3_reactiveness_scale = Clamp(f, 0.0f, 4.0f);
+    } else if (key == "fsr3_shading_change_scale") {
+        v.fsr3_shading_change_scale = Clamp(f, 0.0f, 4.0f);
+    } else if (key == "fsr3_accumulation") {
+        v.fsr3_accumulation = Clamp(f, 0.0f, 1.0f);
+    } else if (key == "fsr3_min_disocclusion") {
+        v.fsr3_min_disocclusion = Clamp(f, -1.0f, 1.0f);
     } else if (key == "debug_view") {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
@@ -270,7 +294,7 @@ void Load() {
             std::string text{line};
             text.erase(text.find_last_not_of(" \t\r\n") + 1);
             const auto eq = text.find('=');
-            if (text.empty() || text[0] == '#' || eq == std::string::npos) {
+            if (text.empty() || text[0] == '#' || text[0] == '[' || eq == std::string::npos) {
                 continue;
             }
             Set(v, text.substr(0, eq), text.substr(eq + 1));
@@ -286,8 +310,7 @@ void Load() {
         v.upscaler = UpscalerOff;
         for (int u = 0; u < UpscalerCount; ++u) {
             if (std::strcmp(env, UpscalerName(u)) == 0 ||
-                (u == UpscalerFsr3 && (std::strcmp(env, "fsr31") == 0 || std::strcmp(env, "fsr3") == 0)) ||
-                (u == UpscalerFsr4 && std::strcmp(env, "fsr4") == 0)) {
+                (u == UpscalerFsr3 && (std::strcmp(env, "fsr31") == 0 || std::strcmp(env, "fsr3") == 0))) {
                 v.upscaler = u;
             }
         }
@@ -296,16 +319,16 @@ void Load() {
         {"BB_FSR_SHARPNESS", "sharpness"},        {"BB_JITTER", "jitter"},
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
-        {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
-        {"BB_DLSS_PRESET", "dlss_preset"},
-        {"BB_HUD", "show_hud"},                     {"BB_HUD_QUADRANT", "hud_quadrant"},
-        {"BB_HUD_OPACITY", "hud_opacity"},          {"BB_HUD_SCALE", "hud_scale"},
-        {"BB_PREP_WORKERS", "prep_workers"},
-        {"BB_ASYNC_PIPELINES", "async_pipelines"},
-        {"BB_TEXTURE_QUALITY", "texture_quality"},
-        {"BB_SAVE_AUTO_BACKUP", "save_auto_backup"},
-        {"BB_FPS", "target_fps"},                   {"BB_LIVE_FPS", "live_fps"},
-        {"BB_TARGET_FPS", "target_fps"},            {"BB_MAX_DT_HZ", "max_dt_hz"},
+        {"BB_UPSCALE_PRESET", "preset"},          {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_DLSS_PRESET", "dlss_preset"},        {"BB_DLSS_MIP_BIAS", "dlss_mip_bias"},
+        {"BB_DLSS_JITTER_FADE", "dlss_jitter_fade"},
+        {"BB_RENDER_SCALE", "render_scale"},      {"BB_MIP_BIAS", "mip_bias"},
+        {"BB_HUD", "show_hud"},                   {"BB_HUD_QUADRANT", "hud_quadrant"},
+        {"BB_HUD_OPACITY", "hud_opacity"},        {"BB_HUD_SCALE", "hud_scale"},
+        {"BB_PREP_WORKERS", "prep_workers"},      {"BB_ASYNC_PIPELINES", "async_pipelines"},
+        {"BB_TEXTURE_QUALITY", "texture_quality"}, {"BB_SAVE_AUTO_BACKUP", "save_auto_backup"},
+        {"BB_FPS", "target_fps"},                 {"BB_LIVE_FPS", "live_fps"},
+        {"BB_TARGET_FPS", "target_fps"},          {"BB_MAX_DT_HZ", "max_dt_hz"},
         {"BB_LANG", "language"},
     };
     for (const auto& [env, key] : env_keys) {
@@ -314,6 +337,7 @@ void Load() {
         }
     }
     v.startup_preset = v.preset;
+    v.startup_render_scale = v.render_scale;
     v.startup_upscaler = v.upscaler;
     v.startup_object_motion = v.object_motion;
     for (int e = 0; e < EffectCount; ++e) {
@@ -335,7 +359,7 @@ void Reload() {
             std::string text{line};
             text.erase(text.find_last_not_of(" \t\r\n") + 1);
             const auto eq = text.find('=');
-            if (text.empty() || text[0] == '#' || eq == std::string::npos) {
+            if (text.empty() || text[0] == '#' || text[0] == '[' || eq == std::string::npos) {
                 continue;
             }
             Set(v, text.substr(0, eq), text.substr(eq + 1));
@@ -344,13 +368,38 @@ void Reload() {
     }
 }
 
-void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
+void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool dlss, bool fsr_sdk, bool fsr4_to_sdk,
+                              bool xess) {
     auto& v = Get();
-    v.fsr4_supported = fsr4;
+    v.fsr4_supported = fsr4 && !(fsr4_to_sdk && fsr_sdk);
     v.fsr411_supported = fsr4 && fsr411;
+    v.dlss_supported = dlss;
+    v.fsr_sdk_supported = fsr_sdk;
+    v.xess_supported = xess;
     const int requested = v.upscaler;
-    if ((requested == UpscalerFsr4 && !v.fsr4_supported) ||
-        (requested == UpscalerFsr411 && !v.fsr411_supported)) {
+    if (requested == UpscalerFsr4 && fsr4_to_sdk && fsr_sdk) {
+        std::printf("Upscaler: fsr4 runs through AMD's FSR SDK on this GPU: the built-in FSR 4 model is "
+                    "far slower on Radeon (BB_FSR4_BUILTIN_AMD=1 keeps it)\n");
+        v.upscaler = UpscalerFsr;
+    } else if (requested == UpscalerFsr && !fsr_sdk) {
+        v.fsr4_problem = "FSR needs the AMD FSR SDK files (engine/fsr_sdk); using FSR 3.1";
+        std::printf("Upscaler: fsr unavailable (AMD FSR SDK files missing or GPU unsupported); falling back to FSR 3.1 before the first frame\n");
+        v.upscaler = UpscalerFsr3;
+    } else if (requested == UpscalerDlss && !dlss) {
+        v.fsr4_problem = "DLSS needs an NVIDIA RTX GPU, its driver's NGX and nvngx_dlss; using FSR 3.1";
+        v.dlss_problem = "DLSS needs an NVIDIA RTX GPU, its driver's NGX and nvngx_dlss";
+        std::printf("Upscaler: dlss unavailable; falling back to FSR 3.1 before the first frame\n");
+        v.upscaler = UpscalerFsr3;
+    } else if (requested == UpscalerXess && !xess) {
+        v.fsr4_problem = "XeSS needs Windows, Intel's libxess.dll (engine/xess) and a GPU it supports; using FSR 3.1";
+        std::printf("Upscaler: xess unavailable; falling back to FSR 3.1 before the first frame\n");
+        v.upscaler = UpscalerFsr3;
+    } else if (requested == UpscalerFsr411 && !v.fsr411_supported && v.fsr4_supported) {
+        v.fsr4_problem = "FSR 4.1.1 needs its fsr4_411 files and a GPU that runs its shaders; using FSR 4";
+        std::printf("Upscaler: fsr411 unavailable (GPU or fsr4_411 files); falling back to FSR 4 before the first frame\n");
+        v.upscaler = UpscalerFsr4;
+    } else if ((requested == UpscalerFsr4 && !v.fsr4_supported) ||
+               (requested == UpscalerFsr411 && !v.fsr411_supported)) {
         v.fsr4_problem = "GPU does not support the selected FSR 4 shaders; using FSR 3.1";
         std::printf("Upscaler: %s unsupported on this GPU; falling back to FSR 3.1 before the first frame\n",
                     UpscalerName(requested));
@@ -365,6 +414,7 @@ void ConfigureDlssSupport(bool available, const char* problem) {
     kept = problem ? problem : "";
     v.dlss_problem = available || kept.empty() ? nullptr : kept.c_str();
     if (v.upscaler == UpscalerDlss && !available) {
+        v.fsr4_problem = "DLSS needs an NVIDIA RTX GPU, its driver's NGX and nvngx_dlss; using FSR 3.1";
         std::printf("Upscaler: DLSS unavailable (%s); falling back to FSR 3.1\n",
                     kept.empty() ? "the DLSS bridge or NVIDIA's DLSS library is missing"
                                  : kept.c_str());
@@ -379,8 +429,9 @@ bool FixedRenderSession() {
 
 int RenderPreset() {
     const auto& v = Get();
-    return FixedRenderSession() ? v.startup_preset :
-        v.upscaler == UpscalerTaa ? NativeAA : v.preset.load();
+    return FixedRenderSession() ? v.startup_preset
+         : v.upscaler == UpscalerTaa ? NativeAA
+                                     : v.preset.load();
 }
 
 bool ResolutionNeedsRestart() {
@@ -388,6 +439,7 @@ bool ResolutionNeedsRestart() {
     // TAA needs the live path (native guest targets): run.sh selects it on restart.
     return FixedRenderSession() &&
         (v.preset != v.startup_preset || v.output_res != v.startup_output_res ||
+         (v.preset == PresetCustom && v.render_scale != v.startup_render_scale) ||
          (v.upscaler == UpscalerOff) != (v.startup_upscaler == UpscalerOff) ||
          (v.upscaler == UpscalerTaa) != (v.startup_upscaler == UpscalerTaa));
 }
@@ -416,28 +468,38 @@ void Save() {
         std::printf("Settings: cannot write %s\n", Path());
         return;
     }
+    const int out_idx = std::clamp(v.output_res.load(), 0, OutputCount - 1);
     std::fprintf(file,
                  "# bbport settings (in-game menu: Insert / L3+R3)\n"
-                 "# upscaler: off | fsr31 | fsr4 | fsr411 | taa | dlss"
-                 " (dlss needs bbport_dlss.dll and nvngx_dlss.dll, else FSR 3.1)\n"
-                 "# dlss_preset: 0 = driver default, 10 = J (less ghosting), 11 = K (transformer)\n"
-                 "upscaler=%s\npreset=%d\ndlss_preset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
+                 "# upscaler: off | fsr31 | fsr4 | fsr411 | taa | dlss | fsr | xess\n"
+                 "upscaler=%s\npreset=%d\ndlss_preset=%s\ndlss_mip_bias=%d\n"
+                 "dlss_auto_exposure=%d\ndlss_jitter_fade=%d\nupscale_before_post=%d\n"
+                 "render_scale=%.2f\nmip_bias=%.2f\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
+                 "fsr3_velocity_factor=%.3f\nfsr3_reactiveness_scale=%.3f\n"
+                 "fsr3_shading_change_scale=%.3f\nfsr3_accumulation=%.3f\nfsr3_min_disocclusion=%.3f\n"
                  "debug_view=%d\nshow_fps=%d\nshow_hud=%d\nhud_quadrant=%d\nhud_opacity=%.2f\nhud_scale=%.2f\n"
                  "fsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n"
-                 "mk_enabled=%d\nmk_sens_x=%.2f\nmk_sens_y=%.2f\nmk_invert_x=%d\nmk_invert_y=%d\nmk_smoothing=%.2f\nmk_responsiveness=%.2f\nmk_acceleration=%.2f\n"
+                 "mk_enabled=%d\nmk_native_mouse=%d\nmk_sens_x=%.2f\nmk_sens_y=%.2f\n"
+                 "mk_invert_x=%d\nmk_invert_y=%d\nmk_smoothing=%.2f\nmk_responsiveness=%.2f\nmk_acceleration=%.2f\n"
                  "mouse_menu=%d\n"
                  "live_fps=%d\ntarget_fps=%d\nmax_dt_hz=%d\n",
-                 UpscalerName(v.upscaler), v.preset.load(), v.dlss_preset.load(),
-                 int(v.sharpen.load()),
+                 UpscalerName(v.upscaler), v.preset.load(), DlssPresetText(v.dlss_preset),
+                 int(v.dlss_mip_bias.load()), int(v.dlss_auto_exposure.load()),
+                 int(v.dlss_jitter_fade.load()), int(v.upscale_before_post.load()),
+                 v.render_scale.load(), v.mip_bias.load(), int(v.sharpen.load()),
                  v.sharpness.load(), int(v.jitter.load()), int(v.reactive.load()),
                  int(v.object_motion.load()),
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
+                 v.fsr3_velocity_factor.load(), v.fsr3_reactiveness_scale.load(),
+                 v.fsr3_shading_change_scale.load(), v.fsr3_accumulation.load(),
+                 v.fsr3_min_disocclusion.load(),
                  v.debug_view.load(), int(v.show_fps.load()),
                  int(v.show_hud.load()), v.hud_quadrant.load(),
                  v.hud_opacity.load(), v.hud_scale.load(),
                  int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()),
-                 int(v.mk_enabled.load()), v.mk_sens_x.load(), v.mk_sens_y.load(),
+                 int(v.mk_enabled.load()), int(v.mk_native_mouse.load()),
+                 v.mk_sens_x.load(), v.mk_sens_y.load(),
                  int(v.mk_invert_x.load()), int(v.mk_invert_y.load()),
                  v.mk_smoothing.load(), v.mk_responsiveness.load(), v.mk_acceleration.load(),
                  int(v.mouse_menu.load()), int(v.live_fps.load()), v.target_fps.load(),
@@ -447,7 +509,7 @@ void Save() {
         std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));
     }
     std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(),
-                 OutputWidths[v.output_res], OutputHeights[v.output_res]);
+                 OutputWidths[out_idx], OutputHeights[out_idx]);
     if (v.prep_workers < 0) {
         std::fprintf(file, "prep_workers=auto\n");
     } else {
@@ -478,19 +540,81 @@ void Save() {
 }
 
 float PresetScale(int preset) {
-    static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f};
-    return scales[std::clamp(preset, 0, PresetCount - 1)];
+    static constexpr float scales[PresetCustom] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f};
+    if (preset == PresetCustom) {
+        const auto& v = Get();
+        const float scale = FixedRenderSession() ? v.startup_render_scale : v.render_scale.load();
+        return std::clamp(std::isfinite(scale) ? scale : 1.0f, RenderScaleMin, RenderScaleMax);
+    }
+    return scales[std::clamp(preset, 0, PresetCustom - 1)];
 }
 
 const char* PresetName(int preset) {
-    static constexpr const char* names[PresetCount] = {"Native AA", "Quality", "Balanced",
-                                                       "Performance", "Ultra Performance"};
+    static constexpr const char* names[PresetCount] = {
+        "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance", "Custom"};
     return names[std::clamp(preset, 0, PresetCount - 1)];
 }
 
+int ModelPreset(int preset) {
+    if (preset != PresetCustom) {
+        return std::clamp(preset, 0, PresetCustom - 1);
+    }
+    const float scale = PresetScale(preset);
+    int nearest = NativeAA;
+    for (int p = NativeAA; p < PresetCustom; ++p) {
+        if (std::abs(PresetScale(p) - scale) < std::abs(PresetScale(nearest) - scale)) {
+            nearest = p;
+        }
+    }
+    return nearest;
+}
+
+bool DlssPresetValid(int preset) {
+    return preset == DlssPresetDefault || preset == 5 || preset == 6 ||
+           (preset >= 10 && preset <= 13);
+}
+
+int DlssPresetFromText(const char* text) {
+    if (!text || !text[0] || std::strcmp(text, "default") == 0 || std::strcmp(text, "0") == 0) {
+        return DlssPresetDefault;
+    }
+    if (std::strcmp(text, "auto") == 0 || std::strcmp(text, "-1") == 0) {
+        return DlssPresetAuto;
+    }
+    const char letter = char(std::tolower(static_cast<unsigned char>(text[0])));
+    if (letter >= 'a' && letter <= 'z' && text[1] == '\0') {
+        if (!DlssPresetValid(letter - 'a' + 1)) {
+            std::printf("Settings: DLSS preset '%s' is not in NVIDIA's DLSS 310.9 (E, F, J, K, L, M); k\n",
+                        text);
+            return DlssPresetK;
+        }
+        return letter - 'a' + 1;
+    }
+    char* end = nullptr;
+    const long numeric = std::strtol(text, &end, 10);
+    if (end && *end == '\0') {
+        const int val = int(numeric);
+        if (DlssPresetValid(val)) {
+            return val;
+        }
+    }
+    std::printf("Settings: unknown dlss_preset '%s' (expected default, auto or a letter); k\n", text);
+    return DlssPresetK;
+}
+
+const char* DlssPresetText(int preset) {
+    static constexpr const char* letters[DlssPresetMax] = {
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+        "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"};
+    if (preset == DlssPresetAuto) {
+        return "auto";
+    }
+    return preset >= 1 && preset <= DlssPresetMax ? letters[preset - 1] : "default";
+}
+
 const char* UpscalerName(int upscaler) {
-    static constexpr const char* names[UpscalerCount] = {"off", "fsr31", "fsr4", "fsr411", "taa",
-                                                         "dlss"};
+    static constexpr const char* names[UpscalerCount] = {
+        "off", "fsr31", "fsr4", "fsr411", "taa", "dlss", "fsr", "xess"};
     return names[std::clamp(upscaler, 0, UpscalerCount - 1)];
 }
 

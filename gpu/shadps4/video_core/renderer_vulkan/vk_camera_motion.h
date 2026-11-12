@@ -50,6 +50,14 @@ public:
     [[nodiscard]] bool Ready() const noexcept {
         return current.valid && previous.valid && depth_id;
     }
+    /// bbport: the last frame drew more than one G-buffer pass: a menu's 3D preview (character
+    /// creation's ChrMake_BG renders two to four), not the world alone. Not a planar reflection:
+    /// water and puddles (the sewers, Gascoigne's arena) draw the world once more from the camera
+    /// mirrored in the water's plane, the same x and z at another height; those frames are the
+    /// world and stay upscaled (they read as previews and the upscaler went off by where one looked).
+    [[nodiscard]] bool PreviewFrame() const noexcept {
+        return last_frame_gbuffer_passes > 1 && !last_frame_reflection;
+    }
     [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
         return depth_id;
     }
@@ -63,17 +71,34 @@ public:
     [[nodiscard]] float Near() const noexcept;
     // Current projection, previous projection, and row Z of previous-view * inverse-view.
     [[nodiscard]] std::array<std::array<float, 4>, 3> TaaDepthParameters() const noexcept;
+    /// bbport: this frame's camera and the previous one, as the motion pass uses them (3x4 rows,
+    /// world to view and back; projection x/y/z scale and z offset, the x/y scales signed by the
+    /// G-buffer viewport: ndc +y down). Used for camera speed in TemporalUpscaler::CameraSpeed.
+    struct Matrices {
+        std::array<float, 12> view{}, inv_view{}, prev_view{};
+        std::array<float, 4> proj{}, prev_proj{};
+        bool valid = false;
+    };
+    [[nodiscard]] Matrices CameraMatrices() const noexcept {
+        return {current.view, current.inv_view, previous.view, current.proj, previous.proj,
+                current.valid && previous.valid};
+    }
+    /// bbport: the matrices and jitter of the motion of this frame, printed with an upscaler dump
+    /// (BB_DUMP_TRIGGER) for offline checks of the vectors.
+    void PrintState(int frame) const;
 
-    /// Records the motion vector pass: `depth_view` (depth aspect, General layout) into
-    /// `motion_view` (RG16F storage, General), pixels, previous minus current.
-    void RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_view, vk::ImageView motion_view,
-                      u32 width, u32 height);
+    /// Records the motion vector pass (Scheduler::Record): `depth_view` (depth aspect, General
+    /// layout) into `motion_view` (RG16F storage, General), pixels, previous minus current.
+    void RecordMotion(vk::ImageView depth_view, vk::ImageView motion_view, u32 width, u32 height);
 
     /// A bound constant buffer of 864 bytes: checks the scene constant signature.
     void OnConstants(const float* data);
 
     /// The G-buffer pass (5+ color targets): its depth is the scene depth.
-    void OnGBufferPass(VideoCore::ImageId depth);
+    /// `x_sign`/`y_sign`: signs of the G-buffer pass's viewport x/y scale (window = ndc * scale +
+    /// offset). The motion shaders take ndc as +y down the screen, so the projection's scales are
+    /// multiplied by them: the game's viewport decides which way view +y goes, per frame.
+    void OnGBufferPass(VideoCore::ImageId depth, float x_sign = 1.0f, float y_sign = 1.0f);
 
     /// The pass copying the finished frame (`frame`, the last target drawn) to the display: the
     /// frame's depth and camera are complete. Records the debug overlay, starts a new frame.
@@ -102,9 +127,23 @@ private:
     ObjectMotion* object_motion = nullptr;
     Camera current, previous;
     bool frame_has_camera = false;
+    /// bbport: the camera of the G-buffer pass in progress (OnConstants), committed as the frame's
+    /// camera once per frame (CommitFrameCamera: the motion pass or the display pass).
+    Camera pass_camera;
+    bool pass_has_camera = false;
+    bool committed = false;
+    u32 frame_gbuffer_passes = 0;
+    u32 last_frame_gbuffer_passes = 0;
+    std::array<std::array<float, 3>, 4> pass_positions{};
+    bool last_frame_reflection = false;
+    /// The frame's passes are the world and its mirror image (pass_positions).
+    [[nodiscard]] bool MirroredPasses() const noexcept;
+    void CommitFrameCamera();
     std::array<float, 2> jitter{}, previous_jitter{};
     std::array<u32, 2> render_size{};
     VideoCore::ImageId depth_id{};
+    float gbuffer_x_sign = 1.0f; ///< bbport: signs of the G-buffer viewport scales (OnGBufferPass)
+    float gbuffer_y_sign = 1.0f;
 
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pipeline_layout;

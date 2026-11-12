@@ -76,6 +76,8 @@ UPSCALER_CHOICES = [
     ("FSR 3.1", "fsr31"),
     ("FSR 4", "fsr4"),
     ("FSR 4.1.1", "fsr411"),
+    ("AMD FSR SDK", "fsr"),
+    ("Intel XeSS", "xess"),
     ("DLSS (NVIDIA RTX)", "dlss"),
 ]
 PRESET_CHOICES = [
@@ -84,6 +86,23 @@ PRESET_CHOICES = [
     ("Balanced", "2"),
     ("Performance", "3"),
     ("Ultra Performance", "4"),
+    ("Custom", "5"),
+]
+DLSS_PRESET_CHOICES = [
+    ("Auto: K, M (Perf), L (Ultra Perf)", "auto"),
+    ("K: transformer (default)", "k"),
+    ("J: transformer", "j"),
+    ("M: transformer, 2nd generation", "m"),
+    ("L: transformer, 2nd generation (Ultra Perf)", "l"),
+    ("E: CNN", "e"),
+    ("F: CNN (Ultra Perf, DLAA)", "f"),
+    ("The DLL's default", "0"),
+]
+FSR3_TUNING_PRESETS = [
+    ("Default (AMD's)", 1.0, 1.0, 1.0, 0.333, -0.333),
+    ("Steady bright pixels", 0.5, 1.0, 1.0, 0.333, -0.333),
+    ("Less ghosting", 1.0, 1.5, 1.5, 0.250, -0.333),
+    ("Less flicker", 1.0, 1.0, 1.0, 0.400, -0.100),
 ]
 LIVE_RES_CHOICES = [
     ("Off - startup patch (recommended)", "0"),

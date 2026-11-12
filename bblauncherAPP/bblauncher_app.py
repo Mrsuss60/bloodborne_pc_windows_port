@@ -48,6 +48,7 @@ from bblauncher_Utils import (
     DEFAULT_GAME,
     DEFAULT_SETTINGS,
     EFFECT_CHOICES,
+    FSR3_TUNING_PRESETS,
     KEYBIND_PRESETS,
     LAUNCHER_VERSION,
     LIVE_FPS_CONFLICTING_PATCHES,
@@ -1538,7 +1539,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 upscaler_val = "taa"
             elif is_fsr:
                 upscaler_val = self.cmb_upscaler.currentData() or "fsr31"
-                if upscaler_val not in ("fsr31", "fsr4", "fsr411", "dlss"):
+                if upscaler_val not in ("fsr31", "fsr4", "fsr411", "fsr", "xess", "dlss"):
                     upscaler_val = "fsr31"
             else:
                 upscaler_val = "off"
@@ -1553,6 +1554,18 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             keys_to_update.update({
                 "upscaler": upscaler_val,
                 "preset": self.cmb_preset.currentData() or "0",
+                "render_scale": f"{self.sl_render_scale.value() / 100:.2f}",
+                "mip_bias": f"{self.sl_mip_bias.value() / 100:.2f}",
+                "dlss_preset": self.cmb_dlss_preset.currentData() or "k",
+                "dlss_mip_bias": "1" if self.chk_dlss_mip_bias.isChecked() else "0",
+                "dlss_auto_exposure": "1" if self.chk_dlss_auto_exposure.isChecked() else "0",
+                "dlss_jitter_fade": "1" if self.chk_dlss_jitter_fade.isChecked() else "0",
+                "upscale_before_post": "1" if self.chk_upscale_before_post.isChecked() else "0",
+                "fsr3_velocity_factor": f"{self.sl_fsr3_velocity_factor.value() / 1000:.3f}",
+                "fsr3_reactiveness_scale": f"{self.sl_fsr3_reactiveness_scale.value() / 1000:.3f}",
+                "fsr3_shading_change_scale": f"{self.sl_fsr3_shading_change_scale.value() / 1000:.3f}",
+                "fsr3_accumulation": f"{self.sl_fsr3_accumulation.value() / 1000:.3f}",
+                "fsr3_min_disocclusion": f"{self.sl_fsr3_min_disocclusion.value() / 1000:.3f}",
                 "output_res": output_res_val,
                 "effect_game_aa": effect_game_aa,
                 "prep_workers": prep_workers_val,
@@ -1751,10 +1764,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
     @staticmethod
     def _ini_percent(opts: dict, key: str, default: float, minimum: int, maximum: int) -> int:
+        return BloodborneLauncher._ini_scaled(opts, key, default, minimum, maximum, 100)
+
+    @staticmethod
+    def _ini_scaled(opts: dict, key: str, default: float, minimum: int, maximum: int, scale: int = 100) -> int:
         try:
-            value = int(round(float(opts.get(key, str(default))) * 100))
+            value = int(round(float(opts.get(key, str(default))) * scale))
         except (TypeError, ValueError):
-            value = int(round(default * 100))
+            value = int(round(default * scale))
         return max(minimum, min(maximum, value))
 
     @staticmethod
@@ -1775,12 +1792,75 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             combo.blockSignals(False)
 
     @staticmethod
-    def _set_slider(slider, label, value: int):
+    def _set_slider(slider, label, value: int, scale: int = 100, decimals: int = 2, signed: bool = False):
         value = max(slider.minimum(), min(slider.maximum(), value))
         slider.blockSignals(True)
         slider.setValue(value)
         slider.blockSignals(False)
-        label.setText(f"{value / 100:.2f}")
+        label.setText(f"{value / scale:+.{decimals}f}" if signed else f"{value / scale:.{decimals}f}")
+
+    def _set_dlss_preset_combo(self, raw_value: str):
+        val = str(raw_value).strip().lower()
+        if not val:
+            val = "k"
+        elif val == "default":
+            val = "0"
+        idx = self.cmb_dlss_preset.findData(val)
+        if idx < 0 and len(val) == 1 and "a" <= val <= "z":
+            self.cmb_dlss_preset.blockSignals(True)
+            self.cmb_dlss_preset.addItem(f"Preset {val.upper()}", val)
+            idx = self.cmb_dlss_preset.count() - 1
+            self.cmb_dlss_preset.setCurrentIndex(idx)
+            self.cmb_dlss_preset.blockSignals(False)
+            return
+        if idx < 0:
+            idx = self.cmb_dlss_preset.findData("k")
+        if idx >= 0 and self.cmb_dlss_preset.currentIndex() != idx:
+            self.cmb_dlss_preset.blockSignals(True)
+            self.cmb_dlss_preset.setCurrentIndex(idx)
+            self.cmb_dlss_preset.blockSignals(False)
+
+    def _update_upscaler_option_visibility(self):
+        if not hasattr(self, "cmb_upscaler"):
+            return
+        up = (self.cmb_upscaler.currentData() or "off").strip().lower()
+        preset = (self.cmb_preset.currentData() or "1").strip()
+        if hasattr(self, "grp_custom_scale"):
+            self.grp_custom_scale.setVisible(preset == "5")
+        if hasattr(self, "grp_dlss"):
+            self.grp_dlss.setVisible(up == "dlss")
+        if hasattr(self, "grp_fsr3"):
+            self.grp_fsr3.setVisible(up == "fsr31")
+
+    def _refresh_fsr3_preset_combo(self):
+        if not hasattr(self, "cmb_fsr3_preset"):
+            return
+        vals = (
+            self.sl_fsr3_velocity_factor.value(),
+            self.sl_fsr3_reactiveness_scale.value(),
+            self.sl_fsr3_shading_change_scale.value(),
+            self.sl_fsr3_accumulation.value(),
+            self.sl_fsr3_min_disocclusion.value(),
+        )
+        matched = "__custom__"
+        for label, v0, v1, v2, v3, v4 in FSR3_TUNING_PRESETS:
+            targets = tuple(int(round(x * 1000)) for x in (v0, v1, v2, v3, v4))
+            if vals == targets:
+                matched = label
+                break
+        self._set_combo_data(self.cmb_fsr3_preset, matched)
+
+    def _on_fsr3_preset_selected(self):
+        label = self.cmb_fsr3_preset.currentData()
+        for p_label, v0, v1, v2, v3, v4 in FSR3_TUNING_PRESETS:
+            if p_label == label:
+                self._set_slider(self.sl_fsr3_velocity_factor, self.lbl_fsr3_velocity_factor_val, int(round(v0 * 1000)), scale=1000, decimals=3)
+                self._set_slider(self.sl_fsr3_reactiveness_scale, self.lbl_fsr3_reactiveness_scale_val, int(round(v1 * 1000)), scale=1000, decimals=3)
+                self._set_slider(self.sl_fsr3_shading_change_scale, self.lbl_fsr3_shading_change_scale_val, int(round(v2 * 1000)), scale=1000, decimals=3)
+                self._set_slider(self.sl_fsr3_accumulation, self.lbl_fsr3_accumulation_val, int(round(v3 * 1000)), scale=1000, decimals=3)
+                self._set_slider(self.sl_fsr3_min_disocclusion, self.lbl_fsr3_min_disocclusion_val, int(round(v4 * 1000)), scale=1000, decimals=3, signed=True)
+                self.save_bbport_ini()
+                break
 
     @staticmethod
     def _patch_value_for_state(active_value: str, enabled: bool) -> str:
@@ -1844,16 +1924,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         ini_upscaler = ini_opts.get("upscaler", "off").strip().lower()
         if ini_upscaler in ("fsr3", "fsr31"):
             upscaler_value = "fsr31"
-        elif ini_upscaler == "fsr4":
-            upscaler_value = "fsr4"
-        elif ini_upscaler == "fsr411":
-            upscaler_value = "fsr411"
-        elif ini_upscaler == "dlss":
-            upscaler_value = "dlss"
+        elif ini_upscaler in ("fsr4", "fsr411", "fsr", "xess", "dlss"):
+            upscaler_value = ini_upscaler
         else:
             upscaler_value = "off"
         self._set_combo_data(self.cmb_upscaler, upscaler_value)
         self._set_combo_data(self.cmb_preset, ini_opts.get("preset", "1"))
+        self._set_dlss_preset_combo(ini_opts.get("dlss_preset", "k"))
         self._set_combo_data(self.cmb_live_res, ini_opts.get("live_resolution", "0").strip().lower())
         self._set_combo_data(self.cmb_async_pipelines, ini_opts.get("async_pipelines", "auto").strip().lower())
         self._set_combo_data(self.cmb_texture_quality, ini_opts.get("texture_quality", "auto").strip().lower())
@@ -1885,17 +1962,31 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             (self.chk_object_motion, "object_motion", False),
             (self.chk_fsr4_auto_exposure, "fsr4_auto_exposure", False),
             (self.chk_fsr4_invert_jitter, "fsr4_invert_jitter", False),
+            (self.chk_dlss_mip_bias, "dlss_mip_bias", True),
+            (self.chk_dlss_auto_exposure, "dlss_auto_exposure", False),
+            (self.chk_dlss_jitter_fade, "dlss_jitter_fade", False),
+            (self.chk_upscale_before_post, "upscale_before_post", False),
             (self.chk_show_fps, "show_fps", False),
             (self.chk_hud, "show_hud", True),
         ):
             self._set_check(chk, self._ini_bool(ini_opts, key, default))
 
+        self._set_slider(self.sl_render_scale, self.lbl_render_scale_val, self._ini_percent(ini_opts, "render_scale", 1.30, 100, 300))
         self._set_slider(self.sl_sharpness, self.lbl_sharpness_val, self._ini_percent(ini_opts, "sharpness", 0.30, 0, 200))
+        self._set_slider(self.sl_mip_bias, self.lbl_mip_bias_val, self._ini_percent(ini_opts, "mip_bias", 0.00, -200, 100), signed=True)
         self._set_slider(self.sl_reactive_scale, self.lbl_reactive_scale_val, self._ini_percent(ini_opts, "reactive_scale", 1.00, 0, 1600))
         self._set_slider(self.sl_reactive_threshold, self.lbl_reactive_threshold_val, self._ini_percent(ini_opts, "reactive_threshold", 0.20, 0, 100))
         self._set_slider(self.sl_reactive_max, self.lbl_reactive_max_val, self._ini_percent(ini_opts, "reactive_max", 0.90, 0, 100))
+        self._set_slider(self.sl_fsr3_velocity_factor, self.lbl_fsr3_velocity_factor_val, self._ini_scaled(ini_opts, "fsr3_velocity_factor", 1.000, 0, 1000, 1000), scale=1000, decimals=3)
+        self._set_slider(self.sl_fsr3_reactiveness_scale, self.lbl_fsr3_reactiveness_scale_val, self._ini_scaled(ini_opts, "fsr3_reactiveness_scale", 1.000, 0, 4000, 1000), scale=1000, decimals=3)
+        self._set_slider(self.sl_fsr3_shading_change_scale, self.lbl_fsr3_shading_change_scale_val, self._ini_scaled(ini_opts, "fsr3_shading_change_scale", 1.000, 0, 4000, 1000), scale=1000, decimals=3)
+        self._set_slider(self.sl_fsr3_accumulation, self.lbl_fsr3_accumulation_val, self._ini_scaled(ini_opts, "fsr3_accumulation", 0.333, 0, 1000, 1000), scale=1000, decimals=3)
+        self._set_slider(self.sl_fsr3_min_disocclusion, self.lbl_fsr3_min_disocclusion_val, self._ini_scaled(ini_opts, "fsr3_min_disocclusion", -0.333, -1000, 1000, 1000), scale=1000, decimals=3, signed=True)
         self._set_slider(self.sl_hud_opacity, self.lbl_hud_opacity_val, self._ini_percent(ini_opts, "hud_opacity", 0.75, 10, 100))
         self._set_slider(self.sl_hud_scale, self.lbl_hud_scale_val, self._ini_percent(ini_opts, "hud_scale", 1.00, 50, 250))
+
+        self._refresh_fsr3_preset_combo()
+        self._update_upscaler_option_visibility()
 
         effect_defaults = {key: default for key, _label, default in EFFECT_CHOICES}
         for effect_key, chk in self.effect_checks.items():

@@ -274,7 +274,9 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // main camera (shadow passes bind the same layout with the light's camera).
     gbuffer_draw = camera_motion->Enabled() && std::popcount(key.mrt_mask) >= 5 && db_desc.first;
     if (gbuffer_draw) {
-        camera_motion->OnGBufferPass(db_desc.first);
+        const auto& vp = regs.viewports[0];
+        camera_motion->OnGBufferPass(db_desc.first, vp.xscale < 0.0f ? -1.0f : 1.0f,
+                                     vp.yscale < 0.0f ? -1.0f : 1.0f);
     }
     if (upscaler->Enabled() && cb_descs[0].first) {
         upscaler->OnColorTarget(cb_descs[0].first);
@@ -301,6 +303,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             }
         }
     }
+}
+
+void Rasterizer::NotifyUiDraw(const GraphicsPipeline* pipeline) {
+    if (!upscaler->Enabled()) return;
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto vs_hash = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
+    const auto& regs = Regs();
+    if (!UiComposition::ObserveDraw(key.mrt_mask, vs_hash, regs.depth_control.stencil_enable))
+        return;
+    auto color = cb_descs[0].first;
+    // A stencil-only pipeline does not resolve colour bindings. Reuse a previous
+    // colour only if it is still the engine's bound target, never another pass's.
+    if (key.mrt_mask == 0 && color &&
+        (!regs.color_buffers[0] || texture_cache.GetImage(color).info.guest_address !=
+                                      regs.color_buffers[0].Address())) {
+        color = {};
+    }
+    const auto& viewport = regs.viewports[0];
+    upscaler->OnDraw(vs_hash, color, db_desc.first,
+                     UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
 }
 
 static std::pair<u32, u32> GetDrawOffsets(
@@ -1006,6 +1028,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
+        upscaler->OnDisplayPass();
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -1025,14 +1048,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_geometry = 0;
 
     PrepareRenderState(pipeline);
-    const u32 draw_colors = std::popcount(pipeline->GetGraphicsKey().mrt_mask);
-    // Stencil-only draws (UI masks) too: their depth must become the UI depth.
-    if (upscaler->Enabled() && (draw_colors == 1 || (draw_colors == 0 && db_desc.first))) {
-        const auto& viewport = Regs().viewports[0];
-        upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
-                         draw_colors ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
-                         UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
-    }
+    NotifyUiDraw(pipeline);
     const PreparedDraw* draw_prepared = bind_prepared;
     // bbport: vertex and index buffers are resolved while the helper binds textures (their
     // commands are recorded after BeginRendering, as before).
@@ -1242,13 +1258,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     motion_draw = false;
     motion_geometry = 0;
     PrepareRenderState(pipeline);
-    const u32 draw_colors = std::popcount(pipeline->GetGraphicsKey().mrt_mask);
-    if (upscaler->Enabled() && (draw_colors == 1 || (draw_colors == 0 && db_desc.first))) {
-        const auto& viewport = Regs().viewports[0];
-        upscaler->OnDraw(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
-                         draw_colors ? cb_descs[0].first : VideoCore::ImageId{}, db_desc.first,
-                         UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
-    }
+    NotifyUiDraw(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
@@ -2342,7 +2352,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     // image (normalized sampling only; see Shader::ImageResource::needs_native).
     boost::container::small_vector<bool, 16> binding_proxy_ok;
     const bool sample_proxies = !BbToggle::Disabled(BbToggle::SampleSceneProxies) &&
-                                !on_helper && scene_targets->Reduced();
+                                !on_helper && scene_targets->Reduced() &&
+                                !PointReadsNative(stage, prepared);
 
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
@@ -2660,6 +2671,34 @@ void Rasterizer::ForceAnisotropy(AmdGpu::Sampler& sharp, bool is_depth) const {
     sharp.max_aniso.Assign(ratio);
 }
 
+// bbport: a pass at the native size (graphics after the upscaler has run, compute) that reads a
+// reduced scene proxy through a point-filtered sampler upscales it nearest-neighbour: 17 such
+// post-processing passes made effects and the moon's edge blocky at every reduced preset. The
+// stage reads the native images instead, resolved from the proxies with linear filtering
+// (SceneTargets::Copy). Bilinear samplers keep reading the proxy (the same upscale, no resolve).
+// The sampler that reads each image is not known here: any point sampler counts.
+// BB_PROXY_POINT_NATIVE=0 (or experiment bit 0): proxies are read regardless, as before.
+bool Rasterizer::PointReadsNative(const Shader::Info& stage, const PreparedStage* prepared) const {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_PROXY_POINT_NATIVE");
+        return !(env && env[0] == '0');
+    }();
+    // Experiment bit 0 of BB_TOGGLE_FILE: proxies read regardless (A/B while the game runs).
+    if (!enabled || BbToggle::Experiment(1) ||
+        (stage.sw_stage != Shader::SwStage::Compute && upscaler->RasterScaling())) {
+        return false;
+    }
+    for (u32 i = 0; i < stage.samplers.size(); ++i) {
+        const auto sharp = prepared && prepared->sampler_sharps ? prepared->sampler_sharps[i]
+                                                                : stage.samplers[i].GetSharp(stage);
+        if (sharp.xy_mag_filter == AmdGpu::Filter::Point ||
+            sharp.xy_mag_filter == AmdGpu::Filter::AnisoPoint) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index) {
     for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
@@ -2721,8 +2760,11 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             return false;
         }
     }
+    // Point-sampling stages in native passes read native images (PointReadsNative): sets of
+    // their own, whose native entries stand even for images with a current proxy.
+    const bool point_native = scene_targets->Reduced() && PointReadsNative(stage, prepared);
     u64 key = XXH3_64bits_withSeed(prepared->image_hashes, count * sizeof(u64),
-                                   reinterpret_cast<u64>(&stage));
+                                   reinterpret_cast<u64>(&stage) ^ (point_native ? 2 : 0));
     key |= 1; // 0 marks an empty slot
     auto& set = texture_sets[key % texture_sets.size()];
     slot = &set;
@@ -2766,7 +2808,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             (entry.proxy ? !proxies_on ||
                                !scene_targets->ProxyCurrent(image, entry.range.base.level,
                                                             entry.range.extent.levels)
-                         : image.scene_proxy && proxies_on) ||
+                         : image.scene_proxy && proxies_on && !point_native) ||
             (upscaler->Enabled() && upscaler->RedirectsSampled(entry.id))) {
             ++texture_set_why[2];
             ++texture_set_misses;
@@ -2802,6 +2844,29 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     }
     (void)first_image_idx;
     return true;
+}
+
+// bbport: a draw into the upscaler's output-size images (BeginRenderingFull's redirected passes):
+// its scale from this draw's own viewport. Made for every draw, also those the render state
+// memo continues a pass with: a UI pass mixes viewports, and the scale of the pass's first draw
+// was kept for all of them.
+void Rasterizer::UpdateUiTransform() {
+    target_scale = {1.0f, 1.0f};
+    if (!ui_pass.active) {
+        return;
+    }
+    const auto& regs = Regs();
+    const auto [gw, gh] = ui_pass.guest;
+    const auto [ow, oh] = ui_pass.output;
+    // The UI movie viewport is now 1920x1080 even when the scene is 960x540.
+    // A native viewport (or native window-space UI vertices) must not be doubled
+    // again. The final display copy still uses the guest render-size coordinates.
+    const auto& viewport = regs.viewports[0];
+    const bool native_coordinates = ui_pass.native_ui &&
+        (UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2) ||
+         (regs.IsClipDisabled() && !regs.viewport_control.xscale_enable &&
+          !regs.viewport_control.yscale_enable));
+    target_scale = UiComposition::Scale(gw, gh, ow, oh, native_coordinates);
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
@@ -2843,6 +2908,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             attachment_feedback_loop = false;
             push_data.scene_size = begin_memo.scene_size;
             target_scale = begin_memo.target_scale;
+            // The same pass, not the same viewport: a UI pass mixes the movie viewport and
+            // target-sized viewports.
+            ui_pass = begin_memo.ui_pass;
+            if (ui_pass.active) {
+                UpdateUiTransform();
+            }
             return begin_memo.state;
         }
         ++begin_memo_misses;
@@ -2859,7 +2930,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (!clears) {
             // Recomputed after the full path: it may have started the scene (scene_started).
             begin_memo = {true, MakeBeginSignature(pipeline), state, push_data.scene_size,
-                          target_scale};
+                          target_scale, ui_pass};
         }
     }
     return state;
@@ -3100,6 +3171,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     // bbport: a pass drawn into the upscaler's output-size images (UI, display pass): every
     // attachment must be redirected, viewports and scissors are scaled.
     target_scale = {1.0f, 1.0f};
+    ui_pass = {};
     if (color_redirected || depth_redirected) {
         u32 color_targets = 0;
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
@@ -3138,17 +3210,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         } else {
             state.width = redirect.width;
             state.height = redirect.height;
-            // The UI movie viewport is now 1920x1080 even when the scene is 960x540.
-            // A native viewport (or native window-space UI vertices) must not be doubled
-            // again. The final display copy still uses the guest render-size coordinates.
-            const auto& viewport = regs.viewports[0];
-            const bool native_coordinates = redirect.native_ui &&
-                (UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2) ||
-                 (regs.IsClipDisabled() && !regs.viewport_control.xscale_enable &&
-                  !regs.viewport_control.yscale_enable));
-            target_scale = UiComposition::Scale(guest_extent.first, guest_extent.second,
-                                                redirect.width, redirect.height,
-                                                native_coordinates);
+            // Viewports and scissors follow each draw's viewport (UpdateUiTransform).
+            ui_pass = {true, redirect.native_ui, {guest_extent.first, guest_extent.second},
+                       {redirect.width, redirect.height}};
+            UpdateUiTransform();
         }
     }
 
@@ -3164,12 +3229,15 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     }
 
     if (reduced) {
-        // Half-resolution passes keep the scene's factor (proxy / native = scene / 1920).
+        // Half-resolution passes keep the scene's factor (proxy / native).
         const auto size = scene_targets->Size();
         const auto proxy = pass_size.value_or(size);
         state.width = proxy.width;
         state.height = proxy.height;
-        target_scale = {float(size.width) / 1920.0f, float(size.height) / 1080.0f};
+        const auto native = SceneResolution::Native();
+        target_scale = {float(size.width) / float(native.width),
+                        float(size.height) / float(native.height)};
+        ui_pass.active = false; // the memo keeps this scale for the pass
     }
     if (FrameCapture::Active()) {
         std::array<const VideoCore::ImageInfo*, AmdGpu::NUM_COLOR_BUFFERS> colors{};
@@ -3388,7 +3456,6 @@ void Rasterizer::UpdateViewportScissorState() const {
     const auto& regs = Regs();
 
     const AmdGpu::Scissor scsr = regs.GetCombinedScissor();
-
     boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
     boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
 

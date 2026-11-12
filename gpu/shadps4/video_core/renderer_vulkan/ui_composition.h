@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 
@@ -22,11 +23,25 @@ inline bool NativeViewport(float width, float height) {
            std::abs(std::abs(height) - 1080.0f) < 0.5f;
 }
 
+// A scene rendered near 1920x1080 (e.g. 4K Performance): the game's full-screen post passes
+// then have a native-sized viewport too, so a native viewport no longer tells a UI draw apart.
+inline bool SceneHasUiViewportSize(uint32_t scene_width, uint32_t scene_height) {
+    return std::abs(float(scene_width) - 1920.0f) < 8.0f &&
+           std::abs(float(scene_height) - 1080.0f) < 8.0f;
+}
+
 // Scaleform draws, including the first stencil/movie pass. A native-size viewport
 // alone also matches every fullscreen post pass when guest targets stay at 1080p.
 constexpr bool MovieShader(uint64_t hash) {
     return hash == 0x34e8a281 || hash == 0x81d336ce || hash == 0x09957251 ||
            hash == 0x24042a9b || hash == 0xa400228b;
+}
+
+// Scaleform clip masks write stencil with no colour exports. Observe them before
+// the masked image so a late UI-depth preparation cannot erase the clip mask.
+constexpr bool ObserveDraw(uint32_t mrt_mask, uint64_t vs_hash, bool has_stencil) {
+    return std::popcount(mrt_mask) == 1 ||
+           (mrt_mask == 0 && has_stencil && MovieShader(vs_hash));
 }
 
 inline std::array<float, 2> Scale(uint32_t guest_width, uint32_t guest_height,

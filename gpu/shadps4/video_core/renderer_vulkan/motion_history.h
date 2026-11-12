@@ -228,24 +228,49 @@ public:
         uint32_t store{}, load{}, vertices{}, instances{}, first_vertex{}, first_instance{};
     };
     struct Stats {
-        uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{};
+        uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{},
+            held{};
     } stats;
 
     // A small skeleton (weapon, prop; most are static world pieces) only needs history
     // while its bone palette changes: with last frame's bones its motion is the camera's.
     // Checked before the index scan of Prepare, with a cheap identity. The first frame
     // of a change stores positions (nothing to load yet), the next one loads them.
+    //
+    // bbport: a draw whose palette changed keeps its history for `hold` more frames
+    // (SetHold, BB_OBJECT_MOTION_HOLD in vk_object_motion.cpp). Without it, bones that move
+    // on some frames only never got a vector: a changed frame that follows an unchanged one
+    // has nothing to load (that frame stored nothing; it counts as unmatched), and the frame
+    // after it is "still" again. The palettes hold world-space bones (the G-buffer vertex
+    // shaders multiply by the palette, then by the scene camera; the model constants only
+    // give the first bone index), so an attached weapon changes its palette only on the
+    // frames the game updates its attachment, which at 120 FPS need not be every rendered
+    // frame. Ludwig's Holy Blade on the back showed it: orange (camera motion) in the debug
+    // view while the body, a large skeleton stored every frame, was blue, and DLSS dropped
+    // the blade's history while the player ran. A held frame stores and loads like a moving
+    // one; for an object that did not move its vector equals the camera's, so holding costs
+    // only the vertex stores of objects that moved within the last `hold` frames.
     struct GateKey {
         uint64_t shader{}, geometry{}, indices{};
         uint32_t index_count{}, instances{}, first_instance{}, occurrence{};
         bool operator==(const GateKey&) const = default;
     };
+    void SetHold(uint32_t frames) { hold = frames; }
     bool Moving(GateKey key, uint64_t palette) {
         key.occurrence = 0;
         key.occurrence = gate_occurrences[key]++;
         const auto* prev = gate_previous.find(key);
-        const bool moving = prev && *prev != palette;
-        gate_current.emplace(key, palette);
+        GateState state{palette, 0};
+        bool moving = false;
+        if (prev && prev->palette != palette) {
+            moving = true;
+            state.hold = hold;
+        } else if (prev && prev->hold) {
+            moving = true; // unchanged, but changed within the last `hold` frames
+            state.hold = prev->hold - 1;
+            ++stats.held;
+        }
+        gate_current.emplace(key, state);
         stats.still += moving ? 0 : 1;
         return moving;
     }
@@ -311,6 +336,7 @@ private:
         }
     };
     uint32_t capacity{}, used{};
+    uint32_t hold{}; ///< frames a small skeleton keeps its history after a change (SetHold)
     uint64_t frame{};
     FlatMap<Key, uint32_t, Hash> previous, current, occurrences;
     struct GateHash {
@@ -322,7 +348,11 @@ private:
             return size_t(h);
         }
     };
-    FlatMap<GateKey, uint64_t, GateHash> gate_previous, gate_current;
+    struct GateState {
+        uint64_t palette{};
+        uint32_t hold{}; ///< further frames this draw keeps its history (Moving)
+    };
+    FlatMap<GateKey, GateState, GateHash> gate_previous, gate_current;
     FlatMap<GateKey, uint32_t, GateHash> gate_occurrences;
 };
 

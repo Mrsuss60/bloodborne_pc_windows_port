@@ -10,12 +10,22 @@ struct Size {
     uint32_t width = 1920, height = 1080;
     bool operator==(const Size&) const = default;
 };
+/// bbport: `scale` is output / render (BbSettings::PresetScale; the Custom preset's is any ratio
+/// from 1 to 3).
+inline Size& Native() {
+    static Size native{};
+    return native;
+}
+inline Size ForScale(double scale, Size output = {}) {
+    // Multiples of 4: even for half-resolution effects, and the game pads its targets to 4 (an
+    // undrawn column at the right edge otherwise); the preset labels show the same sizes.
+    scale = std::clamp(scale, 1.0, 3.0);
+    return {uint32_t(std::max(1l, std::lround(output.width / scale / 4)) * 4),
+            uint32_t(std::max(1l, std::lround(output.height / scale / 4)) * 4)};
+}
 inline Size ForPreset(int preset, Size output = {}) {
-    // Even dimensions for half-resolution effects; match the preset labels exactly.
     constexpr std::array<double, 5> scales{1.0, 1.5, 1.7, 2.0, 3.0};
-    const double scale = scales[std::clamp(preset, 0, 4)];
-    return {uint32_t(std::max(1l, std::lround(output.width / scale / 2)) * 2),
-            uint32_t(std::max(1l, std::lround(output.height / scale / 2)) * 2)};
+    return ForScale(scales[std::clamp(preset, 0, 4)], output);
 }
 constexpr uint32_t Pack(Size size) { return size.width | (size.height << 16); }
 constexpr Size Unpack(uint32_t packed) {

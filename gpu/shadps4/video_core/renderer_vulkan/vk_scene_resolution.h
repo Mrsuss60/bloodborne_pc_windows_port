@@ -6,6 +6,7 @@
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include "video_core/renderer_vulkan/scene_proxy_release.h"
 #include "video_core/renderer_vulkan/scene_resolution.h"
 #include "video_core/texture_cache/image.h"
 
@@ -25,7 +26,7 @@ public:
     ~SceneTargets();
     bool SetSize(SceneResolution::Size);
     SceneResolution::Size Size() const { return size; }
-    bool Reduced() const { return size != SceneResolution::Size{}; }
+    bool Reduced() const { return size != SceneResolution::Native(); }
     /// A reduced proxy can stand in for the image: a 1920x1080 scene target or, scaled by
     /// the same factor, a half-resolution (960x540) one (toggle SceneHalfRes).
     bool Eligible(const VideoCore::Image&) const;
@@ -63,7 +64,17 @@ public:
     [[nodiscard]] bool Tracks(u64 image_uid) const {
         return !copying && tracked.contains(image_uid);
     }
+    /// A proxy of the image holds writes its native image has not seen yet (NativeAccess would
+    /// resolve them).
+    [[nodiscard]] bool NativeStale(const VideoCore::Image& image) const;
     void ResolveAll();
+    void Forget(u64 image_uid) {
+        releases.Add(image_uid);
+    }
+    [[nodiscard]] std::size_t ProxyCount() const noexcept {
+        return entries.size();
+    }
+    void DropForgotten();
     bool debug = false; ///< BB_SCENE_DEBUG frame: print resolves and fills
 private:
     struct Entry {
@@ -99,6 +110,8 @@ private:
     SceneResolution::Size size;
     std::unordered_map<u64, std::unique_ptr<Entry>> entries; ///< by Key(uid, level)
     std::unordered_set<u64> tracked; ///< uids with proxies
+    ProxyReleases releases;
+    u64 released_proxies = 0, released_bytes = 0, release_report_proxies = 0;
     bool copying = false;
     bool force_stencil_bits = false; ///< test the portable resampler on any driver
     u64 generation = 0;

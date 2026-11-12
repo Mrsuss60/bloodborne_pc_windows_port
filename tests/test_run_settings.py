@@ -74,7 +74,7 @@ class RestartResolutionTests(unittest.TestCase):
     def test_outputs_other_than_1080p_patch_the_render_size_and_restarts_recompute_it(self):
         rows = self.run_restarts()
         # 720p Quality, 720p Ultra Performance after a restart, then 1080p (live host targets).
-        self.assertEqual([row['BB_RENDER_RES'] for row in rows], ['854x480', '426x240', None])
+        self.assertEqual([row['BB_RENDER_RES'] for row in rows], ['852x480', '640x360', None])
         self.assertEqual([row['BB_OUTPUT_RES'] for row in rows], ['1280x720', '1280x720', None])
         self.assertEqual([row['BB_AUTO_RENDER_RES'] for row in rows], ['1', '1', None])
 
@@ -88,17 +88,17 @@ class RestartResolutionTests(unittest.TestCase):
         # Only the first launch matters here: the probe rewrites bbport.ini for the restarts.
         self.assertIsNone(self.run_restarts(ini_extra='live_resolution=1\n')[0]['BB_RENDER_RES'])
         self.assertEqual(self.run_restarts(ini_extra='live_resolution=0\n', caps=1)[0]['BB_RENDER_RES'],
-                         '854x480')
+                         '852x480')
         # Unset: off (the startup patch), whatever the GPU; auto asks the GPU check.
-        self.assertEqual(self.run_restarts(caps=1)[0]['BB_RENDER_RES'], '854x480')
+        self.assertEqual(self.run_restarts(caps=1)[0]['BB_RENDER_RES'], '852x480')
         self.assertIsNone(self.run_restarts(ini_extra='live_resolution=auto\n', caps=1)[0]['BB_RENDER_RES'])
         self.assertEqual(self.run_restarts(ini_extra='live_resolution=auto\n', caps=0)[0]['BB_RENDER_RES'],
-                         '854x480')
+                         '852x480')
 
     def test_live_resolution_without_sed_or_grep(self):
         # A missing sed ended run.sh (exit 127) before the game in the AppImage on NixOS.
         self.assertEqual(self.run_restarts(ini_extra='live_resolution=0\n', caps=1,
-                                           bare_path=True)[0]['BB_RENDER_RES'], '854x480')
+                                           bare_path=True)[0]['BB_RENDER_RES'], '852x480')
         self.assertIsNone(self.run_restarts(ini_extra='live_resolution=auto\n', caps=1,
                                             bare_path=True)[0]['BB_RENDER_RES'])
 

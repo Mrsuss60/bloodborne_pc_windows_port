@@ -767,6 +767,16 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
+    /// bbport: waits for the GPU to complete the submissions before the current one, which is
+    /// not sent: for callers that keep recording into it (the upscaler between CommandBuffer()
+    /// and the end of its pass) and free resources only earlier submissions used.
+    void WaitSubmittedWork() {
+        const u64 tick = CurrentTick();
+        if (tick > 1) {
+            Wait(tick - 1);
+        }
+    }
+
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 

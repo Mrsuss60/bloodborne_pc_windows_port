@@ -12,6 +12,8 @@ thread_local jmp_buf* runtime_fault_recover = nullptr;
 thread_local sigjmp_buf* runtime_fault_recover = nullptr;
 #endif
 uint32_t runtime_disabled_optimizations = 0;
+uint64_t runtime_disabled_optimizations2 = 0;
+uint64_t runtime_experiment_bits = 0;
 uint64_t runtime_tsc_frequency() { return 1000000000; }
 int runtime_file_translate(const char*, char*, size_t) { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t, uint64_t) { std::abort(); }

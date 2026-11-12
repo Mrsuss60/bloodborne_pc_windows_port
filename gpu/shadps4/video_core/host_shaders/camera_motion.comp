@@ -38,10 +38,10 @@ void main() {
     // Depth was rasterised through a shifted viewport. Reconstruct its unjittered
     // position, and keep jitter out of FSR's motion vectors (as for the object vectors).
     const vec2 scene_uv = uv - jitter / size;
-    // bbport: view +y maps down the screen (pixel rows). Checked against the GPU's own object
-    // vectors on static meshes (2026-10-06, 13 frames running up the Cathedral Ward stairs):
-    // this convention matches them within 0.05 px, y up was 1.3-3.7 px off. The error is in
-    // pitch and vertical movement, so it showed on stairs (FSR 4 streaks, FSR 3 blur).
+    // bbport: ndc +y down the screen (pixel rows). The projection's y scale carries the sign of
+    // the G-buffer pass's viewport y scale (CameraMotion::OnConstants): the viewport decides which
+    // way view +y goes. A fixed sign was right in some areas and wrong in others (0.2: y up, bad on
+    // the Cathedral Ward stairs and in the sewers; 0.3: y down, smearing when the camera turns).
     const vec2 ndc = vec2(scene_uv.x * 2.0 - 1.0, scene_uv.y * 2.0 - 1.0);
 
     // Clip z = zs * z + zo, w = z; depth = zs + zo / z (zo < 0, depth < zs in front).
@@ -87,7 +87,7 @@ void main() {
     const vec3 mv_color = sky ? vec3(0.0, 0.0, 0.3) : vec3(0.5) + vec3(motion / 128.0, 0.0);
     imageStore(color_img, pixel, vec4(mix(current.rgb, mv_color, 0.75), current.a));
 #else
-    vec2 result = motion;
+    vec2 result = any(isnan(motion)) || any(isinf(motion)) ? vec2(0.0) : clamp(motion, -4.0 * size, 4.0 * size);
     if (mode == 1) {
         const vec4 object_motion = texelFetch(object_tex, pixel, 0);
         // A later ordinary draw may have covered this pixel without touching the motion

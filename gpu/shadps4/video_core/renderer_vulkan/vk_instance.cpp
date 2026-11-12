@@ -13,9 +13,11 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_fsr4vk.h"
+#include "video_core/renderer_vulkan/vk_fsr_sdk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
 #include "bbport_settings.h"
 
 #include <vk_mem_alloc.h>
@@ -202,21 +204,13 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
-    if (!CreateDevice()) {
-        if (Dlss* dlss = Dlss::Get()) {
-            dlss->Disable("device creation failed");
-        }
-    }
-    BbSettings::ConfigureUpscalerSupport(IsFsr4Int8Supported(), IsFsr411Supported());
+    CreateDevice();
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
 }
 
 Instance::~Instance() {
-    if (Dlss* dlss = Dlss::Get()) {
-        dlss->Shutdown(); // NGX before the VkDevice and its images go away
-    }
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
 }
@@ -251,7 +245,10 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
-        vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
+        vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
+        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT,
+        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT,
+        vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -269,7 +266,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    std::vector<const char*> enabled_extensions;
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -394,10 +391,24 @@ bool Instance::CreateDevice() {
         feature_chain.get<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>()
             .shaderMixedFloatDotProductFloat16AccFloat32 &&
         add_extension(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
+    // bbport: FSR 4.1.1's FP8 variant (RDNA4): FP8 cooperative matrices. Cooperative matrices
+    // alone (FP16) run it emulated, for testing (BB_FSR411_VARIANT=fp8emu).
+    cooperative_matrix =
+        feature_chain.get<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>().cooperativeMatrix &&
+        add_extension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    shader_float8 =
+        cooperative_matrix &&
+        feature_chain.get<vk::PhysicalDeviceShaderFloat8FeaturesEXT>().shaderFloat8CooperativeMatrix &&
+        add_extension(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
     if (compute_shader_derivatives) {
         compute_shader_derivatives_features =
             feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
     }
+    // bbport: NVIDIA NGX (DLSS) needs these besides push descriptors and buffer device address
+    // (NVSDK_NGX_VULKAN_RequiredExtensions); only NVIDIA drivers expose them.
+    const bool nvx_binary_import = add_extension(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
+    dlss_extensions =
+        add_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) && nvx_binary_import;
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -437,6 +448,77 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    // bbport: FSR 4.1.1 through the fsr4vk provider DLL (vk_fsr4vk.cpp). Its device requirements
+    // are standard features and two extensions, requested only when the DLL is installed and the
+    // device has all of them.
+    const auto extension_available = [&](std::string_view extension) {
+        return std::find(available_extensions.begin(), available_extensions.end(), extension) !=
+               available_extensions.end();
+    };
+    fsr4vk = Fsr4Vk::FilesPresent() && features.shaderInt16 &&
+             features.shaderStorageImageReadWithoutFormat &&
+             features.shaderStorageImageWriteWithoutFormat && vk12_features.shaderFloat16 &&
+             vk12_features.shaderInt8 && vk12_features.storageBuffer8BitAccess &&
+             vk12_features.runtimeDescriptorArray &&
+             vk12_features.descriptorBindingVariableDescriptorCount &&
+             vk12_features.bufferDeviceAddress && vk13_features.synchronization2 &&
+             vk13_features.shaderIntegerDotProduct && compute_shader_derivatives &&
+             compute_shader_derivatives_features.computeDerivativeGroupLinear &&
+             feature_chain.get<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>()
+                 .mutableDescriptorType &&
+             feature_chain.get<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>().descriptorBuffer &&
+             extension_available(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) &&
+             extension_available(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+    if (fsr4vk) {
+        add_extension(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+        add_extension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "fsr4vk: {} found, its device features are enabled",
+                 Fsr4Vk::LibraryPathUtf8());
+        std::printf("Upscaler: fsr4vk found (%s): FSR 4.1.1 available\n",
+                    Fsr4Vk::LibraryPathUtf8().c_str());
+    } else if (Fsr4Vk::FilesPresent()) {
+        std::printf(
+            "Upscaler: fsr4vk found, but this GPU lacks a Vulkan feature it needs: no FSR 4.1.1\n");
+    }
+    fsr_sdk = FsrSdk::FilesPresent() && features.shaderStorageImageWriteWithoutFormat &&
+              vk13_features.synchronization2;
+    // bbport: Intel's driver for integrated graphics crashes inside igvk64.dll while the SDK
+    // prepares its upscaler, right after the first load; use FSR 3.1 unless BB_FSR_SDK_INTEL=1.
+    if (fsr_sdk && properties.vendorID == 0x8086 && IsIntegrated()) {
+        const char* force = std::getenv("BB_FSR_SDK_INTEL");
+        if (!(force && force[0] == '1')) {
+            fsr_sdk = false;
+            std::printf("Upscaler: AMD FSR SDK left out on Intel integrated graphics (its driver crashes "
+                        "while the SDK prepares; FSR 3.1 is used; BB_FSR_SDK_INTEL=1 uses the SDK)\n");
+        }
+    }
+    if (fsr_sdk) {
+        std::printf("Upscaler: AMD FSR SDK 2.4 found (%s)\n", FsrSdk::DirectoryUtf8().c_str());
+    } else if (FsrSdk::FilesPresent()) {
+        std::printf("Upscaler: AMD FSR SDK found, but this GPU lacks a Vulkan feature it needs\n");
+    }
+    // bbport: Intel XeSS-SR (vk_xess.cpp): the device extensions libxess.dll asks for and the
+    // features it requires, requested only when the library is installed.
+    if (Xess::FilesPresent() && features.shaderStorageImageWriteWithoutFormat &&
+        feature_chain.get<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>().mutableDescriptorType &&
+        extension_available(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) {
+        std::vector<const char*> xess_extensions{VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME};
+        std::vector<const char*> required;
+        xess = Xess::RequiredDeviceExtensions(*instance, physical_device, required);
+        xess_extensions.insert(xess_extensions.end(), required.begin(), required.end());
+        for (const char* extension : xess ? xess_extensions : std::vector<const char*>{}) {
+            const bool enabled = std::ranges::any_of(enabled_extensions, [&](const char* name) {
+                return std::strcmp(name, extension) == 0;
+            });
+            xess = (enabled || add_extension(extension)) && xess;
+        }
+        std::printf(xess ? "Upscaler: Intel XeSS found (%s): XeSS-SR available\n"
+                         : "Upscaler: Intel XeSS found (%s), but this GPU or driver lacks what it needs\n",
+                    Xess::DirectoryUtf8().c_str());
+    } else if (Xess::FilesPresent()) {
+        std::printf("Upscaler: Intel XeSS found, but this GPU lacks a Vulkan feature it needs\n");
+    }
+    const bool fsr_shared = fsr4vk || fsr_sdk;
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -467,6 +549,9 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                // bbport: fsr4vk (vk_fsr4vk.cpp) and the AMD FSR SDK (vk_fsr_sdk.cpp).
+                .shaderStorageImageReadWithoutFormat =
+                    fsr4vk || (fsr_sdk && features.shaderStorageImageReadWithoutFormat),
                 // bbport: required by the FSR 3 accumulate shaders (vk_temporal_upscaler).
                 .shaderStorageImageWriteWithoutFormat =
                     features.shaderStorageImageWriteWithoutFormat,
@@ -490,18 +575,25 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
+            // bbport: fsr4vk (vk_fsr4vk.cpp) and the AMD FSR SDK (vk_fsr_sdk.cpp).
+            .descriptorBindingVariableDescriptorCount =
+                fsr4vk || (fsr_shared && vk12_features.descriptorBindingVariableDescriptorCount),
+            .runtimeDescriptorArray = fsr4vk || (fsr_shared && vk12_features.runtimeDescriptorArray),
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
             .hostQueryReset = vk12_features.hostQueryReset,
             .timelineSemaphore = vk12_features.timelineSemaphore,
             .bufferDeviceAddress = vk12_features.bufferDeviceAddress,
+            .vulkanMemoryModel = vk12_features.vulkanMemoryModel,
+            .vulkanMemoryModelDeviceScope = vk12_features.vulkanMemoryModelDeviceScope,
             .shaderOutputLayer = vk12_features.shaderOutputLayer,
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
+            .computeFullSubgroups = vk13_features.computeFullSubgroups,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
             .shaderIntegerDotProduct = vk13_features.shaderIntegerDotProduct,
@@ -593,6 +685,19 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE{
             .shaderMixedFloatDotProductFloat16AccFloat32 = true,
         },
+        vk::PhysicalDeviceCooperativeMatrixFeaturesKHR{
+            .cooperativeMatrix = true,
+        },
+        vk::PhysicalDeviceShaderFloat8FeaturesEXT{
+            .shaderFloat8 = true,
+            .shaderFloat8CooperativeMatrix = true,
+        },
+        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT{
+            .mutableDescriptorType = true,
+        },
+        vk::PhysicalDeviceDescriptorBufferFeaturesEXT{
+            .descriptorBuffer = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -653,45 +758,28 @@ bool Instance::CreateDevice() {
     if (!mixed_float_dot_product) {
         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
     }
-
-    // DLSS (optional bridge library) needs its own device extensions on NVIDIA GPUs.
-    const std::size_t own_extensions = enabled_extensions.size();
-    Dlss* dlss = Dlss::Get();
-    if (dlss) {
-        dlss->AppendDeviceExtensions(*instance, physical_device, enabled_extensions);
+    if (!cooperative_matrix) {
+        device_chain.unlink<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
     }
-    const auto create = [&] {
-        device_chain.get<vk::DeviceCreateInfo>().enabledExtensionCount =
-            static_cast<u32>(enabled_extensions.size());
-        device_chain.get<vk::DeviceCreateInfo>().ppEnabledExtensionNames =
-            enabled_extensions.data();
-        return physical_device.createDeviceUnique(device_chain.get());
-    };
-    auto [device_result, dev] = create();
-    if (device_result != vk::Result::eSuccess && enabled_extensions.size() > own_extensions) {
-        // The driver advertises NGX's extensions but the device does not start with them:
-        // DLSS is optional, so retry without them and fall back to FSR 3.1.
-        LOG_WARNING(Render_Vulkan, "Device creation with the DLSS extensions failed ({}): "
-                    "again without them", vk::to_string(device_result));
-        if (dlss) {
-            dlss->Disable("the Vulkan device does not start with NGX's extensions");
-        }
-        enabled_extensions.resize(own_extensions);
-        auto retried = create();
-        device_result = retried.result;
-        dev = std::move(retried.value);
+    if (!shader_float8) {
+        device_chain.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+    }
+    if (!fsr4vk && !xess) {
+        device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();
+    }
+    if (!fsr4vk) {
+        device_chain.unlink<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
+    }
+
+    auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    if (device_result == vk::Result::eSuccess) {
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(*dev);
     }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
     }
     device = std::move(dev);
-
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
-
-    if (dlss) {
-        dlss->Initialize(*instance, physical_device, *device);
-    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

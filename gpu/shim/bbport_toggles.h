@@ -12,6 +12,7 @@
 extern "C" std::uint64_t runtime_disabled_optimizations;
 /// The second toggle word (BB_TOGGLE_FILE2): every bit of the first word is assigned.
 extern "C" std::uint64_t runtime_disabled_optimizations2;
+extern "C" std::uint64_t runtime_experiment_bits;
 
 namespace BbToggle {
 enum : std::uint64_t {
@@ -88,6 +89,11 @@ enum : std::uint64_t {
     DefensiveGuards = 1ull << 1,
     /// Pages written by the PS4 red-zone vertex generators stay writable (set: off).
     StickyFaultPages = 1ull << 2,
+    /// Additional runtime toggle bits placed past Word 1's assigned 64 bits.
+    Fsr4MotionYFlip = 1ull << 3,
+    CameraOwnInverse = 1ull << 6,
+    CameraYFlip = 1ull << 7,
+    Fsr4EncodedInput = 1ull << 8,
 };
 inline bool Disabled(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & bit) != 0;
@@ -95,6 +101,9 @@ inline bool Disabled(std::uint64_t bit) {
 /// Disabled(), for the switches in the second word.
 inline bool Disabled2(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) & bit) != 0;
+}
+inline bool Experiment(std::uint64_t bit) {
+    return (__atomic_load_n(&runtime_experiment_bits, __ATOMIC_RELAXED) & bit) != 0;
 }
 } // namespace BbToggle
 

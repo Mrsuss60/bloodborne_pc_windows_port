@@ -41,6 +41,17 @@ LIVE_FPS_CONFLICTS = {
 # then renders at 1920x1080 / ratio and the port's temporal upscaler restores the output size.
 OUTPUT_SIZE=(1920,1080)
 PRESET_SCALES=[1.0,1.5,1.7,2.0,3.0]
+PRESET_CUSTOM=len(PRESET_SCALES)
+
+
+def preset_scale(settings):
+    preset=int(settings.get('preset','0') or 0)
+    if preset==PRESET_CUSTOM:
+        try:
+            return min(3.0,max(1.0,float(settings.get('render_scale','1.3') or 1.3)))
+        except ValueError:
+            return 1.3
+    return PRESET_SCALES[max(0,min(preset,len(PRESET_SCALES)-1))]
 # The community patch changes two independent consumers: the game render/window setup
 # and the UI movie viewport. Keep the latter at native size so glyph rasterisation and
 # vector tessellation do not inherit the scene's FSR resolution.
@@ -127,7 +138,7 @@ def effect_patches(settings):
     # When a temporal upscaler or TAA is active, disable the game's native FXAA pass
     # to prevent double anti-aliasing (AA stacking blur), unless explicitly forced to '1'.
     upscaler = settings.get('upscaler', 'off').lower()
-    auto_disable_aa = upscaler in ('fsr3', 'fsr31', 'fsr4', 'fsr411', 'taa') and settings.get('effect_game_aa') != '1'
+    auto_disable_aa = upscaler in ('fsr3', 'fsr31', 'fsr4', 'fsr411', 'taa', 'dlss', 'fsr', 'xess') and settings.get('effect_game_aa') != '1'
     for key,(off,on) in EFFECTS.items():
         if key == 'effect_game_aa' and auto_disable_aa:
             if off and off not in names: names.append(off)
@@ -159,8 +170,7 @@ def render_size(settings,override=''):
         w,h=(int(v) for v in override.lower().split('x'))
         return (w,h)
     if settings.get('upscaler','fsr3')=='off': return None
-    preset=int(settings.get('preset','0') or 0)
-    scale=PRESET_SCALES[max(0,min(preset,len(PRESET_SCALES)-1))]
+    scale=preset_scale(settings)
     if scale==1.0: return None
     # Even sizes (the game has half-resolution buffers).
     return tuple(max(2,round(v/scale/2)*2) for v in OUTPUT_SIZE)
@@ -184,12 +194,12 @@ def scaled_sizes(settings):
     if out==OUTPUT_SIZE or settings.get('upscaler')=='taa': return None
     scale=1.0
     if settings.get('upscaler','fsr3')!='off':
-        preset=int(settings.get('preset','0') or 0)
-        scale=PRESET_SCALES[max(0,min(preset,len(PRESET_SCALES)-1))]
-    render=tuple(max(2,round(v/scale/2)*2) for v in out)
+        scale=preset_scale(settings)
+    scale=max(1.0,min(scale,out[0]/640,out[1]/360))
+    render=tuple(max(4,round(v/scale/4)*4) for v in out)
     # A scene of exactly 1920x1080 (4K Performance) is indistinguishable from the game's UI
     # coordinate space, which the port's UI composition recognizes by that size.
-    if render==OUTPUT_SIZE: render=(1916,1078)
+    if render==OUTPUT_SIZE: render=(1916,1076)
     return render,out
 
 

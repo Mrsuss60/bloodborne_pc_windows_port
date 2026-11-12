@@ -27,13 +27,37 @@ const char* KeyCodeToStorageName(int code);
 int StringToKeyCode(const char* name);
 void ResetKeybindsToDefaults();
 
-enum Upscaler : int { UpscalerOff = 0, UpscalerFsr3 = 1, UpscalerFsr4 = 2, UpscalerFsr411 = 3,
-                      UpscalerTaa = 4, UpscalerDlss = 5, UpscalerCount };
-/// FSR 4 v07 or FSR 4.1.1: the same inputs, settings and placement in the frame.
+enum Upscaler : int {
+    UpscalerOff = 0,
+    UpscalerFsr3 = 1,
+    UpscalerFsr4 = 2,
+    UpscalerFsr411 = 3,
+    UpscalerTaa = 4,
+    UpscalerDlss = 5,
+    UpscalerFsr = 6,
+    UpscalerXess = 7,
+    UpscalerCount
+};
+/// FSR 4 v07, FSR 4.1.1, or AMD FSR SDK (host-upscaled scene targets).
 inline bool IsFsr4(int upscaler) {
-    return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
+    return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411 || upscaler == UpscalerFsr;
 }
-enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
+inline bool IsFrameUpscaler(int upscaler) {
+    return IsFsr4(upscaler) || upscaler == UpscalerDlss || upscaler == UpscalerXess;
+}
+
+enum Preset : int {
+    NativeAA = 0,
+    Quality,
+    Balanced,
+    Performance,
+    UltraPerformance,
+    PresetCustom,
+    PresetCount
+};
+inline constexpr float RenderScaleMin = 1.0f, RenderScaleMax = 3.0f;
+inline constexpr float MipBiasMin = -2.0f, MipBiasMax = 1.0f;
+
 /// Texture quality (texture_quality in bbport.ini; BB_TEXTURE_QUALITY overrides): block-compressed
 /// materials reduced to save VRAM on GPUs with 2-4 GB.
 enum TextureQuality : int { TqAuto = 0, TqFull = 1, TqHalf = 2, TqQuarter = 3, TqCount = 4 };
@@ -46,9 +70,17 @@ inline const char* TextureQualityName(int quality) {
     default: return "auto";
     }
 }
-/// NVIDIA's DLSS render-preset hint (NVSDK_NGX_DLSS_Hint_Render_Preset): 0 = the driver's
-/// choice, 10 = J (less ghosting), 11 = K (the transformer model, recommended).
-enum DlssModel : int { DlssModelDefault = 0, DlssModelJ = 10, DlssModelK = 11 };
+
+/// NVIDIA's DLSS render-preset hint: -1 = Auto (by preset), 0 = DLL default, 5 = E, 6 = F,
+/// 10 = J, 11 = K (transformer), 12 = L, 13 = M.
+inline constexpr int DlssPresetDefault = 0, DlssPresetK = 11, DlssPresetMax = 26;
+inline constexpr int DlssPresetAuto = -1, DlssPresetL = 12, DlssPresetM = 13;
+int DlssPresetFromText(const char* text);
+const char* DlssPresetText(int preset);
+bool DlssPresetValid(int preset);
+/// Legacy alias kept until vk_dlss/vk_temporal_upscaler are updated to DlssPreset*.
+enum DlssModel : int { DlssModelDefault = DlssPresetDefault, DlssModelJ = 10, DlssModelK = DlssPresetK };
+
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 enum HudQuadrant : int { HudTopLeft = 0, HudTopRight = 1, HudBottomLeft = 2, HudBottomRight = 3, HudQuadrantCount };
 /// Language of the in-game menu (bbport.ini `language=en|ru`, BB_LANG overrides).
@@ -75,8 +107,10 @@ inline constexpr Effect Effects[] = {
     {"debug_menu", "Debug menu (needs the font files)", "Debug menu (нужны файлы шрифтов)", false},
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
+
 /// Persistent cheat slots (bbport.ini [Cheats]). The live cheat table uses ids 0..16.
 inline constexpr int CheatSlotCount = 32;
+
 /// Live output resolutions: the upscaler's output and the UI host targets.
 inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840};
 inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
@@ -86,7 +120,14 @@ inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 struct Values {
     std::atomic<int> upscaler{UpscalerOff};
     std::atomic<int> preset{NativeAA};
-    std::atomic<int> dlss_preset{DlssModelDefault};
+    std::atomic<int> dlss_preset{DlssPresetK};
+    std::atomic<int> dlss_applied_preset{-1};
+    std::atomic<bool> dlss_mip_bias{true};
+    std::atomic<bool> dlss_auto_exposure{false};
+    std::atomic<bool> dlss_jitter_fade{false};
+    std::atomic<bool> upscale_before_post{false};
+    std::atomic<float> render_scale{1.3f};
+    std::atomic<float> mip_bias{0.0f};
     std::atomic<bool> sharpen{true};
     std::atomic<float> sharpness{0.65f};
     std::atomic<bool> jitter{true};
@@ -95,6 +136,9 @@ struct Values {
     std::atomic<float> reactive_scale{1.0f};
     std::atomic<float> reactive_threshold{0.18f};
     std::atomic<float> reactive_max{0.9f};
+    std::atomic<float> fsr3_velocity_factor{1.0f}, fsr3_reactiveness_scale{1.0f},
+        fsr3_shading_change_scale{1.0f}, fsr3_accumulation{0.333f},
+        fsr3_min_disocclusion{-0.333f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
     std::atomic<bool> show_hud{false};
@@ -143,15 +187,16 @@ struct Values {
     std::atomic<int> live_resolution{0};
     /// Menu language (Language).
     std::atomic<int> language{LangEn};
-    /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
+    /// Why FSR 4 / upscaler cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
-    /// DLSS (gpu/dlss_bridge, NVIDIA RTX) is ready, or why not (null before the device exists).
-    std::atomic<bool> dlss_supported{false};
+    /// DLSS (NVIDIA RTX), AMD FSR SDK, and Intel XeSS support flags.
+    std::atomic<bool> dlss_supported{false}, fsr_sdk_supported{false}, xess_supported{false};
     std::atomic<const char*> dlss_problem{nullptr};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
+    float startup_render_scale = 1.3f;
     int startup_upscaler = UpscalerFsr3;
     bool startup_object_motion = true;
     bool startup_effects[EffectCount]{};
@@ -174,9 +219,10 @@ inline const char* Tr(const char* en, const char* ru) {
 void Load();
 /// Re-reads the ini file at run time to apply external changes in real time.
 void Reload();
-/// Checks the loaded choice before the first frame; unsupported FSR 4 uses FSR 3.1.
-void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
-/// The DLSS bridge/NGX state: unsupported DLSS uses FSR 3.1, like unsupported FSR 4.
+/// Checks the loaded choice before the first frame; unsupported choices fall back safely.
+void ConfigureUpscalerSupport(bool fsr4, bool fsr411, bool dlss = false, bool fsr_sdk = false,
+                              bool fsr4_to_sdk = false, bool xess = false);
+/// Compatibility wrapper; superseded by ConfigureUpscalerSupport once callers are updated.
 void ConfigureDlssSupport(bool available, const char* problem);
 /// Startup-patched scene dimensions cannot change until run.sh prepares a new image.
 bool FixedRenderSession();
@@ -193,6 +239,7 @@ void Save();
 /// Render resolution divisor of a preset (1.0 native, 1.5 quality, ...).
 float PresetScale(int preset);
 const char* PresetName(int preset);
+int ModelPreset(int preset);
 const char* UpscalerName(int upscaler);
 
 } // namespace BbSettings

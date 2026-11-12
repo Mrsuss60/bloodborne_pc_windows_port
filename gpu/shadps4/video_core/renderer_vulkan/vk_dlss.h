@@ -1,77 +1,39 @@
-// SPDX-FileCopyrightText: Copyright 2026 IFreemz, bbport contributors
 // SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: NVIDIA DLSS Super Resolution as an alternative to FSR 3.1/4, through the NGX core the
+// NVIDIA driver installs (_nvngx.dll, libnvidia-ngx.so.1), loaded at run time: no NVIDIA SDK
+// headers or libraries at build time. The DLSS model itself is NVIDIA's redistributable
+// nvngx_dlss.dll / libnvidia-ngx-dlss.so (tools/fetch_dlss.sh), searched next to the
+// executable and in BB_DLSS_DIR.
 //
-// bbport: NVIDIA DLSS Super Resolution through the optional bridge (gpu/dlss_bridge, MIT;
-// bbport_dlss.dll), loaded at run time from next to bb-probe together with NVIDIA's
-// nvngx_dlss.dll. The port itself contains no NVIDIA code; without the libraries, on other GPUs
-// or with BB_DLSS=0 nothing changes. Adapted from IFreemz/shadPS4-Bloodborne-DLSS-FSR
-// (vk_dlss_ngx).
+// It consumes the FSR 4 frame (vk_fsr4.h): scene color, depth, motion vectors in render pixels
+// (previous - current, without jitter) and the jitter offset; the output is written in General.
 
 #pragma once
 
 #include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
-
-#include "common/types.h"
-#include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_fsr4.h"
 
 namespace Vulkan {
 
-class Dlss {
+class Instance;
+class Scheduler;
+
+class DlssUpscaler {
 public:
-    /// The process-wide instance, or null when the DLLs are absent or BB_DLSS=0.
-    static Dlss* Get();
-    ~Dlss();
+    DlssUpscaler(const Instance& instance, Scheduler& scheduler);
+    ~DlssUpscaler();
 
-    /// Instance and device creation: adds what NGX needs (or disables DLSS when it is missing).
-    void AppendInstanceExtensions(std::vector<const char*>& enabled);
-    void AppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
-                                std::vector<const char*>& enabled);
-    /// After the device exists.
-    void Initialize(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device);
-    /// The device could not be created with NGX's extensions (the driver advertises them, but
-    /// what they load is missing): DLSS off, FSR 3.1 instead.
-    void Disable(std::string_view reason);
-    void Shutdown();
+    /// NGX initialized and DLSS Super Resolution is available on this GPU and driver.
+    [[nodiscard]] bool Available() const noexcept;
 
-    [[nodiscard]] bool Available() const;
-    /// Why DLSS cannot run on this system (empty when it can, or before device creation).
-    [[nodiscard]] std::string Problem() const;
+    /// Records DLSS into `frame.cmdbuf` (the frame's preset picks the DLSS quality mode).
+    /// False when DLSS cannot run; Problem() says why.
+    bool Record(const Fsr4Upscaler::Frame& frame);
 
-    struct Resource {
-        vk::Image image;
-        vk::ImageView view;
-        vk::Format format;
-        vk::ImageAspectFlags aspect;
-        u32 width, height;
-    };
-    struct FeatureDesc {
-        u32 input_width, input_height, output_width, output_height;
-        int quality;
-        u32 preset; ///< NVSDK_NGX_DLSS_Hint_Render_Preset (0 default, 10 J, 11 K)
-        bool hdr;
-        bool operator==(const FeatureDesc&) const = default;
-    };
-    struct Frame {
-        Resource color, depth, motion, output;
-        float jitter_x, jitter_y;
-        bool reset;
-        float frame_ms;
-        float sharpness;
-    };
-
-    /// DLSS quality mode for an output/render size ratio (0 DLAA .. 4 Ultra Performance).
-    static int QualityForScale(float scale);
-    [[nodiscard]] bool HasFeature(const FeatureDesc& desc) const;
-    /// Records the feature creation. The GPU must be done with the previous one.
-    bool CreateFeature(vk::CommandBuffer command, const FeatureDesc& desc);
-    bool Evaluate(vk::CommandBuffer command, const Frame& frame);
-    void ReleaseFeature();
+    [[nodiscard]] const char* Problem() const noexcept;
+    [[nodiscard]] bool Fatal() const noexcept;
 
 private:
-    Dlss();
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

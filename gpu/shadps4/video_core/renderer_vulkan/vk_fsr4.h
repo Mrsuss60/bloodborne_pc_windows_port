@@ -29,6 +29,7 @@ public:
         vk::Image image;
         vk::ImageView view;
         u32 width, height;
+        vk::Format format = vk::Format::eUndefined; ///< needed by DLSS (vk_dlss.h)
     };
     struct Frame {
         vk::CommandBuffer cmdbuf;
@@ -39,16 +40,29 @@ public:
         float frame_ms, near_plane, far_plane, vertical_fov;
         float sharpness;
         bool sharpen, reset, auto_exposure;
+        /// bbport: the R8 reactive mask at render size, or none (view null). DLSS takes it as its
+        /// bias-current-colour mask; FSR 4 does not read it (RecordFsr4Reactive blends after).
+        Image reactive{};
     };
 
     /// Records FSR 4 into `frame.cmdbuf`; the output stays in General. False when FSR 4
     /// cannot run (Problem() says why; missing assets or device features are permanent).
     bool Record(const Frame& frame);
 
+    /// Starts building the model for `preset` and that output size on a worker thread, so the
+    /// first frame that asks for FSR 4 finds it ready (building it compiles its passes, ~20 s the
+    /// first time on some drivers). Nothing if one is built or being built already.
+    void Prewarm(int preset, u32 output_width, u32 output_height);
+    /// The model is being built in the background: Record returns false (not fatal) until it is
+    /// done, and the caller keeps FSR 3.1 on screen meanwhile.
+    [[nodiscard]] bool Preparing() const noexcept;
+
     /// Why the last Record failed, or null.
     [[nodiscard]] const char* Problem() const noexcept;
     /// Assets or device features are missing: FSR 4 will not run in this session.
     [[nodiscard]] bool Fatal() const noexcept;
+    /// bbport: forgets a failure (FSR 4.1.1 failed: the built-in FSR 4 model is tried next).
+    void ClearFailure() noexcept;
 
 private:
     struct Impl;

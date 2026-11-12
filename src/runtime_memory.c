@@ -828,12 +828,15 @@ uint64_t runtime_disabled_optimizations;
 /* The second toggle word: the first has all 64 bits assigned (gpu/shim/bbport_toggles.h), so
  * the switches added after it are read from BB_TOGGLE_FILE2, same format, same 250 ms poll. */
 uint64_t runtime_disabled_optimizations2;
+/* Optional experiment mask (optional second number in BB_TOGGLE_FILE). */
+uint64_t runtime_experiment_bits;
 __thread RuntimeRecoverBuf *runtime_fault_recover;
 static void *toggle_watcher(void *path) {
     for (unsigned long long last=ULLONG_MAX;;) {
         FILE *f=fopen(path,"r");
-        unsigned long long value=0;
-        if (f) { if (fscanf(f,"%llu",&value)!=1) value=0; fclose(f); }
+        unsigned long long value=0, experiment=0;
+        if (f) { if (fscanf(f,"%llu %llu",&value,&experiment)<1) value=0; fclose(f); }
+        __atomic_store_n(&runtime_experiment_bits,(uint64_t)experiment,__ATOMIC_RELEASE);
         if (value!=last) {
             __atomic_store_n(&runtime_disabled_optimizations,(uint64_t)value,__ATOMIC_RELEASE);
             printf("Runtime: disabled optimizations mask=%llu\n",value);

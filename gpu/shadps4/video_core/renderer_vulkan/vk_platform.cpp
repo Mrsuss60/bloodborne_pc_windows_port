@@ -23,6 +23,8 @@
 #endif
 #endif
 
+#include <algorithm>
+#include <string>
 #include <vector>
 #include <fmt/ranges.h>
 
@@ -31,8 +33,8 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
-#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
 #ifdef _WIN32
 #include "platform/win32/nvidia_profile.h"
 #endif
@@ -304,8 +306,20 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
     auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
-    if (Dlss* dlss = Dlss::Get()) {
-        dlss->AppendInstanceExtensions(extensions); // the optional DLSS bridge needs its own
+    // bbport: Intel XeSS-SR (vk_xess.h) names the instance extensions it needs, when libxess.dll is
+    // installed; none on current drivers.
+    u32 xess_api_version = 0;
+    for (const char* extension : Xess::RequiredInstanceExtensions(&xess_api_version)) {
+        if (std::ranges::none_of(extensions, [&](const char* name) {
+                return std::string_view(name) == extension;
+            })) {
+            extensions.push_back(extension);
+        }
+    }
+    if (xess_api_version > available_version) {
+        LOG_WARNING(Render_Vulkan, "XeSS needs Vulkan {}.{}; the instance has {}.{}",
+                    VK_VERSION_MAJOR(xess_api_version), VK_VERSION_MINOR(xess_api_version),
+                    VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
     }
 
     const vk::ApplicationInfo application_info = {
@@ -434,10 +448,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     };
 
     auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
+    if (instance_result == vk::Result::eSuccess) {
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(*instance);
+    }
     ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
                vk::to_string(instance_result));
-
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(*instance);
 
     return std::move(instance);
 }

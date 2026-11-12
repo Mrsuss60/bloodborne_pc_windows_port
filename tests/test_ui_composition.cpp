@@ -16,9 +16,17 @@ int main() {
     assert(Choose(false, true, true, true) == Background::None);
     assert(NativeViewport(1920, -1080));
     assert(!NativeViewport(960, -540));
+    assert(SceneHasUiViewportSize(1916, 1076));
+    assert(!SceneHasUiViewportSize(2560, 1440));
     assert(MovieShader(0x34e8a281) && MovieShader(0x24042a9b));
     assert(!MovieShader(0x0b0acf50)); // fullscreen post/tonemap also has a native viewport
     assert(!MovieShader(0x6c62a79f)); // shadow geometry
+    assert(ObserveDraw(0, 0xa400228b, true));
+    assert(ObserveDraw(0, 0x34e8a281, true));
+    assert(ObserveDraw(1, 0x44072322, true));
+    assert(!ObserveDraw(0, 0x6c62a79f, true));
+    assert(!ObserveDraw(0, 0xa400228b, false));
+    assert(!ObserveDraw(3, 0xa400228b, true));
     const auto display = Scale(960, 540, 1920, 1080, false);
     assert(display[0] == 2 && display[1] == 2);
     const auto ui = Scale(960, 540, 1920, 1080, true);

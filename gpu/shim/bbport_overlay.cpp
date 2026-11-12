@@ -488,9 +488,10 @@ void Checkbox(const char* label, std::atomic<bool>& value) {
     Store(value, v, ImGui::Checkbox(label, &v));
 }
 
-void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
+void Slider(const char* label, std::atomic<float>& value, float lo, float hi,
+            const char* format = "%.2f") {
     float v = value;
-    Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, "%.2f"));
+    Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, format));
 }
 
 void Hint(const char* text) {
@@ -522,18 +523,24 @@ void Menu() {
                 frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg);
 
     ImGui::SeparatorText(Tr("Temporal upscaler", "Временной апскейлер"));
-    const char* const upscalers[] = {Tr("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)",
+    const char* const upscalers[] = {Tr("Off", "Выкл"),
+                                     "FSR 3.1",
+                                     "FSR 4 (INT8)",
                                      "FSR 4.1.1 (INT8)",
                                      Tr("TAA (native anti-aliasing)", "TAA (нативное сглаживание)"),
-                                     "DLSS (NVIDIA RTX)"};
+                                     "DLSS (NVIDIA RTX)",
+                                     "FSR (AMD FSR SDK)",
+                                     "XeSS (Intel)"};
     static_assert(sizeof(upscalers) / sizeof(upscalers[0]) == BbSettings::UpscalerCount);
-    static const char* later[] = {"XeSS"};
-    int upscaler = s.upscaler;
+    const int upscaler = std::clamp(s.upscaler.load(), 0, BbSettings::UpscalerCount - 1);
     if (ImGui::BeginCombo(Tr("Upscaler", "Апскейлер"), upscalers[upscaler])) {
         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
-            const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
-                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
-                : i == BbSettings::UpscalerDlss ? s.dlss_supported.load() : true;
+            const bool supported = i == BbSettings::UpscalerFsr4    ? s.fsr4_supported.load()
+                                 : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                                 : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load()
+                                 : i == BbSettings::UpscalerFsr    ? s.fsr_sdk_supported.load()
+                                 : i == BbSettings::UpscalerXess   ? s.xess_supported.load()
+                                                                   : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
                 Store(s.upscaler, i, true);
@@ -541,24 +548,34 @@ void Menu() {
             ImGui::EndDisabled();
             if (!supported) {
                 ImGui::SameLine();
-                ImGui::TextDisabled("%s", Tr("— not supported by the graphics card",
-                                             "— не поддерживается видеокартой"));
+                const bool use_sdk = i == BbSettings::UpscalerFsr4 && s.fsr_sdk_supported.load();
+                ImGui::TextDisabled("%s", use_sdk ? Tr("— too slow on this GPU: use FSR (AMD FSR SDK)",
+                                                       "— слишком медленно на этой видеокарте: выберите FSR (AMD FSR SDK)")
+                                                  : Tr("— not supported by the graphics card",
+                                                       "— не поддерживается видеокартой"));
             }
-        }
-        for (const char* name : later) {
-            ImGui::BeginDisabled();
-            ImGui::Selectable(name, false);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", Tr("— in development", "— в работе"));
         }
         ImGui::EndCombo();
     }
-    if (s.upscaler == BbSettings::UpscalerDlss) {
-        Hint(Tr("NVIDIA DLSS Super Resolution (RTX GPUs; Native AA is DLAA). Needs the DLSS bridge "
-                "and NVIDIA's library next to the game; otherwise FSR 3.1 is used.",
-                "NVIDIA DLSS Super Resolution (видеокарты RTX; Native AA — это DLAA). Нужны мост "
-                "DLSS и библиотека NVIDIA рядом с игрой; без них используется FSR 3.1."));
+    if (s.upscaler == BbSettings::UpscalerXess) {
+        Hint(Tr("Intel XeSS Super Resolution (XeSS SDK 3.0.2): the XMX model on Intel Arc, the DP4a "
+                "model on other GPUs. The preset picks the render size; XeSS takes the quality mode "
+                "nearest to it. Windows only; needs libxess.dll next to the game or in xess/.",
+                "Intel XeSS Super Resolution (XeSS SDK 3.0.2): модель XMX на Intel Arc, модель DP4a "
+                "на остальных видеокартах. Пресет задаёт разрешение рендера; XeSS берёт ближайший к "
+                "нему режим качества. Только Windows; нужен libxess.dll рядом с игрой или в xess/."));
+    } else if (s.upscaler == BbSettings::UpscalerFsr) {
+        Hint(Tr("AMD's own FSR from the FSR SDK 2.4: FSR 4.1.2 on Radeon RX 6000 and newer and on "
+                "Ryzen APUs that AMD supports (FP8 on RX 9000, INT8 on RX 6000/7000, a lighter INT8 "
+                "model on some APUs), FSR 3.1.6 on other GPUs. The SDK picks the model by itself.",
+                "Собственный FSR от AMD из FSR SDK 2.4: FSR 4.1.2 на Radeon RX 6000 и новее и на "
+                "поддерживаемых AMD процессорах Ryzen (FP8 на RX 9000, INT8 на RX 6000/7000, облегчённая "
+                "модель INT8 на некоторых APU), FSR 3.1.6 на остальных видеокартах. Модель SDK выбирает сам."));
+    } else if (s.upscaler == BbSettings::UpscalerDlss) {
+        Hint(Tr("NVIDIA DLSS Super Resolution (RTX GPUs; Native AA is DLAA). Needs "
+                "nvngx_dlss.dll next to the game; otherwise FSR 3.1 is used.",
+                "NVIDIA DLSS Super Resolution (видеокарты RTX; Native AA — это DLAA). Нужна "
+                "библиотека nvngx_dlss.dll рядом с игрой; без неё используется FSR 3.1."));
     }
     if (const char* problem = s.dlss_problem.load();
         problem && s.upscaler == BbSettings::UpscalerDlss) {
@@ -570,8 +587,8 @@ void Menu() {
     }
     if (const char* problem = s.fsr4_problem.load()) {
         ImGui::PushTextWrapPos();
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), Tr("FSR 4 unavailable: %s", "FSR 4 недоступен: %s"),
-                           problem);
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                           Tr("Upscaler unavailable: %s", "Апскейлер недоступен: %s"), problem);
         if (!BbSettings::IsFsr4(s.upscaler))
             ImGui::TextUnformatted(Tr("The mode chosen above is active. You can select FSR 4 again.",
                                       "Активен режим, выбранный выше. FSR 4 можно выбрать снова."));
@@ -605,7 +622,8 @@ void Menu() {
     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
     ImGui::BeginDisabled(!upscaler_on);
     ImGui::BeginDisabled(taa);
-    int preset = taa ? BbSettings::NativeAA : s.preset.load();
+    const int preset = taa ? BbSettings::NativeAA
+                           : std::clamp(s.preset.load(), 0, BbSettings::PresetCount - 1);
     char preset_label[64];
     std::snprintf(preset_label, sizeof(preset_label), "%s (x%.1f)", BbSettings::PresetName(preset),
                   BbSettings::PresetScale(preset));
@@ -613,11 +631,11 @@ void Menu() {
         for (int i = 0; i < BbSettings::PresetCount; ++i) {
             char label[64];
             const float scale = BbSettings::PresetScale(i);
-            const int output = s.output_res;
+            const int output = std::clamp(s.output_res.load(), 0, BbSettings::OutputCount - 1);
             std::snprintf(label, sizeof(label), Tr("%s (x%.1f, render %dx%d)", "%s (x%.1f, рендер %dx%d)"),
                           BbSettings::PresetName(i), scale,
-                          int(std::lround(BbSettings::OutputWidths[output] / scale / 2) * 2),
-                          int(std::lround(BbSettings::OutputHeights[output] / scale / 2) * 2));
+                          int(std::lround(BbSettings::OutputWidths[output] / scale / 4) * 4),
+                          int(std::lround(BbSettings::OutputHeights[output] / scale / 4) * 4));
             if (ImGui::Selectable(label, i == preset)) {
                 Store(s.preset, i, true);
             }
@@ -625,37 +643,99 @@ void Menu() {
         ImGui::EndCombo();
     }
     ImGui::EndDisabled();
+    if (!taa && s.preset == BbSettings::PresetCustom) {
+        Slider(Tr("Render scale (Custom)", "Масштаб рендера (Custom)"), s.render_scale,
+               BbSettings::RenderScaleMin, BbSettings::RenderScaleMax, "x%.2f");
+        Hint(Tr("Output / render size for the Custom preset: 1.00 renders at the output (DLAA, Native "
+                "AA), 1.30 is between Native and Quality, 3.00 is Ultra Performance. FSR 4 and DLSS run "
+                "the model of the nearest preset. Ctrl+click to type a value.",
+                "Отношение вывода к рендеру для пресета Custom: 1.00 — рендер в разрешении вывода "
+                "(DLAA, Native AA), 1.30 — между Native и Quality, 3.00 — Ultra Performance. FSR 4 и "
+                "DLSS берут модель ближайшего пресета. Ctrl+клик — ввести значение."));
+    }
     if (s.upscaler == BbSettings::UpscalerDlss) {
-        static constexpr int models[] = {BbSettings::DlssModelDefault, BbSettings::DlssModelK,
-                                         BbSettings::DlssModelJ};
-        static constexpr const char* names_en[] = {"Driver default",
-                                                   "K (transformer, recommended)",
-                                                   "J (transformer, less ghosting)"};
-        static constexpr const char* names_ru[] = {"По умолчанию (драйвер)",
-                                                   "K (transformer, рекомендуется)",
-                                                   "J (transformer, меньше шлейфов)"};
-        const int current = s.dlss_preset.load();
-        int selected = 0;
-        for (int i = 0; i < 3; ++i) {
-            if (models[i] == current) {
+        static constexpr int presets[] = {BbSettings::DlssPresetAuto, 11, 10, 13, 12, 5, 6,
+                                          BbSettings::DlssPresetDefault};
+        const char* names[] = {
+            Tr("Auto: K, M for Performance, L for Ultra Performance",
+               "Авто: K, M для Performance, L для Ultra Performance"),
+            Tr("K: transformer (default)", "K: трансформер (по умолчанию)"),
+            Tr("J: transformer", "J: трансформер"),
+            Tr("M: transformer, 2nd generation", "M: трансформер 2-го поколения"),
+            Tr("L: transformer, 2nd generation (Ultra Performance)",
+               "L: трансформер 2-го поколения (Ultra Performance)"),
+            Tr("E: CNN", "E: CNN"),
+            Tr("F: CNN (Ultra Performance, DLAA)", "F: CNN (Ultra Performance, DLAA)"),
+            Tr("The DLL's default", "По умолчанию DLL"),
+        };
+        const int current = s.dlss_preset;
+        int selected = -1;
+        for (int i = 0; i < int(sizeof(presets) / sizeof(presets[0])); ++i) {
+            if (presets[i] == current) {
                 selected = i;
             }
         }
-        if (ImGui::BeginCombo(Tr("DLSS model preset", "Пресет модели DLSS"),
-                              Tr(names_en[selected], names_ru[selected]))) {
-            for (int i = 0; i < 3; ++i) {
-                if (ImGui::Selectable(Tr(names_en[i], names_ru[i]), i == selected)) {
-                    Store(s.dlss_preset, models[i], true);
+        char other[48];
+        std::snprintf(other, sizeof(other), "%s %c", Tr("Preset", "Пресет"),
+                      char('A' + std::clamp(current, 1, BbSettings::DlssPresetMax) - 1));
+        if (ImGui::BeginCombo(Tr("DLSS model", "Модель DLSS"),
+                              selected >= 0 ? names[selected] : other)) {
+            for (int i = 0; i < int(sizeof(presets) / sizeof(presets[0])); ++i) {
+                if (ImGui::Selectable(names[i], i == selected)) {
+                    Store(s.dlss_preset, presets[i], true);
                 }
             }
             ImGui::EndCombo();
         }
-        Hint(Tr("NVIDIA's render-preset hint: K is the transformer model (best quality, the "
-                "driver default on recent versions), J is similar with less ghosting but more "
-                "flicker. The change applies from the next frame.",
-                "Подсказка NVIDIA о пресете рендера: K — transformer-модель (лучшее качество, "
-                "по умолчанию в новых драйверах), J похож, но меньше шлейфов и больше мерцания. "
-                "Изменение применяется со следующего кадра."));
+        Hint(Tr("Which NVIDIA model DLSS runs; it changes at once (a brief pause). K keeps thin and moving "
+                "objects steadier; E is a little faster on RTX 20 and 30 cards but softer in motion. M and L "
+                "need a DLSS 4.5 nvngx_dlss.dll (310.5 or newer). A preset the DLL refuses runs its default.",
+                "Какую модель NVIDIA запускает DLSS; меняется сразу (короткая пауза). K устойчивее на тонких "
+                "и движущихся объектах; E чуть быстрее на RTX 20 и 30, но мягче в движении. Для M и L нужен "
+                "nvngx_dlss.dll из DLSS 4.5 (310.5 или новее). Пресет, который DLL не принимает, заменяется "
+                "её пресетом по умолчанию."));
+        const int applied = s.dlss_applied_preset;
+        if (applied > 0) {
+            ImGui::TextDisabled(Tr("Running: preset %c", "Работает: пресет %c"), char('A' + applied - 1));
+        } else if (applied == 0) {
+            ImGui::TextDisabled("%s", Tr("Running: the DLL's default preset",
+                                         "Работает: пресет DLL по умолчанию"));
+        }
+        if (applied == 0 && current != BbSettings::DlssPresetDefault && current != BbSettings::DlssPresetAuto) {
+            ImGui::PushTextWrapPos();
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                               Tr("This DLSS version refuses preset %c: its default runs",
+                                  "Эта версия DLSS не принимает пресет %c: работает её пресет"),
+                               char('A' + std::clamp(current, 1, BbSettings::DlssPresetMax) - 1));
+            ImGui::PopTextWrapPos();
+        }
+        Checkbox(Tr("DLSS: auto exposure", "DLSS: авто-экспозиция"), s.dlss_auto_exposure);
+        Hint(Tr("DLSS works out the frame's exposure itself, for the game's tonemapped frame too (the HDR "
+                "scene at 1080p always has it). Can steady dark scenes that ghost. Live (a brief pause).",
+                "DLSS сам определяет экспозицию кадра, и для готового кадра игры (HDR-сцена при 1080p — "
+                "всегда). Может успокоить тёмные сцены с гостингом. Меняется сразу (короткая пауза)."));
+        Checkbox(Tr("Upscale before post-processing (experimental)",
+                    "Апскейл до постобработки (эксперимент)"),
+                 s.upscale_before_post);
+        Hint(Tr("Outputs other than 1080p: the upscaler takes the HDR scene before the game's post-processing, as "
+                "NVIDIA's DLSS guide asks, and the post runs at the output size. Uses more GPU time and memory. "
+                "Applies after a restart.",
+                "Вывод не 1080p: апскейлер берёт HDR-сцену до постобработки игры, как просит руководство NVIDIA "
+                "по DLSS, а постобработка идёт в разрешении вывода. Больше нагрузка на GPU и память. Применяется "
+                "после перезапуска."));
+        Checkbox(Tr("DLSS: less wobble while turning (experimental)",
+                    "DLSS: меньше дрожания при поворотах (эксперимент)"),
+                 s.dlss_jitter_fade);
+        Hint(Tr("Fades the sub-pixel jitter out while the camera moves. The image holds steadier, but NVIDIA's "
+                "DLSS guide warns against jitter only on a still camera. Off: as the guide asks. Live.",
+                "Убирает субпиксельный jitter, пока камера движется. Картинка стабильнее, но руководство NVIDIA "
+                "по DLSS предостерегает от jitter только при неподвижной камере. Выкл.: как в руководстве. Меняется сразу."));
+        Checkbox(Tr("DLSS: sharper textures (mip bias -1)", "DLSS: чётче текстуры (mip bias -1)"),
+                 s.dlss_mip_bias);
+        Hint(Tr("Textures one mip level sharper than the render resolution alone gives, as NVIDIA's DLSS "
+                "guide asks. Off: only the render-to-output ratio. Live.",
+                "Текстуры на один mip-уровень чётче, чем даёт само разрешение рендера, как советует "
+                "руководство NVIDIA по DLSS. Выкл.: только соотношение рендера и вывода. Меняется сразу."));
     }
     if (taa) {
         ImGui::TextWrapped("%s", Tr("TAA smooths the scene at the output resolution, without the FSR "
@@ -702,11 +782,73 @@ void Menu() {
             "До 1 — резкость самого апскейлера (RCAS). Выше 1 добавляется ещё один проход RCAS. "
             "Ctrl+клик по ползунку — ввести точное значение."));
     ImGui::EndDisabled();
+    Slider(Tr("Texture mip bias", "Mip bias текстур"), s.mip_bias,
+           BbSettings::MipBiasMin, BbSettings::MipBiasMax, "%+.2f");
+    Hint(Tr("Added to the texture detail the upscaler already asks for (the render-to-output ratio, "
+            "and DLSS's extra level): below 0 sharper textures (more shimmer), above 0 softer. 0: "
+            "the upscaler's own. Live.",
+            "Добавляется к детализации текстур, которую уже задаёт апскейлер (соотношение рендера и "
+            "вывода и лишний уровень DLSS): меньше 0 — чётче (больше мерцания), больше 0 — мягче. 0 — "
+            "как у апскейлера. Меняется сразу."));
     Checkbox(Tr("Sub-pixel shift (jitter)", "Субпиксельный сдвиг (jitter)"), s.jitter);
     Hint(Tr("Every frame the scene is shifted by a fraction of a pixel, and the upscaler gathers "
             "more detail from several frames. Without it you only get history-based smoothing.",
             "Каждый кадр сцена сдвигается на долю пикселя, и апскейлер собирает из нескольких "
             "кадров больше деталей. Без него получается только сглаживание по истории."));
+
+    if (s.upscaler == BbSettings::UpscalerFsr3) {
+        ImGui::SeparatorText(Tr("FSR 3.1 tuning", "Настройка FSR 3.1"));
+        struct Tuning {
+            const char* en;
+            const char* ru;
+            float velocity, reactiveness, shading, accumulation, disocclusion;
+        };
+        static constexpr Tuning presets[] = {
+            {"Default (AMD's)", "По умолчанию (AMD)", 1.0f, 1.0f, 1.0f, 0.333f, -0.333f},
+            {"Steady bright pixels", "Стабильные яркие пиксели", 0.5f, 1.0f, 1.0f, 0.333f, -0.333f},
+            {"Less ghosting", "Меньше шлейфов", 1.0f, 1.5f, 1.5f, 0.25f, -0.333f},
+            {"Less flicker", "Меньше мерцания", 1.0f, 1.0f, 1.0f, 0.4f, -0.1f},
+        };
+        int t_index = -1;
+        for (int i = 0; i < int(sizeof(presets) / sizeof(presets[0])); ++i) {
+            const auto& p = presets[i];
+            const auto is_near = [](float a, float b) { return std::abs(a - b) < 0.0005f; };
+            if (is_near(s.fsr3_velocity_factor, p.velocity) &&
+                is_near(s.fsr3_reactiveness_scale, p.reactiveness) &&
+                is_near(s.fsr3_shading_change_scale, p.shading) &&
+                is_near(s.fsr3_accumulation, p.accumulation) &&
+                is_near(s.fsr3_min_disocclusion, p.disocclusion)) {
+                t_index = i;
+            }
+        }
+        if (ImGui::BeginCombo(Tr("Tuning preset", "Профиль настройки"),
+                              t_index >= 0 ? Tr(presets[t_index].en, presets[t_index].ru)
+                                           : Tr("Custom", "Своё"))) {
+            for (int i = 0; i < int(sizeof(presets) / sizeof(presets[0])); ++i) {
+                if (ImGui::Selectable(Tr(presets[i].en, presets[i].ru), i == t_index)) {
+                    Store(s.fsr3_velocity_factor, presets[i].velocity, true);
+                    Store(s.fsr3_reactiveness_scale, presets[i].reactiveness, true);
+                    Store(s.fsr3_shading_change_scale, presets[i].shading, true);
+                    Store(s.fsr3_accumulation, presets[i].accumulation, true);
+                    Store(s.fsr3_min_disocclusion, presets[i].disocclusion, true);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        Hint(Tr("FSR 3.1's own tuning parameters. Steady bright pixels: lamps and sparks shimmer "
+                "less in motion. Less ghosting: fewer trails behind moving things, thin details flicker a "
+                "little more. Less flicker: thin swaying things (grass, hair) flicker less, a little more "
+                "ghosting.",
+                "Собственные параметры настройки FSR 3.1. Стабильные яркие пиксели: фонари и искры "
+                "меньше мерцают в движении. Меньше шлейфов: меньше следов за движущимся, тонкие детали "
+                "мерцают чуть больше. Меньше мерцания: тонкое (трава, волосы) мерцает меньше, шлейфов "
+                "чуть больше."));
+        Slider(Tr("Velocity factor", "Учёт скорости"), s.fsr3_velocity_factor, 0.0f, 1.0f, "%.2f");
+        Slider(Tr("Reactiveness", "Реактивность"), s.fsr3_reactiveness_scale, 0.0f, 4.0f, "%.2f");
+        Slider(Tr("Shading change", "Изменение освещения"), s.fsr3_shading_change_scale, 0.0f, 4.0f, "%.2f");
+        Slider(Tr("Accumulation per frame", "Накопление за кадр"), s.fsr3_accumulation, 0.0f, 1.0f, "%.3f");
+        Slider(Tr("Disocclusion accumulation", "Накопление при раскрытии"), s.fsr3_min_disocclusion, -1.0f, 1.0f, "%.3f");
+    }
 
     ImGui::SeparatorText(Tr("Reactive mask", "Маска реактивности"));
     ImGui::BeginDisabled(taa);
@@ -715,6 +857,26 @@ void Menu() {
             "frames. Fewer trails behind effects, but shimmer returns under them.",
             "Помечает прозрачные эффекты (частицы, дымку), чтобы апскейлер меньше опирался на "
             "прошлые кадры. Меньше шлейфов за эффектами, но под ними возвращается дрожание."));
+    {
+        const char* use = s.upscaler == BbSettings::UpscalerFsr3
+                              ? Tr("FSR 3.1 uses it as its reactive mask.",
+                                   "FSR 3.1 берёт её как свою реактивную маску.")
+                          : s.upscaler == BbSettings::UpscalerXess
+                              ? Tr("XeSS uses it as its responsive pixel mask.",
+                                   "XeSS берёт её как маску отзывчивых пикселей.")
+                          : s.upscaler == BbSettings::UpscalerDlss
+                              ? Tr("Current DLSS models do not use it, only the deprecated preset F.",
+                                   "Текущие модели DLSS её не используют, только устаревший пресет F.")
+                          : BbSettings::IsFsr4(s.upscaler)
+                              ? Tr("FSR 4 has no mask input: the marked pixels are blended with "
+                                   "this frame after it.",
+                                   "У FSR 4 нет входа для маски: отмеченные пиксели смешиваются "
+                                   "с текущим кадром после него.")
+                              : Tr("TAA does not use it.", "TAA её не использует.");
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("%s", use);
+        ImGui::PopTextWrapPos();
+    }
     ImGui::BeginDisabled(!s.reactive);
     Slider(Tr("Scale", "Масштаб"), s.reactive_scale, 0.0f, 4.0f);
     Slider(Tr("Threshold", "Порог"), s.reactive_threshold, 0.0f, 1.0f);
@@ -1272,11 +1434,14 @@ void FpsCounter() {
     const auto& s = BbSettings::Get();
     ImGui::Text(Tr("%.0f FPS  %.1f ms  %s", "%.0f FPS  %.1f мс  %s"),
                 frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg,
-                s.upscaler == BbSettings::UpscalerFsr3   ? "FSR 3.1"
-                : s.upscaler == BbSettings::UpscalerFsr4 ? "FSR 4"
+                s.upscaler == BbSettings::UpscalerFsr3     ? "FSR 3.1"
+                : s.upscaler == BbSettings::UpscalerFsr4   ? "FSR 4"
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
-                : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
-                                                         : "");
+                : s.upscaler == BbSettings::UpscalerFsr    ? "FSR"
+                : s.upscaler == BbSettings::UpscalerXess   ? "XeSS"
+                : s.upscaler == BbSettings::UpscalerDlss   ? "DLSS"
+                : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
+                                                           : "");
     ImGui::End();
 }
 
@@ -1326,11 +1491,14 @@ void HudOverlay() {
 
         // 1. Performance: FPS & Frametime
         const float cur_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
-        const char* upscaler_label = s.upscaler == BbSettings::UpscalerFsr3   ? " [FSR 3.1]"
-                                   : s.upscaler == BbSettings::UpscalerFsr4 ? " [FSR 4]"
-                                   : s.upscaler == BbSettings::UpscalerFsr411 ? " [FSR 4.1.1]"
-                                   : s.upscaler == BbSettings::UpscalerTaa ? " [TAA]"
-                                   : "";
+        const char* upscaler_label = s.upscaler == BbSettings::UpscalerFsr3     ? " [FSR 3.1]"
+                                   : s.upscaler == BbSettings::UpscalerFsr4     ? " [FSR 4]"
+                                   : s.upscaler == BbSettings::UpscalerFsr411   ? " [FSR 4.1.1]"
+                                   : s.upscaler == BbSettings::UpscalerFsr      ? " [FSR]"
+                                   : s.upscaler == BbSettings::UpscalerXess     ? " [XeSS]"
+                                   : s.upscaler == BbSettings::UpscalerDlss     ? " [DLSS]"
+                                   : s.upscaler == BbSettings::UpscalerTaa      ? " [TAA]"
+                                                                                : "";
 
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "FPS: %.1f", cur_fps);
         ImGui::SameLine();

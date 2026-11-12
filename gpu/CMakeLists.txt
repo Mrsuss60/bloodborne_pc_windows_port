@@ -126,6 +126,20 @@ add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+if (WIN32)
+    # AMD's FidelityFX sources rely on MSVC's transitive includes (memset, floor, placement new,
+    # swprintf_s) on _WIN32.
+    foreach(ffx_target IN ITEMS ffx_vulkan_portable ffx_vulkan_fsr3_vk_backend_1_1_4
+            ffx_vulkan_fsr3_host_1_1_4 ffx_vulkan_fsr4_v07_vulkan ffx_vulkan_fsr4_v07_assets
+            ffx_vulkan_fsr3_sdk_core_3_1_5_scaffold)
+        if (TARGET ${ffx_target})
+            target_compile_options(${ffx_target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include cstdio>"
+                "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include cwchar>" "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include cstring>"
+                "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include cmath>" "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include new>"
+                "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include mutex>")
+        endif()
+    endforeach()
+endif()
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
@@ -154,10 +168,15 @@ add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
 add_host_shader(camera_motion.comp camera_motion_comp)
 add_host_shader(upscale_merge.comp upscale_merge_comp)
+add_host_shader(upscale_debug.comp upscale_debug_comp)
+add_host_shader(upscale_debug.comp upscale_debug_ldr_comp LDR_OUTPUT=1)
 add_host_shader(upscale_reactive.comp upscale_reactive_comp)
 add_host_shader(taa.comp taa_comp)
 add_host_shader(taa_sharpen.comp taa_sharpen_comp)
 add_host_shader(taa_sharpen.comp taa_sharpen_ldr_comp LDR_OUTPUT=1)
+add_host_shader(fsr4_color.comp fsr4_decode_comp)
+add_host_shader(fsr4_color.comp fsr4_encode_comp ENCODE=1)
+add_host_shader(fsr4_reactive.comp fsr4_reactive_comp)
 add_host_shader(buffer_multi_copy.comp buffer_multi_copy_comp)
 add_host_shader(indirect_guard.comp indirect_guard_comp)
 add_host_shader(depth_resample.frag depth_resample_frag)
@@ -208,11 +227,11 @@ target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
     BB_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
-target_include_directories(bbgpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
+target_include_directories(bbgpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} shim shadps4 ../src ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 if (WIN32)
     target_sources(bbgpu PRIVATE platform/win32/nvidia_profile.cpp)
-    target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_WIN32_KHR _WIN32_WINNT=0x0A00)
     # In GCC 15/16 on MinGW-w64, -O2 causes an ICE in choose_baseaddr or runs out of memory on gnmdriver.cpp.
     # Compile gnmdriver.cpp with -O1 to avoid this compiler bug.
     set_source_files_properties(
@@ -228,7 +247,7 @@ endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 if (WIN32)
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-        tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit ws2_32)
+        tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit ws2_32 setupapi)
 else()
     target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
         tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
@@ -249,26 +268,42 @@ target_link_libraries(motion-shader-test PRIVATE bbgpu)
 add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
 target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(ui-composition-test PRIVATE ..)
+add_executable(scene-proxy-release-test EXCLUDE_FROM_ALL ../tests/test_scene_proxy_release.cpp)
+target_compile_options(scene-proxy-release-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(scene-proxy-release-test PRIVATE ..)
 
 add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)
-# The test's Vulkan-Hpp inline methods have a different set of platform extensions
-# from vk_platform.cpp. Keep them local and use an explicit dispatcher in the test.
-target_compile_options(scene-resolution-test PRIVATE -UNDEBUG -fPIC)
-set_source_files_properties(../tests/test_scene_resolution.cpp PROPERTIES
-    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+# Match bbgpu's Vulkan-Hpp ABI (NDEBUG, and Win32 platform macros on Windows); on Linux keep test methods local.
+target_compile_options(scene-resolution-test PRIVATE -fPIC)
+target_compile_definitions(scene-resolution-test PRIVATE NDEBUG)
+if (WIN32)
+    target_compile_definitions(scene-resolution-test PRIVATE VK_USE_PLATFORM_WIN32_KHR _WIN32_WINNT=0x0A00)
+else()
+    set_source_files_properties(../tests/test_scene_resolution.cpp PROPERTIES
+        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+endif()
 target_link_libraries(scene-resolution-test PRIVATE bbgpu)
 add_executable(taa-shader-test EXCLUDE_FROM_ALL ../tests/test_taa_shader.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_include_directories(taa-shader-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-target_compile_options(taa-shader-test PRIVATE -UNDEBUG -fPIC)
-set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
-    COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+target_compile_options(taa-shader-test PRIVATE -fPIC)
+target_compile_definitions(taa-shader-test PRIVATE NDEBUG)
+if (WIN32)
+    target_compile_definitions(taa-shader-test PRIVATE VK_USE_PLATFORM_WIN32_KHR _WIN32_WINNT=0x0A00)
+else()
+    set_source_files_properties(../tests/test_taa_shader.cpp PROPERTIES
+        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+endif()
 target_link_libraries(taa-shader-test PRIVATE bbgpu)
 add_dependencies(taa-shader-test host_shaders)
 
 add_executable(camera-motion-test EXCLUDE_FROM_ALL ../tests/test_camera_motion.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include)
-target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
+target_compile_options(camera-motion-test PRIVATE -fPIC)
+target_compile_definitions(camera-motion-test PRIVATE NDEBUG)
+if (WIN32)
+    target_compile_definitions(camera-motion-test PRIVATE VK_USE_PLATFORM_WIN32_KHR _WIN32_WINNT=0x0A00)
+endif()
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
 

@@ -36,9 +36,11 @@ from bblauncher_Utils import (
     CONTENT_SKU_CHOICES,
     DEBUG_VIEW_CHOICES,
     DEFAULT_GAME,
+    DLSS_PRESET_CHOICES,
     EFFECT_CHOICES,
     FPS_LIVE_CHOICES,
     FPS_XML_CHOICES,
+    FSR3_TUNING_PRESETS,
     GAMEPLAY_KEYBINDS,
     HUD_QUADRANT_CHOICES,
     LANGUAGE_CHOICES,
@@ -1420,12 +1422,14 @@ class LauncherUI:
             layout.addWidget(hint_lbl)
         return card, layout
 
-    def _make_slider(self, minimum: int, maximum: int, value: int):
+    def _make_slider(self, minimum: int, maximum: int, value: int, scale: int = 100, decimals: int = 2,
+                     signed: bool = False):
         slider = NoWheelSlider(Qt.Horizontal)
         slider.setRange(minimum, maximum)
         slider.setValue(max(minimum, min(maximum, value)))
-        label = QLabel(f"{slider.value() / 100:.2f}")
-        slider.valueChanged.connect(lambda v, l=label: l.setText(f"{v / 100:.2f}"))
+        fmt = (lambda v: f"{v / scale:+.{decimals}f}" if signed else f"{v / scale:.{decimals}f}")
+        label = QLabel(fmt(slider.value()))
+        slider.valueChanged.connect(lambda v, l=label, f=fmt: l.setText(f(v)))
         slider.sliderReleased.connect(self.save_bbport_ini)
         return slider, label
 
@@ -1597,7 +1601,7 @@ class LauncherUI:
         c_layout.addWidget(card_disp)
 
         # ---- Upscaler settings ----
-        card_q, l_q = self._new_card("Upscaler Settings (FSR & DLSS)")
+        card_q, l_q = self._new_card("Upscaler Settings (FSR, DLSS & XeSS)")
 
         grid_up = QGridLayout()
         grid_up.setHorizontalSpacing(16)
@@ -1609,13 +1613,19 @@ class LauncherUI:
         self.cmb_upscaler = QComboBox()
         for label, value in UPSCALER_CHOICES:
             self.cmb_upscaler.addItem(label, value)
-        init_upscaler = self.settings.get("upscaler_model", "Off")
-        if not self.settings.get("feat_upscaler", False) and init_upscaler != "Off":
-            init_upscaler = "Off"
-        upscaler_idx = self.cmb_upscaler.findText(init_upscaler)
+        ini_up = ini_opts.get("upscaler", "").strip().lower()
+        ini_up_norm = "fsr31" if ini_up == "fsr3" else ini_up
+        upscaler_idx = self.cmb_upscaler.findData(ini_up_norm) if ini_up_norm else -1
+        if upscaler_idx < 0:
+            init_upscaler = self.settings.get("upscaler_model", "Off")
+            if not self.settings.get("feat_upscaler", False) and init_upscaler != "Off":
+                init_upscaler = "Off"
+            upscaler_idx = self.cmb_upscaler.findText(init_upscaler)
         if upscaler_idx >= 0:
             self.cmb_upscaler.setCurrentIndex(upscaler_idx)
-        self.cmb_upscaler.currentIndexChanged.connect(lambda: (self.save_settings(), self.save_bbport_ini()))
+        self.cmb_upscaler.currentIndexChanged.connect(
+            lambda: (self._update_upscaler_option_visibility(), self.save_settings(), self.save_bbport_ini())
+        )
         grid_up.addWidget(self.cmb_upscaler, 0, 1)
 
         grid_up.addWidget(QLabel("Upscaler Preset:"), 0, 2)
@@ -1624,10 +1634,26 @@ class LauncherUI:
             self.cmb_preset.addItem(label, value)
         preset_idx = self.cmb_preset.findData(ini_opts.get("preset", "1").strip())
         self.cmb_preset.setCurrentIndex(preset_idx if preset_idx >= 0 else 0)
-        self.cmb_preset.currentIndexChanged.connect(lambda: self.save_bbport_ini())
+        self.cmb_preset.currentIndexChanged.connect(
+            lambda: (self._update_upscaler_option_visibility(), self.save_bbport_ini())
+        )
         grid_up.addWidget(self.cmb_preset, 0, 3)
 
         l_q.addLayout(grid_up)
+
+        self.grp_custom_scale = QWidget()
+        grid_scale = QGridLayout(self.grp_custom_scale)
+        grid_scale.setContentsMargins(0, 0, 0, 0)
+        grid_scale.setHorizontalSpacing(16)
+        grid_scale.setVerticalSpacing(8)
+        self.sl_render_scale, self.lbl_render_scale_val = self._make_slider(
+            100, 300, self._ini_percent(ini_opts, "render_scale", 1.30, 100, 300)
+        )
+        self.sl_render_scale.setToolTip(
+            "Output / render ratio for Custom preset (1.00 = Native AA, 1.30 = between Native and Quality, 3.00 = Ultra Performance)."
+        )
+        self._add_slider_row(grid_scale, 0, "Render Scale (Custom):", self.sl_render_scale, self.lbl_render_scale_val)
+        l_q.addWidget(self.grp_custom_scale)
 
         grid_q = QGridLayout()
         grid_q.setHorizontalSpacing(16)
@@ -1669,24 +1695,152 @@ class LauncherUI:
         grid_qs.setHorizontalSpacing(16)
         grid_qs.setVerticalSpacing(10)
         self.sl_sharpness, self.lbl_sharpness_val = self._make_slider(
-            0, 200, int(float(ini_opts.get("sharpness", "0.30")) * 100)
+            0, 200, self._ini_percent(ini_opts, "sharpness", 0.30, 0, 200)
         )
         self._add_slider_row(grid_qs, 0, "Sharpness:", self.sl_sharpness, self.lbl_sharpness_val)
-        self.sl_reactive_scale, self.lbl_reactive_scale_val = self._make_slider(
-            0, 1600, int(float(ini_opts.get("reactive_scale", "1.00")) * 100)
+        self.sl_mip_bias, self.lbl_mip_bias_val = self._make_slider(
+            -200, 100, self._ini_percent(ini_opts, "mip_bias", 0.00, -200, 100), signed=True
         )
-        self._add_slider_row(grid_qs, 1, "Reactive Scale:", self.sl_reactive_scale, self.lbl_reactive_scale_val)
+        self.sl_mip_bias.setToolTip(
+            "Added to the texture mip bias set by the upscaler: below 0 is sharper (more shimmer), above 0 is softer."
+        )
+        self._add_slider_row(grid_qs, 1, "Texture Mip Bias:", self.sl_mip_bias, self.lbl_mip_bias_val)
+        self.sl_reactive_scale, self.lbl_reactive_scale_val = self._make_slider(
+            0, 1600, self._ini_percent(ini_opts, "reactive_scale", 1.00, 0, 1600)
+        )
+        self._add_slider_row(grid_qs, 2, "Reactive Scale:", self.sl_reactive_scale, self.lbl_reactive_scale_val)
         self.sl_reactive_threshold, self.lbl_reactive_threshold_val = self._make_slider(
-            0, 100, int(float(ini_opts.get("reactive_threshold", "0.20")) * 100)
+            0, 100, self._ini_percent(ini_opts, "reactive_threshold", 0.20, 0, 100)
         )
         self._add_slider_row(
-            grid_qs, 2, "Reactive Threshold:", self.sl_reactive_threshold, self.lbl_reactive_threshold_val
+            grid_qs, 3, "Reactive Threshold:", self.sl_reactive_threshold, self.lbl_reactive_threshold_val
         )
         self.sl_reactive_max, self.lbl_reactive_max_val = self._make_slider(
-            0, 100, int(float(ini_opts.get("reactive_max", "0.90")) * 100)
+            0, 100, self._ini_percent(ini_opts, "reactive_max", 0.90, 0, 100)
         )
-        self._add_slider_row(grid_qs, 3, "Reactive Max:", self.sl_reactive_max, self.lbl_reactive_max_val)
+        self._add_slider_row(grid_qs, 4, "Reactive Max:", self.sl_reactive_max, self.lbl_reactive_max_val)
         l_q.addLayout(grid_qs)
+
+        # ---- DLSS Options sub-section (shown when DLSS is selected) ----
+        self.grp_dlss = QWidget()
+        l_dlss = QVBoxLayout(self.grp_dlss)
+        l_dlss.setContentsMargins(0, 6, 0, 0)
+        l_dlss.setSpacing(8)
+        lbl_dlss_hdr = QLabel("DLSS Options")
+        lbl_dlss_hdr.setStyleSheet("color: #c8ccd4; font-weight: bold;")
+        l_dlss.addWidget(lbl_dlss_hdr)
+
+        row_dlss_model = QHBoxLayout()
+        row_dlss_model.setSpacing(12)
+        row_dlss_model.addWidget(QLabel("DLSS Model Preset:"))
+        self.cmb_dlss_preset = QComboBox()
+        for label, value in DLSS_PRESET_CHOICES:
+            self.cmb_dlss_preset.addItem(label, value)
+        self._set_dlss_preset_combo(ini_opts.get("dlss_preset", "k"))
+        self.cmb_dlss_preset.currentIndexChanged.connect(lambda: self.save_bbport_ini())
+        row_dlss_model.addWidget(self.cmb_dlss_preset, 1)
+        l_dlss.addLayout(row_dlss_model)
+
+        grid_dlss = QGridLayout()
+        grid_dlss.setHorizontalSpacing(16)
+        grid_dlss.setVerticalSpacing(8)
+        self.chk_dlss_auto_exposure = QCheckBox("DLSS: Auto Exposure")
+        self.chk_dlss_auto_exposure.setChecked(self._ini_bool(ini_opts, "dlss_auto_exposure", False))
+        self.chk_dlss_auto_exposure.stateChanged.connect(lambda: self.save_bbport_ini())
+        grid_dlss.addWidget(self.chk_dlss_auto_exposure, 0, 0)
+
+        self.chk_dlss_mip_bias = QCheckBox("DLSS: Sharper Textures (mip bias -1)")
+        self.chk_dlss_mip_bias.setChecked(self._ini_bool(ini_opts, "dlss_mip_bias", True))
+        self.chk_dlss_mip_bias.stateChanged.connect(lambda: self.save_bbport_ini())
+        grid_dlss.addWidget(self.chk_dlss_mip_bias, 0, 1)
+
+        self.chk_dlss_jitter_fade = QCheckBox("DLSS: Less Wobble While Turning (experimental)")
+        self.chk_dlss_jitter_fade.setChecked(self._ini_bool(ini_opts, "dlss_jitter_fade", False))
+        self.chk_dlss_jitter_fade.stateChanged.connect(lambda: self.save_bbport_ini())
+        grid_dlss.addWidget(self.chk_dlss_jitter_fade, 1, 0)
+
+        self.chk_upscale_before_post = QCheckBox("Upscale Before Post-Processing (experimental)")
+        self.chk_upscale_before_post.setToolTip(
+            "Outputs other than 1080p: upscaler takes the HDR scene before post-processing (applies on restart when enabled via BB_UPSCALE_EARLY=1)."
+        )
+        self.chk_upscale_before_post.setChecked(self._ini_bool(ini_opts, "upscale_before_post", False))
+        self.chk_upscale_before_post.stateChanged.connect(lambda: self.save_bbport_ini())
+        grid_dlss.addWidget(self.chk_upscale_before_post, 1, 1)
+        l_dlss.addLayout(grid_dlss)
+        l_q.addWidget(self.grp_dlss)
+
+        # ---- FSR 3.1 Tuning sub-section (shown when FSR 3.1 is selected) ----
+        self.grp_fsr3 = QWidget()
+        l_fsr3 = QVBoxLayout(self.grp_fsr3)
+        l_fsr3.setContentsMargins(0, 6, 0, 0)
+        l_fsr3.setSpacing(8)
+        lbl_fsr3_hdr = QLabel("FSR 3.1 Tuning")
+        lbl_fsr3_hdr.setStyleSheet("color: #c8ccd4; font-weight: bold;")
+        l_fsr3.addWidget(lbl_fsr3_hdr)
+
+        row_fsr3_preset = QHBoxLayout()
+        row_fsr3_preset.setSpacing(12)
+        row_fsr3_preset.addWidget(QLabel("Tuning Preset:"))
+        self.cmb_fsr3_preset = QComboBox()
+        for label, *_vals in FSR3_TUNING_PRESETS:
+            self.cmb_fsr3_preset.addItem(label, label)
+        self.cmb_fsr3_preset.addItem("Custom", "__custom__")
+        self.cmb_fsr3_preset.currentIndexChanged.connect(self._on_fsr3_preset_selected)
+        row_fsr3_preset.addWidget(self.cmb_fsr3_preset, 1)
+        l_fsr3.addLayout(row_fsr3_preset)
+
+        grid_fsr3 = QGridLayout()
+        grid_fsr3.setHorizontalSpacing(16)
+        grid_fsr3.setVerticalSpacing(10)
+        self.sl_fsr3_velocity_factor, self.lbl_fsr3_velocity_factor_val = self._make_slider(
+            0, 1000, self._ini_scaled(ini_opts, "fsr3_velocity_factor", 1.000, 0, 1000, 1000),
+            scale=1000, decimals=3
+        )
+        self._add_slider_row(
+            grid_fsr3, 0, "Velocity Factor:", self.sl_fsr3_velocity_factor, self.lbl_fsr3_velocity_factor_val
+        )
+        self.sl_fsr3_reactiveness_scale, self.lbl_fsr3_reactiveness_scale_val = self._make_slider(
+            0, 4000, self._ini_scaled(ini_opts, "fsr3_reactiveness_scale", 1.000, 0, 4000, 1000),
+            scale=1000, decimals=3
+        )
+        self._add_slider_row(
+            grid_fsr3, 1, "Reactiveness:", self.sl_fsr3_reactiveness_scale, self.lbl_fsr3_reactiveness_scale_val
+        )
+        self.sl_fsr3_shading_change_scale, self.lbl_fsr3_shading_change_scale_val = self._make_slider(
+            0, 4000, self._ini_scaled(ini_opts, "fsr3_shading_change_scale", 1.000, 0, 4000, 1000),
+            scale=1000, decimals=3
+        )
+        self._add_slider_row(
+            grid_fsr3, 2, "Shading Change:", self.sl_fsr3_shading_change_scale, self.lbl_fsr3_shading_change_scale_val
+        )
+        self.sl_fsr3_accumulation, self.lbl_fsr3_accumulation_val = self._make_slider(
+            0, 1000, self._ini_scaled(ini_opts, "fsr3_accumulation", 0.333, 0, 1000, 1000),
+            scale=1000, decimals=3
+        )
+        self._add_slider_row(
+            grid_fsr3, 3, "Accumulation per Frame:", self.sl_fsr3_accumulation, self.lbl_fsr3_accumulation_val
+        )
+        self.sl_fsr3_min_disocclusion, self.lbl_fsr3_min_disocclusion_val = self._make_slider(
+            -1000, 1000, self._ini_scaled(ini_opts, "fsr3_min_disocclusion", -0.333, -1000, 1000, 1000),
+            scale=1000, decimals=3, signed=True
+        )
+        self._add_slider_row(
+            grid_fsr3, 4, "Disocclusion Accumulation:", self.sl_fsr3_min_disocclusion,
+            self.lbl_fsr3_min_disocclusion_val
+        )
+        for _sl in (
+            self.sl_fsr3_velocity_factor,
+            self.sl_fsr3_reactiveness_scale,
+            self.sl_fsr3_shading_change_scale,
+            self.sl_fsr3_accumulation,
+            self.sl_fsr3_min_disocclusion,
+        ):
+            _sl.valueChanged.connect(lambda _v: self._refresh_fsr3_preset_combo())
+        l_fsr3.addLayout(grid_fsr3)
+        l_q.addWidget(self.grp_fsr3)
+
+        self._refresh_fsr3_preset_combo()
+        self._update_upscaler_option_visibility()
 
         self._save_footer(l_q)
         c_layout.addWidget(card_q)
