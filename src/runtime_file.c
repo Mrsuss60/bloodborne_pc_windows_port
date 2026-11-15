@@ -254,9 +254,14 @@ static int64_t do_open(const char *guest,int flags,int mode) {
             e=errno;
             if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
             else {
+#ifdef _WIN32
                 DWORD win_err = GetLastError();
                 fprintf(stderr, "Runtime ERROR: open('%s' -> '%s', flags=0x%x) failed: errno=%d, Win32 error %lu\n",
                         guest, path, flags, e, (unsigned long)win_err);
+#else
+                fprintf(stderr, "Runtime ERROR: open('%s' -> '%s', flags=0x%x) failed: errno=%d\n",
+                        guest, path, flags, e);
+#endif
             }
             return -e;
         }
@@ -301,8 +306,11 @@ static int64_t do_close(int fd) {
 }
 static int host_fd(int fd) {
     if (fd>=0 && fd<3) return fd;
+    pthread_mutex_lock(&lock);
     File *f=get(fd);
-    return f ? f->host : -1;
+    int h=f ? f->host : -1;
+    pthread_mutex_unlock(&lock);
+    return h;
 }
 /* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
  * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
@@ -377,16 +385,20 @@ static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset)
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
-    File *f=get(fd);
-    if (!f) return -EBADF;
     if (whence<0 || whence>2) return -EINVAL;
+    pthread_mutex_lock(&lock);
+    File *f=get(fd);
+    if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
     if (f->dir) {
         /* Directory offsets are entry indices for getdirentries. */
-        if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
+        if (whence==0 && offset>=0) { f->position=(size_t)offset; pthread_mutex_unlock(&lock); return offset; }
+        pthread_mutex_unlock(&lock);
         return -EINVAL;
     }
+    int host = f->host;
+    pthread_mutex_unlock(&lock);
 #ifdef _WIN32
-    int64_t r = _lseeki64(f->host, offset, whence);
+    int64_t r = _lseeki64(host, offset, whence);
     if (r < 0) {
         int e = errno;
         DWORD werr = GetLastError();
@@ -396,7 +408,7 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
     }
     return r;
 #else
-    off_t r=lseek(f->host,offset,whence);
+    off_t r=lseek(host,offset,whence);
     return r<0 ? -errno : r;
 #endif
 }

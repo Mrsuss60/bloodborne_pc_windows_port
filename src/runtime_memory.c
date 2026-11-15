@@ -156,7 +156,7 @@ typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-static PendingHook pending[64]; static size_t pending_count;
+static PendingHook pending[2048]; static size_t pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -212,19 +212,36 @@ static void punch(uint64_t phys, uint64_t size) {
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
-    if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
+    if (pending_count >= sizeof(pending)/sizeof(*pending)) {
+        static uint64_t overflow_logged = 0;
+        if (!overflow_logged++) {
+            fprintf(stderr, "[MEM GUARD] Warning: GPU hook queue full (%zu entries), dropping to prevent crash\n", pending_count);
+            fflush(stderr);
+        }
+        return;
+    }
     pending[pending_count++]=(PendingHook){kind,address,size};
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
 static void flush_hooks(void) {
+    PendingHook batch[64];
     for (;;) {
+        size_t count = 0;
         write_lock();
         if (!pending_count) { write_unlock(); return; }
-        PendingHook h=pending[0];
-        memmove(pending,pending+1,--pending_count*sizeof(*pending));
-        GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
+        count = pending_count < 64 ? pending_count : 64;
+        memcpy(batch, pending, count * sizeof(PendingHook));
+        if (count < pending_count) {
+            memmove(pending, pending + count, (pending_count - count) * sizeof(PendingHook));
+            pending_count -= count;
+        } else {
+            pending_count = 0;
+        }
         write_unlock();
-        if (hook) hook(h.address,h.size);
+        for (size_t i = 0; i < count; ++i) {
+            GpuRange hook = batch[i].kind==HOOK_MAP ? hook_map : batch[i].kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
+            if (hook) hook(batch[i].address, batch[i].size);
+        }
     }
 }
 static int flex_test(uint64_t page) { return (int)((flex_bitmap[page/64]>>(page%64))&1); }
@@ -694,6 +711,17 @@ void *runtime_low_map(size_t size, int prot) {
 #endif
 }
 
+void runtime_low_unmap(void *ptr, size_t size) {
+    if (!ptr || !size) return;
+    write_lock();
+#ifdef _WIN32
+    VirtualFree(ptr, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+#else
+    munmap(ptr, size);
+#endif
+    write_unlock();
+}
+
 typedef struct LowHeader {
     uint32_t magic;
     uint32_t size_class;
@@ -726,13 +754,13 @@ void *runtime_low_alloc(size_t size) {
             low_freelists[sc] = node->next;
             host_mutex_unlock(&low_alloc_lock);
         } else {
+            host_mutex_unlock(&low_alloc_lock);
             size_t block_size = low_classes[sc];
             size_t slab_size = 65536;
             if (slab_size < block_size * 4) slab_size = block_size * 4;
             slab_size = align_up(slab_size, PAGE);
             unsigned char *slab = (unsigned char *)runtime_low_map(slab_size, PROT_READ | PROT_WRITE);
             if (!slab) {
-                host_mutex_unlock(&low_alloc_lock);
                 return NULL;
             }
             node = (LowFreeNode *)slab;
@@ -743,7 +771,13 @@ void *runtime_low_alloc(size_t size) {
                 n->next = head;
                 head = n;
             }
-            low_freelists[sc] = head;
+            host_mutex_lock(&low_alloc_lock);
+            if (head) {
+                LowFreeNode *tail = head;
+                while (tail->next) tail = tail->next;
+                tail->next = low_freelists[sc];
+                low_freelists[sc] = head;
+            }
             host_mutex_unlock(&low_alloc_lock);
         }
         LowHeader *hdr = (LowHeader *)node;
@@ -786,6 +820,8 @@ void runtime_low_free(void *ptr) {
         node->next = low_freelists[hdr->size_class];
         low_freelists[hdr->size_class] = node;
         host_mutex_unlock(&low_alloc_lock);
+    } else if (hdr->size_class == 0xFFFFFFFF) {
+        runtime_low_unmap(hdr, hdr->total_size);
     }
 }
 
@@ -925,7 +961,7 @@ static void cache_region(size_t i) {
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
+    const CachedRegion *c=(__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & 1) ? NULL : cached_region(address);
     if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
     read_lock();
     { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
@@ -953,7 +989,7 @@ int runtime_memory_vma_info(uintptr_t address, int *prot, int *type, uintptr_t *
 }
 /* Region around address: [start,end) mapped or a gap; 0 past the last mapping. */
 int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, int *mapped) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
+    const CachedRegion *c=(__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & 1) ? NULL : cached_region(address);
     if (c) { *start=c->start; *end=c->end; *mapped=c->kind!=KIND_RESERVED; return 1; }
     read_lock();
     size_t i=vma_index(address);
@@ -997,7 +1033,7 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
+    const CachedRegion *c=(__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & 1) ? NULL : cached_region(address);
     if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return 1;
     read_lock();
     int result=covered(address,address+size,0);

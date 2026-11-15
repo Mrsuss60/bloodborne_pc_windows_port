@@ -184,6 +184,9 @@ vk::ImageView ButtonPrompts::AtlasView(Runtime& runtime, VideoCore::Image& image
     if (std::none_of(cells.begin(), cells.end(), is_drawn)) {
         return {};
     }
+    if (!image.backing) {
+        return {};
+    }
     // A blit decodes the game's (BC7: a blit source on every device with BC textures).
     const vk::Format source_format = image.backing->image.image_ci.format;
     if (source_format != vk::Format::eBc7UnormBlock && source_format != vk::Format::eBc7SrgbBlock) {

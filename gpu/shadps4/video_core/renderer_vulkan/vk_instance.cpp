@@ -990,31 +990,52 @@ void Instance::CollectToolingInfo() const {
 }
 
 u64 Instance::GetDeviceMemoryUsage() const {
-    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
-    vk::PhysicalDeviceMemoryProperties2 props = {
-        .pNext = &memory_budget_props,
-    };
-    physical_device.getMemoryProperties2(&props);
+    using namespace std::chrono;
+    static std::atomic<steady_clock::time_point::rep> last_query_tp{0};
+    static std::atomic<u64> cached_usage{0};
+    const auto now = steady_clock::now().time_since_epoch().count();
+    const auto prev = last_query_tp.load(std::memory_order_relaxed);
+    if (now - prev >= 250'000'000 || prev == 0) { // Refresh at most 4 times a second
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+        vk::PhysicalDeviceMemoryProperties2 props = {
+            .pNext = &memory_budget_props,
+        };
+        physical_device.getMemoryProperties2(&props);
 
-    u64 total_usage = 0;
-    for (const size_t heap : valid_heaps) {
-        total_usage += memory_budget_props.heapUsage[heap];
+        u64 total_usage = 0;
+        for (const size_t heap : valid_heaps) {
+            total_usage += memory_budget_props.heapUsage[heap];
+        }
+        cached_usage.store(total_usage, std::memory_order_relaxed);
+        last_query_tp.store(now, std::memory_order_relaxed);
+        return total_usage;
     }
-    return total_usage;
+    return cached_usage.load(std::memory_order_relaxed);
 }
 
 u64 Instance::GetDeviceMemoryBudgetNow() const {
-    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
-    vk::PhysicalDeviceMemoryProperties2 props = {
-        .pNext = &memory_budget_props,
-    };
-    physical_device.getMemoryProperties2(&props);
+    using namespace std::chrono;
+    static std::atomic<steady_clock::time_point::rep> last_budget_tp{0};
+    static std::atomic<u64> cached_budget{0};
+    const auto now = steady_clock::now().time_since_epoch().count();
+    const auto prev = last_budget_tp.load(std::memory_order_relaxed);
+    if (now - prev >= 500'000'000 || prev == 0) { // Refresh at most twice a second
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+        vk::PhysicalDeviceMemoryProperties2 props = {
+            .pNext = &memory_budget_props,
+        };
+        physical_device.getMemoryProperties2(&props);
 
-    u64 total_budget = 0;
-    for (const size_t heap : valid_heaps) {
-        total_budget += memory_budget_props.heapBudget[heap];
+        u64 total_budget = 0;
+        for (const size_t heap : valid_heaps) {
+            total_budget += memory_budget_props.heapBudget[heap];
+        }
+        const u64 final_budget = VramLimit() != 0 ? std::min(total_budget, VramLimit()) : total_budget;
+        cached_budget.store(final_budget, std::memory_order_relaxed);
+        last_budget_tp.store(now, std::memory_order_relaxed);
+        return final_budget;
     }
-    return VramLimit() != 0 ? std::min(total_budget, VramLimit()) : total_budget;
+    return cached_budget.load(std::memory_order_relaxed);
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

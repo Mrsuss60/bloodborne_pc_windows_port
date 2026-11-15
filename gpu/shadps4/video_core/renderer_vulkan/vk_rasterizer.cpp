@@ -59,6 +59,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
     // Object motion first: it fixes the buffer addresses the motion shader variants embed.
     object_motion = std::make_unique<ObjectMotion>(instance, scheduler);
+    pipeline_cache.StartShaderImport();
     camera_motion = std::make_unique<CameraMotion>(instance, scheduler, texture_cache, runtime);
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
@@ -487,8 +488,8 @@ bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
     if (pending_writes.empty() || address >= pending_max || address + size <= pending_min) {
         return false;
     }
-    // Now and then drop entries whose writes the recording thread has done: the bounds shrink.
-    if ((++pending_checks & 63) == 0) {
+    // Keep pending_writes compact and shrink bounds frequently as the recorder catches up.
+    if ((++pending_checks & 15) == 0 || pending_writes.size() > 32) {
         std::erase_if(pending_writes, [&](const PendingWrite& write) {
             return draw_pipe->Reached(write.position);
         });
@@ -1475,7 +1476,7 @@ void Rasterizer::OnSubmit() {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
     }
-    texture_cache.ProcessDownloadImages();
+    texture_cache.ProcessDownloadImages(false);
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
 }
@@ -2548,6 +2549,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
             // storage and feedback loop doesn't make sense for them
+            const auto shader_stage = stage.hw_stage == Shader::HwStage::Compute
+                                          ? vk::PipelineStageFlagBits2::eComputeShader
+                                          : vk::PipelineStageFlagBits2::eAllGraphics;
             if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
                 if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
                     barrier |= runtime.Transit(
@@ -2555,13 +2559,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                         vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
                 } else {
                     barrier |= runtime.Transit(
-                        &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                        &image, vk::ImageLayout::eGeneral, shader_stage,
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
                 }
             } else {
                 if (is_storage) {
                     barrier |= runtime.Transit(
-                        &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                        &image, vk::ImageLayout::eGeneral, shader_stage,
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                         desc.view_info.range);
                 } else {
@@ -2569,7 +2573,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
                     barrier |= runtime.Transit(
-                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                        &image, new_layout, shader_stage,
                         vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
                 }
             }
@@ -2580,7 +2584,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             }
 
             vk::ImageView view = *image_view.image_view;
-            vk::ImageLayout layout = image.backing->state.layout;
+            vk::ImageLayout layout = image.backing ? image.backing->state.layout : vk::ImageLayout::eUndefined;
             if (upscaler->Enabled()) {
                 // bbport: the display pass reads the upscaled frame (scaled presets).
                 upscaler->RedirectSampled(image_id, image_view.info, view, layout);
@@ -2818,6 +2822,9 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     }
     ++texture_set_hits;
     slot = nullptr;
+    const auto shader_stage = stage.hw_stage == Shader::HwStage::Compute
+                                  ? vk::PipelineStageFlagBits2::eComputeShader
+                                  : vk::PipelineStageFlagBits2::eAllGraphics;
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
@@ -2838,9 +2845,9 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
         const auto new_layout = image.info.props.is_depth
                                     ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                     : vk::ImageLayout::eShaderReadOnlyOptimal;
-        barrier |= runtime.Transit(&image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+        barrier |= runtime.Transit(&image, new_layout, shader_stage,
                                    vk::AccessFlagBits2::eShaderRead, entry.range);
-        image_infos.emplace_back(VK_NULL_HANDLE, entry.view, image.backing->state.layout);
+        image_infos.emplace_back(VK_NULL_HANDLE, entry.view, image.backing ? image.backing->state.layout : vk::ImageLayout::eUndefined);
     }
     (void)first_image_idx;
     return true;
@@ -3069,7 +3076,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
         attachment.image_view = *image_view.image_view;
-        attachment.image_layout = image->backing->state.layout;
+        attachment.image_layout = (image && image->backing) ? image->backing->state.layout : vk::ImageLayout::eUndefined;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
 
@@ -3133,7 +3140,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
 
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
-        attachment.image_layout = image.backing->state.layout;
+        attachment.image_layout = image.backing ? image.backing->state.layout : vk::ImageLayout::eUndefined;
         attachment.clear_value = {};
         attachment.is_clear = 0;
 
@@ -3205,7 +3212,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                 auto& depth_image = texture_cache.GetImage(db_desc.first);
                 state.depth_stencil_attachment.image_view =
                     *texture_cache.FindDepthTarget(db_desc.first, db_desc.second).image_view;
-                state.depth_stencil_attachment.image_layout = depth_image.backing->state.layout;
+                state.depth_stencil_attachment.image_layout = depth_image.backing ? depth_image.backing->state.layout : vk::ImageLayout::eUndefined;
             }
         } else {
             state.width = redirect.width;
@@ -3374,16 +3381,11 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
 
 bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
     DrainDrawPipe();
-    if (!InvalidateMemory(addr, 8, assume_locks)) {
+    if (!IsMapped(addr, 8)) {
         return false;
     }
-    buffer_cache.ExtendWriteFault(addr);
-    if (BbFaultHint::redzone) {
-        // A PS4 vertex generator keeps locals in the System V red zone, which the Windows
-        // exception frame destroys on every handled fault. Keep this page writable so this
-        // routine does not fault on it again.
-        buffer_cache.MakeWriteFaultSticky(addr);
-    }
+    buffer_cache.OnWriteFault(addr, 8, BbFaultHint::redzone, assume_locks);
+    texture_cache.InvalidateMemory(addr, 8);
     return true;
 }
 

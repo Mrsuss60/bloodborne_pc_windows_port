@@ -24,16 +24,53 @@ namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
 
+struct CachedAuxShader {
+    vk::UniqueShaderModule module{};
+    std::vector<u32> spv{};
+};
+
 static std::mutex aux_modules_mutex;
-static tsl::robin_map<u64, vk::UniqueShaderModule> aux_tcs_cache;
-static tsl::robin_map<u64, vk::UniqueShaderModule> aux_tes_cache;
-static tsl::robin_map<u64, vk::UniqueShaderModule> aux_frag_cache;
+static tsl::robin_map<u64, CachedAuxShader> aux_tcs_cache;
+static tsl::robin_map<u64, CachedAuxShader> aux_tes_cache;
+static tsl::robin_map<u64, CachedAuxShader> aux_frag_cache;
+static tsl::robin_map<u64, vk::UniqueShaderModule> aux_tcs_spv_cache;
+static tsl::robin_map<u64, vk::UniqueShaderModule> aux_tes_spv_cache;
+static tsl::robin_map<u64, vk::UniqueShaderModule> aux_frag_spv_cache;
 
 void ClearAuxShaderCaches() {
     std::scoped_lock lock{aux_modules_mutex};
     aux_tcs_cache.clear();
     aux_tes_cache.clear();
     aux_frag_cache.clear();
+    aux_tcs_spv_cache.clear();
+    aux_tes_spv_cache.clear();
+    aux_frag_spv_cache.clear();
+}
+
+static vk::UniqueShaderModule CreateAuxShaderModule(vk::Device device,
+                                                    std::span<const u32> code) {
+    if (code.empty()) {
+        throw std::runtime_error("Auxiliary SPIR-V shader is empty");
+    }
+    const vk::ShaderModuleCreateInfo shader_info = {
+        .codeSize = code.size() * sizeof(u32),
+        .pCode = code.data(),
+    };
+    auto [res, mod] = device.createShaderModuleUnique(shader_info);
+    if (res != vk::Result::eSuccess) {
+        throw std::runtime_error("Failed to compile SPIR-V shader: " + vk::to_string(res));
+    }
+    return std::move(mod);
+}
+
+static u64 HashAuxTessKey(AuxShaderType type, const Shader::HwFragmentRuntimeInfo& fs_info) {
+    const std::array<u64, 4> meta = {
+        static_cast<u64>(type),
+        static_cast<u64>(fs_info.clip_distance_emulation),
+        static_cast<u64>(fs_info.num_inputs),
+        XXH3_64bits(fs_info.inputs.data(), fs_info.num_inputs * sizeof(fs_info.inputs[0])),
+    };
+    return XXH3_64bits(meta.data(), sizeof(meta));
 }
 
 static constexpr std::array LogicalStageToStageBit = {
@@ -58,27 +95,6 @@ GraphicsPipeline::GraphicsPipeline(
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
-
-    const vk::PushConstantRange push_constants = {
-        .stageFlags = AllGraphicsStageBits,
-        .offset = 0,
-        .size = sizeof(Shader::PushData),
-    };
-
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &push_constants,
-    };
-    auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    if (layout_result != vk::Result::eSuccess) {
-        throw std::runtime_error("Failed to create graphics pipeline layout: " +
-                                 vk::to_string(layout_result));
-    }
-    pipeline_layout = std::move(layout);
-    SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
 
     if (!preloading) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
@@ -186,6 +202,7 @@ GraphicsPipeline::GraphicsPipeline(
         .pDynamicStates = dynamic_states.data(),
     };
 
+    boost::container::small_vector<vk::UniqueShaderModule, 3> uncached_aux_modules;
     boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
         shader_stages;
     auto stage = u32(Shader::SwStage::Vertex);
@@ -204,6 +221,21 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
+    auto get_cached_spv_module = [&](tsl::robin_map<u64, vk::UniqueShaderModule>& cache,
+                                     const std::vector<u32>& spv) -> vk::ShaderModule {
+        const u64 spv_key = XXH3_64bits(spv.data(), spv.size() * sizeof(u32));
+        {
+            std::scoped_lock lock{aux_modules_mutex};
+            if (const auto it = cache.find(spv_key); it != cache.end()) {
+                return *it->second;
+            }
+        }
+        auto mod = CreateAuxShaderModule(device, spv);
+        std::scoped_lock lock{aux_modules_mutex};
+        const auto [it, inserted] = cache.try_emplace(spv_key, std::move(mod));
+        return *it->second;
+    };
+
     stage = u32(Shader::SwStage::TessellationControl);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -213,37 +245,38 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
-        if (!preloading) {
+        vk::ShaderModule tcs_module{};
+        if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
+            if (!preloading) {
+                const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+                sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+            }
+            uncached_aux_modules.push_back(CreateAuxShaderModule(device, sdata.tcs));
+            tcs_module = *uncached_aux_modules.back();
+        } else if (preloading) {
+            tcs_module = get_cached_spv_module(aux_tcs_spv_cache, sdata.tcs);
+        } else {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+            const u64 aux_key = HashAuxTessKey(type, fs_info);
+            {
+                std::scoped_lock lock{aux_modules_mutex};
+                if (const auto it = aux_tcs_cache.find(aux_key); it != aux_tcs_cache.end()) {
+                    sdata.tcs = it->second.spv;
+                    tcs_module = *it->second.module;
+                }
+            }
+            if (!tcs_module) {
+                sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+                auto mod = CreateAuxShaderModule(device, sdata.tcs);
+                std::scoped_lock lock{aux_modules_mutex};
+                const auto [it, inserted] =
+                    aux_tcs_cache.try_emplace(aux_key, CachedAuxShader{std::move(mod), sdata.tcs});
+                tcs_module = *it->second.module;
+            }
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
-            .module = [&]() {
-                if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
-                    return CompileSPV(sdata.tcs, instance.GetDevice());
-                }
-                const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-                u64 key = static_cast<u64>(type) |
-                          (static_cast<u64>(fs_info.clip_distance_emulation) << 8) |
-                          (static_cast<u64>(fs_info.num_inputs) << 16);
-                key ^= XXH3_64bits(fs_info.inputs.data(), fs_info.num_inputs * sizeof(fs_info.inputs[0]));
-                std::scoped_lock lock{aux_modules_mutex};
-                auto it = aux_tcs_cache.find(key);
-                if (it == aux_tcs_cache.end()) {
-                    const vk::ShaderModuleCreateInfo shader_info = {
-                        .codeSize = sdata.tcs.size() * sizeof(u32),
-                        .pCode = sdata.tcs.data(),
-                    };
-                    auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
-                    if (res != vk::Result::eSuccess) {
-                        throw std::runtime_error("Failed to compile SPIR-V shader: " +
-                                                 vk::to_string(res));
-                    }
-                    it = aux_tcs_cache.emplace(key, std::move(mod)).first;
-                }
-                return *it->second;
-            }(),
+            .module = tcs_module,
             .pName = "main",
         });
     }
@@ -255,38 +288,40 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     } else if (is_rect_list || is_quad_list) {
-        if (!preloading) {
+        vk::ShaderModule tes_module{};
+        if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
+            if (!preloading) {
+                const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+                sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
+                    AuxShaderType::PassthroughTES, fs_info);
+            }
+            uncached_aux_modules.push_back(CreateAuxShaderModule(device, sdata.tes));
+            tes_module = *uncached_aux_modules.back();
+        } else if (preloading) {
+            tes_module = get_cached_spv_module(aux_tes_spv_cache, sdata.tes);
+        } else {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-            sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
-                AuxShaderType::PassthroughTES, fs_info);
+            const u64 aux_key = HashAuxTessKey(AuxShaderType::PassthroughTES, fs_info);
+            {
+                std::scoped_lock lock{aux_modules_mutex};
+                if (const auto it = aux_tes_cache.find(aux_key); it != aux_tes_cache.end()) {
+                    sdata.tes = it->second.spv;
+                    tes_module = *it->second.module;
+                }
+            }
+            if (!tes_module) {
+                sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
+                    AuxShaderType::PassthroughTES, fs_info);
+                auto mod = CreateAuxShaderModule(device, sdata.tes);
+                std::scoped_lock lock{aux_modules_mutex};
+                const auto [it, inserted] =
+                    aux_tes_cache.try_emplace(aux_key, CachedAuxShader{std::move(mod), sdata.tes});
+                tes_module = *it->second.module;
+            }
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
-            .module = [&]() {
-                if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
-                    return CompileSPV(sdata.tes, instance.GetDevice());
-                }
-                const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-                u64 key = static_cast<u64>(AuxShaderType::PassthroughTES) |
-                          (static_cast<u64>(fs_info.clip_distance_emulation) << 8) |
-                          (static_cast<u64>(fs_info.num_inputs) << 16);
-                key ^= XXH3_64bits(fs_info.inputs.data(), fs_info.num_inputs * sizeof(fs_info.inputs[0]));
-                std::scoped_lock lock{aux_modules_mutex};
-                auto it = aux_tes_cache.find(key);
-                if (it == aux_tes_cache.end()) {
-                    const vk::ShaderModuleCreateInfo shader_info = {
-                        .codeSize = sdata.tes.size() * sizeof(u32),
-                        .pCode = sdata.tes.data(),
-                    };
-                    auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
-                    if (res != vk::Result::eSuccess) {
-                        throw std::runtime_error("Failed to compile SPIR-V shader: " +
-                                                 vk::to_string(res));
-                    }
-                    it = aux_tes_cache.emplace(key, std::move(mod)).first;
-                }
-                return *it->second;
-            }(),
+            .module = tes_module,
             .pName = "main",
         });
     }
@@ -297,36 +332,40 @@ GraphicsPipeline::GraphicsPipeline(
             .module = modules[stage],
             .pName = "main",
         });
-    } else if (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
-        if (!preloading) {
+    } else if (preloading ? !sdata.fragment.empty()
+                          : runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
+        vk::ShaderModule frag_module{};
+        if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
+            if (!preloading) {
+                const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
+                sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);
+            }
+            uncached_aux_modules.push_back(CreateAuxShaderModule(device, sdata.fragment));
+            frag_module = *uncached_aux_modules.back();
+        } else if (preloading) {
+            frag_module = get_cached_spv_module(aux_frag_spv_cache, sdata.fragment);
+        } else {
             const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
-
-            sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);
+            const u64 aux_key = XXH3_64bits(vs.outputs.data(), vs.outputs.size() * sizeof(vs.outputs[0]));
+            {
+                std::scoped_lock lock{aux_modules_mutex};
+                if (const auto it = aux_frag_cache.find(aux_key); it != aux_frag_cache.end()) {
+                    sdata.fragment = it->second.spv;
+                    frag_module = *it->second.module;
+                }
+            }
+            if (!frag_module) {
+                sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);
+                auto mod = CreateAuxShaderModule(device, sdata.fragment);
+                std::scoped_lock lock{aux_modules_mutex};
+                const auto [it, inserted] = aux_frag_cache.try_emplace(
+                    aux_key, CachedAuxShader{std::move(mod), sdata.fragment});
+                frag_module = *it->second.module;
+            }
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
-            .module = [&]() {
-                if (BbToggle::Disabled(BbToggle::AuxTessCache)) {
-                    return CompileSPV(sdata.fragment, instance.GetDevice());
-                }
-                const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
-                const u64 key = XXH3_64bits(vs.outputs.data(), vs.outputs.size() * sizeof(vs.outputs[0]));
-                std::scoped_lock lock{aux_modules_mutex};
-                auto it = aux_frag_cache.find(key);
-                if (it == aux_frag_cache.end()) {
-                    const vk::ShaderModuleCreateInfo shader_info = {
-                        .codeSize = sdata.fragment.size() * sizeof(u32),
-                        .pCode = sdata.fragment.data(),
-                    };
-                    auto [res, mod] = instance.GetDevice().createShaderModuleUnique(shader_info);
-                    if (res != vk::Result::eSuccess) {
-                        throw std::runtime_error("Failed to compile SPIR-V shader: " +
-                                                 vk::to_string(res));
-                    }
-                    it = aux_frag_cache.emplace(key, std::move(mod)).first;
-                }
-                return *it->second;
-            }(),
+            .module = frag_module,
             .pName = "main",
         });
     }
@@ -497,7 +536,7 @@ GraphicsPipeline::GraphicsPipeline(
             !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
-        .layout = *pipeline_layout,
+        .layout = pipeline_layout,
     };
 
     /* bbport: Vulkan requires external synchronization on VkPipelineCache. The async pipeline
@@ -614,22 +653,8 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
-    const auto flags = uses_push_descriptors
-                           ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-                           : vk::DescriptorSetLayoutCreateFlagBits{};
-    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = flags,
-        .bindingCount = static_cast<u32>(bindings.size()),
-        .pBindings = bindings.data(),
-    };
-    auto [layout_result, layout] =
-        instance.GetDevice().createDescriptorSetLayoutUnique(desc_layout_ci);
-    if (layout_result != vk::Result::eSuccess) {
-        throw std::runtime_error("Failed to create graphics descriptor set layout: " +
-                                 vk::to_string(layout_result));
-    }
-    desc_layout = std::move(layout);
+    const bool use_push = binding < instance.MaxPushDescriptors();
+    InitCanonicalLayouts(bindings, use_push);
 }
 
 } // namespace Vulkan

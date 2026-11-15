@@ -96,6 +96,7 @@ struct Liverpool {
 public:
     explicit Liverpool();
     ~Liverpool();
+    void StopProcessing();
 
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
@@ -120,6 +121,7 @@ public:
             const char* env = std::getenv("BB_WORK_RETIRED");
             return !(env && env[0] == '0');
         }();
+        std::scoped_lock lk{submit_mutex};
         return num_submits == 0 && (work_retired || !use_retired);
     }
 
@@ -275,7 +277,7 @@ private:
     std::atomic<bool> work_retired{true};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
-    std::mutex submit_mutex;
+    mutable std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;

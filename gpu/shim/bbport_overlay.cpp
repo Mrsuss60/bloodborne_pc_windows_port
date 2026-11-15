@@ -120,8 +120,9 @@ static ShaderProgress CurrentShaderProgress() {
     p.total = g_bb_background_pipelines_total.load(std::memory_order_relaxed);
     p.done = g_bb_background_pipelines_done.load(std::memory_order_relaxed);
     static const long long start = NowNs();
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
     p.importing = g_bb_shader_import_active.load(std::memory_order_relaxed) &&
-                  NowNs() - start < 180'000'000'000ll;
+                  frame < 30 && NowNs() - start < 8'000'000'000ll;
     static u32 last_compiles = 0;
     static long long last_change = 0;
     static u32 window_start_compiles = 0;

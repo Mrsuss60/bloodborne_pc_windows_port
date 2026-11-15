@@ -71,6 +71,26 @@ public:
                             });
     }
 
+    /// bbport: consolidated single-pass write fault handling
+    void HandleWriteFault(VAddr cpu_addr, u64 size, VAddr window_addr, u64 window_size,
+                          bool is_redzone, auto&& on_flush) noexcept {
+        IteratePages<false>(
+            cpu_addr, size, [&](RegionManager* manager, u64 offset, size_t page_size) {
+                const bool should_flush = [&] {
+                    std::scoped_lock lk{manager->lock};
+                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                        manager->template IsRegionModified<Type::GPU>(offset, page_size)) {
+                        return true;
+                    }
+                    manager->HandleWriteFault(cpu_addr, size, window_addr, window_size, is_redzone);
+                    return false;
+                }();
+                if (should_flush) {
+                    on_flush();
+                }
+            });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,

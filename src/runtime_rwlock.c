@@ -28,9 +28,8 @@ static int native_timedlock(NativeRwlock *l, int writer, const GuestTime *time) 
     for (unsigned attempt = 0; ; ++attempt) {
         if (!native_try(l, writer)) return 0;
         if (host_realtime_ns() >= deadline) return ETIMEDOUT;
-        if (attempt < 64) YieldProcessor();
-        else if (attempt < 128) SwitchToThread();
-        else Sleep(1);
+        if (attempt < 32) YieldProcessor();
+        else SwitchToThread();
     }
 }
 static int native_unlock(NativeRwlock *l, int writer) {
@@ -50,15 +49,19 @@ static int native_timedlock(NativeRwlock *l, int writer, const GuestTime *time) 
 static int native_unlock(NativeRwlock *l, int writer) { (void)writer; return pthread_rwlock_unlock(l); }
 #endif
 
+#define RWLOCK_MAGIC 0x52574C4B
+#define MAX_HOLDERS_PER_RWLOCK 8
+
 typedef struct Holder {
     HostThreadId thread;
     unsigned readers, writer, pending;
-    struct Holder *next;
 } Holder;
 
 typedef struct Rwlock {
+    uint32_t magic;
+    HostMutex lock;
     NativeRwlock native;
-    Holder *holders;
+    Holder holders[MAX_HOLDERS_PER_RWLOCK];
     unsigned inflight;
     struct Rwlock *next;
 } Rwlock;
@@ -95,24 +98,21 @@ static int create_locked(Rwlock **out) {
     CHECK_LOW_ADDR(r);
     int e=native_init(&r->native);
     if (e) { runtime_low_free(r); return e; }
+    host_mutex_init(&r->lock);
+    r->magic = RWLOCK_MAGIC;
     r->next=registry; registry=r; *out=r; ++created; return 0;
 }
 
 static ABI int32_t rw_init(Rwlock **out, void *const *attr, const char *name) {
     (void)name;
-    if (!out || (attr && !*attr)) return error(EINVAL);
+    if (!out || (attr && !*attr)) { restore_guest_fs(); return error(EINVAL); }
     if (attr) { fputs("STOP: non-default PS4 rwlock attributes are not implemented\n",stderr); exit(21); }
     host_lock(&registry_lock);
     /* POSIX allows uninitialized storage, so never read *out during init. */
     int e=create_locked(out);
-    host_unlock(&registry_lock); return error(e);
-}
-
-static void prune_locked(Rwlock *r, Holder *h) {
-    if (h->readers || h->writer || h->pending) return;
-    Holder **link=&r->holders;
-    while (*link!=h) link=&(*link)->next;
-    *link=h->next; runtime_low_free(h);
+    host_unlock(&registry_lock);
+    restore_guest_fs();
+    return error(e);
 }
 
 enum Operation { READ, WRITE, TRY_READ, TRY_WRITE, TIMED_READ, TIMED_WRITE };
@@ -121,27 +121,55 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
     int writer=op==WRITE || op==TRY_WRITE || op==TIMED_WRITE;
     int attempt=op==TRY_READ || op==TRY_WRITE;
     int timed=op==TIMED_READ || op==TIMED_WRITE;
-    host_lock(&registry_lock);
-    int e=0;
-    if (!*handle) e=create_locked(handle);
-    Rwlock *r=e ? NULL : find_locked(*handle);
-    if (!r) { host_unlock(&registry_lock); return error(e ? e : EINVAL); }
-    Holder *h=r->holders;
-    while (h && !host_thread_equal(h->thread,host_thread_id())) h=h->next;
-    if (h && (h->writer || (writer && h->readers))) {
-        host_unlock(&registry_lock); return error(attempt ? EBUSY : EDEADLK);
+
+    Rwlock *r = *handle;
+    if (!r || r->magic != RWLOCK_MAGIC) {
+        host_lock(&registry_lock);
+        int e = 0;
+        if (!*handle) e = create_locked(handle);
+        r = e ? NULL : find_locked(*handle);
+        host_unlock(&registry_lock);
+        if (!r) return error(e ? e : EINVAL);
     }
-    if (h && h->readers==UINT_MAX) { host_unlock(&registry_lock); return error(EAGAIN); }
+
+    HostThreadId self = host_thread_id();
+    Holder *h = NULL, *free_h = NULL;
+    host_lock(&r->lock);
+    for (int i = 0; i < MAX_HOLDERS_PER_RWLOCK; ++i) {
+        if (host_thread_equal(r->holders[i].thread, self)) {
+            h = &r->holders[i];
+            break;
+        }
+        if (!free_h && !r->holders[i].thread) {
+            free_h = &r->holders[i];
+        }
+    }
+    if (h && h->writer) { host_unlock(&r->lock); restore_guest_fs(); return error(attempt ? EBUSY : EDEADLK); }
+    if (h && h->readers && writer) { host_unlock(&r->lock); restore_guest_fs(); return error(attempt ? EBUSY : EDEADLK); }
+    if (h && h->readers && !writer) {
+        /* Recursive read acquire: already holding shared lock, avoid native lock re-acquire */
+        ++h->readers;
+        __atomic_add_fetch(&reads, 1, __ATOMIC_RELAXED);
+        host_unlock(&r->lock);
+        restore_guest_fs();
+        return 0;
+    }
+    if (h && h->readers == UINT_MAX) { host_unlock(&r->lock); restore_guest_fs(); return error(EAGAIN); }
     if (!h) {
-        h=runtime_low_calloc(1,sizeof(*h));
-        if (!h) { host_unlock(&registry_lock); return error(ENOMEM); }
-        h->thread=host_thread_id(); h->next=r->holders; r->holders=h;
+        h = free_h;
+        if (!h) {
+            host_unlock(&r->lock);
+            restore_guest_fs();
+            return error(ENOMEM);
+        }
+        *h = (Holder){.thread = self};
     }
     ++r->inflight; ++h->pending;
-    host_unlock(&registry_lock);
+    host_unlock(&r->lock);
 
     /* Timed operations first try the lock, matching POSIX timeout validation. */
     runtime_thread_set_blocked(writer ? "rwlock_write" : "rwlock_read", (uintptr_t)*handle);
+    int e = 0;
     if (attempt || timed) e=native_try(&r->native,writer);
     else e=native_lock(&r->native,writer);
     if (timed && e==EBUSY) {
@@ -150,14 +178,17 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
     }
     runtime_thread_clear_blocked();
 
-    host_lock(&registry_lock);
+    host_lock(&r->lock);
     --r->inflight; --h->pending;
     if (!e) {
-        if (writer) { h->writer=1; ++writes; }
-        else { ++h->readers; ++reads; }
+        if (writer) { h->writer = 1; __atomic_add_fetch(&writes, 1, __ATOMIC_RELAXED); }
+        else { ++h->readers; __atomic_add_fetch(&reads, 1, __ATOMIC_RELAXED); }
+    } else {
+        if (!h->readers && !h->writer && !h->pending) {
+            h->thread = 0;
+        }
     }
-    prune_locked(r,h);
-    host_unlock(&registry_lock);
+    host_unlock(&r->lock);
     restore_guest_fs();
     return error(e);
 }
@@ -171,34 +202,78 @@ static ABI int32_t rw_timedwrite(Rwlock **r,const GuestTime *t) { return acquire
 
 static ABI int32_t rw_unlock(Rwlock **handle) {
     if (!handle) return error(EINVAL);
-    host_lock(&registry_lock);
-    Rwlock *r=find_locked(*handle);
-    if (!r) { host_unlock(&registry_lock); return error(EINVAL); }
-    Holder *h=r->holders;
-    while (h && !host_thread_equal(h->thread,host_thread_id())) h=h->next;
-    if (!h || (!h->readers && !h->writer)) { host_unlock(&registry_lock); return error(EPERM); }
-    int e=native_unlock(&r->native,h->writer);
-    if (!e) { if (h->writer) h->writer=0; else --h->readers; ++unlocks; }
-    prune_locked(r,h);
-    host_unlock(&registry_lock);
+    Rwlock *r = *handle;
+    if (!r || r->magic != RWLOCK_MAGIC) {
+        host_lock(&registry_lock);
+        r = find_locked(*handle);
+        host_unlock(&registry_lock);
+        if (!r) return error(EINVAL);
+    }
+    HostThreadId self = host_thread_id();
+    Holder *h = NULL;
+    host_lock(&r->lock);
+    for (int i = 0; i < MAX_HOLDERS_PER_RWLOCK; ++i) {
+        if (host_thread_equal(r->holders[i].thread, self)) {
+            h = &r->holders[i];
+            break;
+        }
+    }
+    if (!h || (!h->readers && !h->writer)) { host_unlock(&r->lock); return error(EPERM); }
+    int is_writer = h->writer;
+    if (!is_writer && h->readers > 1) {
+        --h->readers;
+        __atomic_add_fetch(&unlocks, 1, __ATOMIC_RELAXED);
+        host_unlock(&r->lock);
+        restore_guest_fs();
+        return 0;
+    }
+    int e=native_unlock(&r->native, is_writer);
+    if (!e) {
+        if (is_writer) h->writer = 0;
+        else --h->readers;
+        __atomic_add_fetch(&unlocks, 1, __ATOMIC_RELAXED);
+        if (!h->readers && !h->writer && !h->pending) {
+            h->thread = 0;
+        }
+    }
+    host_unlock(&r->lock);
     restore_guest_fs();
     return error(e);
 }
 
 static ABI int32_t rw_destroy(Rwlock **handle) {
-    if (!handle) return error(EINVAL);
+    if (!handle) { restore_guest_fs(); return error(EINVAL); }
     host_lock(&registry_lock);
-    if (!*handle) { host_unlock(&registry_lock); return 0; }
+    if (!*handle) { host_unlock(&registry_lock); restore_guest_fs(); return 0; }
     Rwlock *r=find_locked(*handle);
-    if (!r) { host_unlock(&registry_lock); return error(EINVAL); }
-    if (r->inflight || r->holders) { host_unlock(&registry_lock); return error(EBUSY); }
+    if (!r) { host_unlock(&registry_lock); restore_guest_fs(); return error(EINVAL); }
+    int has_holders = 0;
+    host_lock(&r->lock);
+    for (int i = 0; i < MAX_HOLDERS_PER_RWLOCK; ++i) {
+        if (r->holders[i].readers || r->holders[i].writer || r->holders[i].pending) {
+            has_holders = 1;
+            break;
+        }
+    }
+    if (r->inflight || has_holders) {
+        host_unlock(&r->lock);
+        host_unlock(&registry_lock);
+        restore_guest_fs();
+        return error(EBUSY);
+    }
+    host_unlock(&r->lock);
     int e=native_destroy(&r->native);
     if (!e) {
         Rwlock **link=&registry;
-        while (*link!=r) link=&(*link)->next;
-        *link=r->next; runtime_low_free(r); *handle=(Rwlock *)(uintptr_t)1;
+        while (*link && *link!=r) link=&(*link)->next;
+        if (*link) *link=r->next;
+        r->magic=0;
+        runtime_low_free(r);
+        *handle=(Rwlock *)(uintptr_t)1;
     }
-    host_unlock(&registry_lock); return error(e);
+    host_unlock(&registry_lock);
+    restore_guest_fs();
+    return error(e);
 }
 
 void runtime_rwlock_dump_info(void *f_ptr, void *handle) {
@@ -212,7 +287,9 @@ void runtime_rwlock_dump_info(void *f_ptr, void *handle) {
         return;
     }
     fprintf(f, "    [rwlock %p: inflight=%u]\n", handle, r->inflight);
-    for (Holder *h = r->holders; h; h = h->next) {
+    for (int i = 0; i < MAX_HOLDERS_PER_RWLOCK; ++i) {
+        Holder *h = &r->holders[i];
+        if (!h->thread && !h->readers && !h->writer && !h->pending) continue;
         const char *th_name = "unknown";
         for (GuestThread *t = runtime_thread_get_all(); t; t = t->next) {
 #ifdef _WIN32

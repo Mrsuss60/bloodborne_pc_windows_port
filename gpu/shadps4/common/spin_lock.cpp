@@ -3,6 +3,8 @@
 
 #include "common/spin_lock.h"
 
+#include <thread>
+
 #if _MSC_VER
 #include <intrin.h>
 #if _M_AMD64
@@ -34,8 +36,21 @@ void ThreadPause() {
 namespace Common {
 
 void SpinLock::lock() {
-    while (lck.test_and_set(std::memory_order_acquire)) {
-        ThreadPause();
+    for (;;) {
+        if (!lck.test_and_set(std::memory_order_acquire)) {
+            return;
+        }
+        for (unsigned spin = 0; lck.test(std::memory_order_relaxed); ++spin) {
+            if (spin < 16) {
+                ThreadPause();
+            } else if (spin < 64) {
+                for (unsigned p = 0; p < 4; ++p) {
+                    ThreadPause();
+                }
+            } else {
+                std::this_thread::yield();
+            }
+        }
     }
 }
 

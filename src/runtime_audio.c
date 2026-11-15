@@ -174,7 +174,7 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
     uint64_t period=(uint64_t)p->frames*1000000000u/48000u;
     if (data) {
         /* Apply per-channel volume and map PS4 8ch (L R C LFE SL SR BL BR) to SDL 7.1 order. */
-        unsigned char converted[2048*8*4];
+        static __thread unsigned char converted[2048*8*4];
         static const int remap[8]={0,1,2,3,6,7,4,5};
         for (size_t f=0;f<(size_t)p->frames;++f) for (int c=0;c<p->channels;++c) {
             int target=p->channels==8 && !p->std_layout ? remap[c] : c;
@@ -203,11 +203,21 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             }
         }
 
+        uint64_t sleep_target = 0;
         if (pace) {
             uint64_t now=now_ns();
             if (!p->next_deadline_ns || now>p->next_deadline_ns+8*period) p->next_deadline_ns=now; /* start or stall: restart cadence */
-            else sleep_until(p->next_deadline_ns);
+            else sleep_target = p->next_deadline_ns;
             p->next_deadline_ns+=period;
+        }
+        if (sleep_target) {
+            host_unlock(&p->lock);
+            sleep_until(sleep_target);
+            host_lock(&p->lock);
+            if (!p->used) {
+                host_unlock(&p->lock);
+                return data ? (int32_t)samples : 0;
+            }
         }
 
         if (p->stream) {

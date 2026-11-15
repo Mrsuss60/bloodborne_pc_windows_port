@@ -175,6 +175,10 @@ Presenter::~Presenter() {
     }
 
     const vk::Device device = instance.GetDevice();
+    if (upscaled_view) {
+        device.destroyImageView(upscaled_view);
+        upscaled_view = VK_NULL_HANDLE;
+    }
     for (auto& frame : present_frames) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
@@ -387,20 +391,29 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     vk::Extent2D image_size{};
     if (upscaled) {
         const auto device = instance.GetDevice();
-        image_view = Check(device.createImageView({
-            .image = display.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = view_info.format,
-            .components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-                           vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eOne},
-            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-        }));
-        draw_scheduler.DeferOperation([device, image_view] { device.destroyImageView(image_view); });
+        if (!upscaled_view || upscaled_view_image != display.image ||
+            upscaled_view_format != view_info.format) {
+            if (const vk::ImageView old_view = upscaled_view) {
+                draw_scheduler.DeferOperation([device, old_view] { device.destroyImageView(old_view); });
+            }
+            upscaled_view = Check(device.createImageView({
+                .image = display.image,
+                .viewType = vk::ImageViewType::e2D,
+                .format = view_info.format,
+                .components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
+                               vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eOne},
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            }));
+            upscaled_view_image = display.image;
+            upscaled_view_format = view_info.format;
+        }
+        image_view = upscaled_view;
         image_size = vk::Extent2D{display.width, display.height};
         const vk::ImageMemoryBarrier2 to_read{
             .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eFragmentShader,
             .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
             .oldLayout = vk::ImageLayout::eGeneral,
             .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -562,11 +575,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // Recreate the swapchain if the window was resized.
     if (win_w != swapchain.GetWidth() || win_h != swapchain.GetHeight()) {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
         swapchain.Recreate(win_w, win_h);
     }
 
     if (!swapchain.AcquireNextImage()) {
-        swapchain.Recreate(win_w, win_h);
+        {
+            std::scoped_lock submit_lock{Scheduler::submit_mutex};
+            swapchain.Recreate(win_w, win_h);
+        }
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
@@ -615,7 +632,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
             vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite |
+                                 vk::AccessFlagBits::eShaderWrite |
+                                 vk::AccessFlagBits::eTransferWrite,
                 .dstAccessMask = vk::AccessFlagBits::eTransferRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eTransferSrcOptimal,
@@ -625,21 +644,31 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
         };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput |
+                                   vk::PipelineStageFlagBits::eComputeShader |
+                                   vk::PipelineStageFlagBits::eTransfer,
                                vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
                                {}, {}, pre_barriers);
-        const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
-        cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, black, color_range);
-        const vk::MemoryBarrier clear_done{
-            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-        };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
-                               vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
+        const vk::ImageBlit blit =
+            MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height);
+        const bool covers_swapchain =
+            blit.dstOffsets[0].x <= 0 && blit.dstOffsets[0].y <= 0 &&
+            blit.dstOffsets[1].x >= static_cast<s32>(extent.width) &&
+            blit.dstOffsets[1].y >= static_cast<s32>(extent.height);
+        if (!covers_swapchain) {
+            const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+            cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, black,
+                                   color_range);
+            const vk::MemoryBarrier clear_done{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            };
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                   vk::PipelineStageFlagBits::eTransfer,
+                                   vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
+        }
         cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
-                         vk::ImageLayout::eTransferDstOptimal,
-                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
-                         vk::Filter::eLinear);
+                         vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         const bool overlay = BbOverlay::Visible();
         const std::array post_barriers{
@@ -667,8 +696,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
         };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                               vk::PipelineStageFlagBits::eAllCommands,
+        const vk::PipelineStageFlags post_dst_stage =
+            overlay ? (vk::PipelineStageFlagBits::eColorAttachmentOutput |
+                       vk::PipelineStageFlagBits::eFragmentShader)
+                    : vk::PipelineStageFlagBits::eColorAttachmentOutput;
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, post_dst_stage,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
         if (overlay) {
             BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent);

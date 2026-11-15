@@ -58,16 +58,31 @@ int host_thread_join(HostThread thread) {
 }
 void host_thread_detach(HostThread thread) { CloseHandle(thread); }
 
-static uint64_t qpc_frequency(void) {
-    static uint64_t frequency;
-    if (!frequency) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); frequency = (uint64_t)f.QuadPart; }
-    return frequency;
+static uint64_t s_qpc_frequency = 0;
+static int s_qpc_is_10mhz = 0;
+
+static void init_qpc(void) {
+    if (!s_qpc_frequency) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_qpc_frequency = (uint64_t)f.QuadPart;
+        s_qpc_is_10mhz = (s_qpc_frequency == 10000000ULL);
+    }
 }
+
 uint64_t host_monotonic_ns(void) {
+    if (!s_qpc_frequency) init_qpc();
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
-    uint64_t f = qpc_frequency(), n = (uint64_t)c.QuadPart;
-    return n / f * 1000000000u + n % f * 1000000000u / f;
+    uint64_t n = (uint64_t)c.QuadPart;
+    if (s_qpc_is_10mhz) {
+        return n * 100ULL;
+    }
+#if defined(__SIZEOF_INT128__)
+    return (uint64_t)(((unsigned __int128)n * 1000000000ULL) / s_qpc_frequency);
+#else
+    return n / s_qpc_frequency * 1000000000ULL + (n % s_qpc_frequency) * 1000000000ULL / s_qpc_frequency;
+#endif
 }
 uint64_t host_realtime_ns(void) {
     FILETIME t;
@@ -76,9 +91,9 @@ uint64_t host_realtime_ns(void) {
     return (ticks - UINT64_C(116444736000000000)) * 100;
 }
 static __thread HANDLE sleep_timer;
-/* High-resolution waitable timers (Windows 10 1803+) wake within ~0.5 ms; spin only for the last ~100 us. */
+/* High-resolution waitable timers (Windows 10 1803+) wake within ~0.5 ms; spin briefly only for the tail ~20 us. */
 void host_sleep_until_ns(uint64_t deadline) {
-    enum { SPIN_NS = 100000 };
+    enum { SPIN_NS = 20000 };
     uint64_t now = host_monotonic_ns();
     if (now >= deadline) return;
     if (deadline - now > SPIN_NS) {
@@ -96,7 +111,7 @@ void host_sleep_until_ns(uint64_t deadline) {
     while (host_monotonic_ns() < deadline) YieldProcessor();
 }
 void host_sleep_ns(uint64_t ns) {
-    if (!ns) { SwitchToThread(); return; }
+    if (!ns) { YieldProcessor(); SwitchToThread(); return; }
     host_sleep_until_ns(host_monotonic_ns() + ns);
 }
 #else

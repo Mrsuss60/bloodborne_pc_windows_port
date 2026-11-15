@@ -47,10 +47,14 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
         auto& block = ring.blocks.emplace_back(Block{
             .buffer = std::make_unique<VideoCore::StreamBuffer>(
                 instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
-            .last_used_frame = frame,
+            .last_used_frame = frame.load(std::memory_order_relaxed),
         });
+        // Touch one byte per OS page to populate mappings without zeroing 128 MiB of WC memory.
         if (!block.buffer->mapped_data.empty()) {
-            std::memset(block.buffer->mapped_data.data(), 0, block.buffer->mapped_data.size());
+            volatile u8* mapped = block.buffer->mapped_data.data();
+            for (size_t off = 0; off < block.buffer->mapped_data.size(); off += 4096) {
+                mapped[off] = 0;
+            }
         }
     }
 }
@@ -81,18 +85,19 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
         }
     }
 
+    const u64 cur_frame = frame.load(std::memory_order_relaxed);
     if (!best) {
         best = &ring.blocks.emplace_back(Block{
             .buffer =
                 std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type, BLOCK_SIZE),
-            .last_used_frame = frame,
+            .last_used_frame = cur_frame,
         });
         ring.current = ring.blocks.size() - 1;
         best_offset = *best->buffer->Reserve(size, alignment, false);
     }
 
     auto& buffer = *best->buffer;
-    best->last_used_frame = frame;
+    best->last_used_frame = cur_frame;
 
     StagingBufferRef ref{
         .buffer = &buffer,
@@ -107,8 +112,10 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
 }
 
 StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred) {
+    std::scoped_lock lk{large_mutex};
     auto& cache = large_caches[u32(type)];
     const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
+    const u64 cur_frame = frame.load(std::memory_order_relaxed);
 
     LargeBuffer* best{};
     for (LargeBuffer& entry : cache) {
@@ -127,13 +134,13 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
                                                           type, "StagingBufferPool:Dedicated"),
             .tick = 0,
-            .last_used_frame = frame,
+            .last_used_frame = cur_frame,
             .held = false,
         });
     }
 
     best->tick = scheduler.CurrentTick();
-    best->last_used_frame = frame;
+    best->last_used_frame = cur_frame;
     best->held = deferred;
 
     VideoCore::Buffer& buffer = *best->buffer;
@@ -150,31 +157,36 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 }
 
 void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
+    std::scoped_lock lk{large_mutex};
     auto& cache = large_caches[u32(ref.type)];
     const auto it = std::ranges::find_if(
         cache, [&](const LargeBuffer& entry) { return entry.buffer.get() == ref.buffer; });
     ASSERT_MSG(it != cache.end() && it->held, "FreeDeferred on an allocation that is not held");
     it->held = false;
     it->tick = scheduler.CurrentTick();
-    it->last_used_frame = frame;
+    it->last_used_frame = frame.load(std::memory_order_relaxed);
 }
 
 void StagingBufferPool::TickFrame() {
-    ++frame;
+    frame.fetch_add(1, std::memory_order_relaxed);
     for (Ring& ring : rings) {
         TrimRing(ring);
     }
-    for (auto& cache : large_caches) {
-        TrimLarge(cache);
+    {
+        std::scoped_lock lk{large_mutex};
+        for (auto& cache : large_caches) {
+            TrimLarge(cache);
+        }
     }
     PublishStats();
 }
 
 void StagingBufferPool::TrimRing(Ring& ring) {
     auto& blocks = ring.blocks;
+    const u64 cur_frame = frame.load(std::memory_order_relaxed);
     for (size_t i = blocks.size(); i-- > 0;) {
         const Block& block = blocks[i];
-        if (blocks.size() <= keep_blocks || frame - block.last_used_frame < RING_IDLE_FRAMES ||
+        if (blocks.size() <= keep_blocks || cur_frame - block.last_used_frame < RING_IDLE_FRAMES ||
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
@@ -191,8 +203,9 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
-    std::erase_if(cache, [this](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
+    const u64 cur_frame = frame.load(std::memory_order_relaxed);
+    std::erase_if(cache, [this, cur_frame](const LargeBuffer& entry) {
+        return !entry.held && cur_frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
                scheduler.IsFree(entry.tick);
     });
 }
@@ -205,16 +218,22 @@ void StagingBufferPool::PublishStats() const {
     static constexpr std::array<const char*, NUM_TYPES> names = {"DeviceLocal", "HostUncached",
                                                                  "HostCached"};
     GpuMemoryGroup group{.name = "Staging"};
+    std::array<u64, NUM_TYPES> ring_bytes{};
     for (size_t i = 0; i < NUM_TYPES; ++i) {
-        u64 bytes = 0;
         for (const Block& block : rings[i].blocks) {
-            bytes += block.buffer->SizeBytes();
+            ring_bytes[i] += block.buffer->SizeBytes();
         }
-        for (const LargeBuffer& entry : large_caches[i]) {
-            bytes += entry.buffer->SizeBytes();
-        }
-        if (bytes != 0) {
-            group.rows.push_back({.name = names[i], .bytes = bytes});
+    }
+    {
+        std::scoped_lock lk{large_mutex};
+        for (size_t i = 0; i < NUM_TYPES; ++i) {
+            u64 bytes = ring_bytes[i];
+            for (const LargeBuffer& entry : large_caches[i]) {
+                bytes += entry.buffer->SizeBytes();
+            }
+            if (bytes != 0) {
+                group.rows.push_back({.name = names[i], .bytes = bytes});
+            }
         }
     }
     GpuMemoryViewer::Publish(std::move(group));

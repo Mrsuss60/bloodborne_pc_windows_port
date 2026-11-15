@@ -70,48 +70,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
     }
 
-    const vk::PushConstantRange push_constants = {
-        .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        .offset = 0,
-        .size = sizeof(Shader::PushData),
-    };
-
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
-    const auto flags = uses_push_descriptors
-                           ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-                           : vk::DescriptorSetLayoutCreateFlagBits{};
-    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = flags,
-        .bindingCount = static_cast<u32>(bindings.size()),
-        .pBindings = bindings.data(),
-    };
+    const bool use_push = binding < instance.MaxPushDescriptors();
+    InitCanonicalLayouts(bindings, use_push);
     const auto device = instance.GetDevice();
-    auto [descriptor_set_result, descriptor_set] =
-        device.createDescriptorSetLayoutUnique(desc_layout_ci);
-    if (descriptor_set_result != vk::Result::eSuccess) {
-        throw std::runtime_error("Failed to create compute descriptor set layout: " +
-                                 vk::to_string(descriptor_set_result));
-    }
-    desc_layout = std::move(descriptor_set);
-
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 1U,
-        .pPushConstantRanges = &push_constants,
-    };
-    auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    if (layout_result != vk::Result::eSuccess) {
-        throw std::runtime_error("Failed to create compute pipeline layout: " +
-                                 vk::to_string(layout_result));
-    }
-    pipeline_layout = std::move(layout);
-    SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .stage = shader_ci,
-        .layout = *pipeline_layout,
+        .layout = pipeline_layout,
     };
     /* bbport: a VkPipelineCache needs external synchronization; the async workers share this one
      * with the GPU thread. Failure is raised to PipelineCache (which skips the pipeline) instead

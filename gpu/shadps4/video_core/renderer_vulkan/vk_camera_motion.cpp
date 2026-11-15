@@ -448,6 +448,9 @@ void CameraMotion::Overlay(VideoCore::ImageId frame) {
         }
         return;
     }
+    if (!depth.backing || !color.backing) {
+        return;
+    }
     const auto device = instance.GetDevice();
     const auto depth_view = Check(device.createImageView({
         .image = vk::Image(depth.backing->image),

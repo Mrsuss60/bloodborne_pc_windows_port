@@ -307,6 +307,7 @@ private:
     vk::UniquePipelineLayout taa_sharpen_pipeline_layout;
     vk::UniquePipeline taa_sharpen_pipeline;
     vk::UniquePipeline taa_sharpen_ldr_pipeline;
+    vk::UniquePipeline extra_sharpen_pipeline;
     vk::UniqueDescriptorSetLayout debug_desc_layout;
     vk::UniquePipelineLayout debug_pipeline_layout;
     vk::UniquePipeline debug_pipeline, debug_ldr_pipeline;
@@ -334,6 +335,7 @@ private:
     VideoCore::UniqueImage extra_sharpen_image;
     vk::UniqueImageView extra_sharpen_view;
     u32 extra_sharpen_width = 0, extra_sharpen_height = 0;
+    vk::Format extra_sharpen_format{};
     vk::UniqueImageView ui_storage_view;
 };
 

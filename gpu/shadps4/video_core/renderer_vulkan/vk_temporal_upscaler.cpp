@@ -25,6 +25,7 @@
 #include "video_core/host_shaders/taa_comp.h"
 #include "video_core/host_shaders/taa_sharpen_comp.h"
 #include "video_core/host_shaders/taa_sharpen_ldr_comp.h"
+#include "video_core/host_shaders/extra_sharpen_comp.h"
 #include "video_core/host_shaders/fsr4_decode_comp.h"
 #include "video_core/host_shaders/fsr4_encode_comp.h"
 #include "video_core/host_shaders/fsr4_reactive_comp.h"
@@ -832,6 +833,7 @@ void TemporalUpscaler::CreatePipelines() {
     storage_layout(2, taa_sharpen_desc_layout, taa_sharpen_pipeline_layout, sizeof(float));
     taa_sharpen_pipeline = compute(TAA_SHARPEN_COMP, *taa_sharpen_pipeline_layout);
     taa_sharpen_ldr_pipeline = compute(TAA_SHARPEN_LDR_COMP, *taa_sharpen_pipeline_layout);
+    extra_sharpen_pipeline = compute(EXTRA_SHARPEN_COMP, *taa_sharpen_pipeline_layout);
     storage_layout(1, fsr4_encode_desc_layout, fsr4_encode_pipeline_layout, sizeof(u32));
     {
         // Debug view: the target (storage), then the mask, motion and object motion (sampled).
@@ -1027,6 +1029,13 @@ void TemporalUpscaler::RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color,
         cmdbuf.pushConstants(*taa_sharpen_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
                              0, sizeof(strength), &strength);
         cmdbuf.dispatch((out_width + 7) / 8, (out_height + 7) / 8, 1);
+        const vk::MemoryBarrier2 post_sharpen{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                             vk::AccessFlagBits2::eTransferRead};
+        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &post_sharpen});
     }
     taa_next = 1 - taa_next;
 }
@@ -1044,7 +1053,8 @@ void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
         return;
     }
     const auto device = instance.GetDevice();
-    if (extra_sharpen_width != w || extra_sharpen_height != h) {
+    const vk::Format format = ldr ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR16G16B16A16Sfloat;
+    if (extra_sharpen_width != w || extra_sharpen_height != h || extra_sharpen_format != format) {
         // Submitted work may still read the old copy: destroyed once the GPU is past it. (A
         // Finish() here submitted the command buffer Run() goes on recording into.)
         scheduler.DeferOperation([image = std::move(extra_sharpen_image),
@@ -1055,26 +1065,29 @@ void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
         extra_sharpen_image = VideoCore::UniqueImage(device, instance.GetAllocator());
         extra_sharpen_image.Create(vk::ImageCreateInfo{
             .imageType = vk::ImageType::e2D,
-            .format = vk::Format::eR32G32B32A32Sfloat,
+            .format = format,
             .extent = {w, h, 1},
             .mipLevels = 1, .arrayLayers = 1, .samples = vk::SampleCountFlagBits::e1,
             .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
+            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst |
+                     vk::ImageUsageFlagBits::eTransferSrc,
             .initialLayout = vk::ImageLayout::eUndefined,
         });
         extra_sharpen_view = Check(device.createImageViewUnique({
             .image = vk::Image(extra_sharpen_image), .viewType = vk::ImageViewType::e2D,
-            .format = vk::Format::eR32G32B32A32Sfloat,
+            .format = format,
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         }));
         extra_sharpen_width = w;
         extra_sharpen_height = h;
+        extra_sharpen_format = format;
     }
     const vk::ImageView target_view = ldr ? UiStorageView(target) : *output_view;
+    const vk::Pipeline pipeline = ldr ? *taa_sharpen_ldr_pipeline : *extra_sharpen_pipeline;
     // bbport: the commands are recorded through the scheduler (a recording thread for FSR 3).
     scheduler.Record([target, copy = vk::Image(extra_sharpen_image),
                       copy_view = *extra_sharpen_view, target_view, extra, w, h,
-                      pipeline = ldr ? *taa_sharpen_ldr_pipeline : *taa_sharpen_pipeline,
+                      pipeline,
                       layout = *taa_sharpen_pipeline_layout](vk::CommandBuffer cmdbuf) {
         const auto image_barrier = [&](vk::Image image, vk::ImageLayout old_layout,
                                        vk::PipelineStageFlags2 src, vk::AccessFlags2 src_access,
@@ -1087,24 +1100,26 @@ void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
             cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
         };
         constexpr auto all = vk::PipelineStageFlagBits2::eAllCommands;
-        constexpr auto rw = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+        constexpr auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                            vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite;
         image_barrier(target, vk::ImageLayout::eGeneral, all, rw,
-                      vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
+                      vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         image_barrier(copy, vk::ImageLayout::eUndefined, all, rw,
-                      vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite);
-        const vk::ImageBlit region{
+                      vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+        const vk::ImageCopy region{
             .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-            .srcOffsets = std::array{vk::Offset3D{}, vk::Offset3D{s32(w), s32(h), 1}},
+            .srcOffset = vk::Offset3D{0, 0, 0},
             .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-            .dstOffsets = std::array{vk::Offset3D{}, vk::Offset3D{s32(w), s32(h), 1}},
+            .dstOffset = vk::Offset3D{0, 0, 0},
+            .extent = {w, h, 1},
         };
-        cmdbuf.blitImage(target, vk::ImageLayout::eGeneral, copy, vk::ImageLayout::eGeneral,
-                         region, vk::Filter::eNearest);
-        image_barrier(copy, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eBlit,
+        cmdbuf.copyImage(target, vk::ImageLayout::eGeneral, copy, vk::ImageLayout::eGeneral,
+                         region);
+        image_barrier(copy, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
                       vk::AccessFlagBits2::eTransferWrite,
                       vk::PipelineStageFlagBits2::eComputeShader,
                       vk::AccessFlagBits2::eShaderStorageRead);
-        image_barrier(target, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eBlit,
+        image_barrier(target, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
                       vk::AccessFlagBits2::eTransferRead,
                       vk::PipelineStageFlagBits2::eComputeShader,
                       vk::AccessFlagBits2::eShaderStorageWrite);
@@ -1287,6 +1302,9 @@ void TemporalUpscaler::OnSceneComposite() {
         mask_ready = RecordReactive(proxy.view);
         return;
     }
+    if (!color.backing) {
+        return;
+    }
     const auto device = instance.GetDevice();
     const auto color_view = Check(device.createImageView({
         .image = vk::Image(color.backing->image),
@@ -1437,7 +1455,8 @@ void TemporalUpscaler::Run() {
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
     };
     const auto all = vk::PipelineStageFlagBits2::eAllCommands;
-    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                    vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite;
     // Previous contents are not needed: the layouts start from undefined every frame.
     own_barrier(vk::Image(motion_image), vk::ImageLayout::eUndefined, all,
                 vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral,
@@ -1870,7 +1889,8 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
     static const bool copy_scene_depth = (std::getenv("BB_UI_DEPTH_COPY") != nullptr &&
                                           std::strcmp(std::getenv("BB_UI_DEPTH_COPY"), "1") == 0);
     const bool copy = copy_scene_depth && depth_id && depth_blit &&
-        texture_cache.GetImage(depth_id).info.pixel_format == ui_depth_format;
+        texture_cache.GetImage(depth_id).info.pixel_format == ui_depth_format &&
+        texture_cache.GetImage(depth_id).backing != nullptr;
     if (copy) {
         runtime.Transit(&texture_cache.GetImage(depth_id), vk::ImageLayout::eTransferSrcOptimal,
                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
@@ -2074,7 +2094,8 @@ void TemporalUpscaler::RunScaled() {
     const auto all = vk::PipelineStageFlagBits2::eAllCommands;
     const auto color_access = vk::AccessFlagBits2::eColorAttachmentRead |
                               vk::AccessFlagBits2::eColorAttachmentWrite;
-    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+    const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                    vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite;
     if (jitter[0] != 0.0f || jitter[1] != 0.0f) {
         ClampSceneEdges(scheduler, color_image, source_width, source_height);
     }

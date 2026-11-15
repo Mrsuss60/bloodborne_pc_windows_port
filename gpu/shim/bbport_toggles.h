@@ -35,7 +35,7 @@ enum : std::uint64_t {
     FaultWindow = 65536,
     ParallelCopies = 131072,
     AsyncFences = 262144,
-    PoolSmallCopies = 524288,
+    SmallCopiesOnRecorder = 524288, ///< on by default; bit set batches small copies on copy threads
     RecordPrefetch = 1ull << 32,
     TextureViewMemo = 1ull << 33,
     TextureBindHelper = 1ull << 34,
@@ -58,7 +58,7 @@ enum : std::uint64_t {
     UpdateImageFastPath = 1u << 30,
     /// Bit set: the texture collector frees nothing (A/B of its evictions while the game runs).
     TextureCollector = 1ull << 31,
-    // TAA A/B in one run: optional techniques, off by default (no measured gain, 2026-10-02).
+    // TAA techniques enabled by default (bit set: off; clear TaaDefaults bit 63 to invert).
     TaaTonemapBlend = 1ull << 51,
     TaaClip = 1ull << 52,
     TaaVariance = 1ull << 53,

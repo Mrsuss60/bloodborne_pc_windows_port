@@ -117,9 +117,23 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
-Liverpool::~Liverpool() {
+void Liverpool::StopProcessing() {
     process_thread.request_stop();
-    process_thread.join();
+    submit_cv.notify_all();
+    if (process_thread.joinable()) {
+#ifdef _WIN32
+        HANDLE h = (HANDLE)process_thread.native_handle();
+        if (h && WaitForSingleObject(h, 200) == WAIT_TIMEOUT) {
+            process_thread.detach();
+            return;
+        }
+#endif
+        process_thread.join();
+    }
+}
+
+Liverpool::~Liverpool() {
+    StopProcessing();
     while (!ce_submits.empty()) {
         ce_submits.front().destroy();
         ce_submits.pop();
@@ -145,10 +159,12 @@ void Liverpool::ProcessCeQueue() {
     task.resume();
     if (task.done()) {
         task.destroy();
-        std::scoped_lock lock{queue.m_access};
-        ce_submits.pop();
-        --num_submits;
+        {
+            std::scoped_lock lock{queue.m_access};
+            ce_submits.pop();
+        }
         std::scoped_lock lock2{submit_mutex};
+        --num_submits;
         submit_cv.notify_all();
     }
 }
@@ -223,12 +239,12 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
-
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
-
-                --num_submits;
+                {
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
+                }
                 std::scoped_lock lock2{submit_mutex};
+                --num_submits;
                 submit_cv.notify_all();
             }
         }
@@ -624,6 +640,24 @@ void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header,
             dirty->MarkField(regs, field);
         }
     };
+    const auto write_regs = [&](u32 base_offset) {
+        if (count <= 1) {
+            return;
+        }
+        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+        const u32 word_offset = base_offset + set_data->reg_offset;
+        const u32 num_words = count - 1;
+        if (word_offset >= Regs::NumRegs || num_words > Regs::NumRegs - word_offset) {
+            if (ReportPm4Issue()) {
+                LOG_WARNING(Render,
+                            "SetReg (gfx opcode={:#x}): range {:#x}+{} exceeds register array; skipped",
+                            u32(header->type3.opcode.Value()), word_offset, num_words);
+            }
+            return;
+        }
+        std::memcpy(&regs.reg_array[word_offset], payload, num_words * sizeof(u32));
+        mark(word_offset, num_words);
+    };
     switch (header->type3.opcode) {
     case PM4ItOpcode::ClearState:
         regs.SetDefaults();
@@ -632,38 +666,24 @@ void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header,
             dirty->reset = true;
         }
         break;
-    case PM4ItOpcode::SetConfigReg: {
-        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-        std::memcpy(&regs.reg_array[Regs::ConfigRegWordOffset + set_data->reg_offset], payload,
-                    (count - 1) * sizeof(u32));
-        mark(Regs::ConfigRegWordOffset + set_data->reg_offset, count - 1);
+    case PM4ItOpcode::SetConfigReg:
+        write_regs(Regs::ConfigRegWordOffset);
         break;
-    }
-    case PM4ItOpcode::SetContextReg: {
-        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-        std::memcpy(&regs.reg_array[Regs::ContextRegWordOffset + set_data->reg_offset], payload,
-                    (count - 1) * sizeof(u32));
-        mark(Regs::ContextRegWordOffset + set_data->reg_offset, count - 1);
+    case PM4ItOpcode::SetContextReg:
+        write_regs(Regs::ContextRegWordOffset);
         break;
-    }
     case PM4ItOpcode::SetShReg: {
         const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
         // The compute program range goes to the queue's cs_state, not to regs.
         if (!(set_data->reg_offset >= 0x200 &&
               set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4))) {
-            std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset], payload,
-                        (count - 1) * sizeof(u32));
-            mark(Regs::ShRegWordOffset + set_data->reg_offset, count - 1);
+            write_regs(Regs::ShRegWordOffset);
         }
         break;
     }
-    case PM4ItOpcode::SetUconfigReg: {
-        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-        std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset], payload,
-                    (count - 1) * sizeof(u32));
-        mark(Regs::UconfigRegWordOffset + set_data->reg_offset, count - 1);
+    case PM4ItOpcode::SetUconfigReg:
+        write_regs(Regs::UconfigRegWordOffset);
         break;
-    }
     case PM4ItOpcode::IndexType:
         regs.index_buffer_type.raw = reinterpret_cast<const PM4CmdDrawIndexType*>(header)->raw;
         mark_field(regs.index_buffer_type);
@@ -1759,27 +1779,39 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::SetShReg: {
+            const u32 count = header->type3.NumWords();
+            if (count <= 1) {
+                break;
+            }
             const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-            const auto set_size = (header->type3.NumWords() - 1) * sizeof(u32);
+            const u32 num_words = count - 1;
+            const u32 set_size = num_words * sizeof(u32);
 
             if (set_data->reg_offset >= 0x200 &&
                 set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                /* bbport: never memcpy past cs_state; skip a malformed packet instead. */
-                if (set_size > sizeof(ComputeProgram)) {
+                const u32 cs_word_offset = set_data->reg_offset - 0x200;
+                if (cs_word_offset + num_words > sizeof(ComputeProgram) / sizeof(u32)) {
                     if (ReportPm4Issue()) {
                         LOG_WARNING(Render,
-                                    "SetShReg (compute): packet size {} exceeds the compute "
-                                    "program block; skipped",
-                                    set_size);
+                                    "SetShReg (compute): size {} at offset {:#x} exceeds cs_state; skipped",
+                                    set_size, set_data->reg_offset.Value());
                     }
                     break;
                 }
                 auto* addr = reinterpret_cast<u32*>(&mapped_queues[vqid + 1].cs_state) +
-                             (set_data->reg_offset - 0x200);
+                             cs_word_offset;
                 std::memcpy(addr, header + 2, set_size);
             } else {
-                std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                            header + 2, set_size);
+                const u32 word_offset = Regs::ShRegWordOffset + set_data->reg_offset;
+                if (word_offset >= Regs::NumRegs || num_words > Regs::NumRegs - word_offset) {
+                    if (ReportPm4Issue()) {
+                        LOG_WARNING(Render,
+                                    "SetShReg (compute): range {:#x}+{} exceeds register array; skipped",
+                                    word_offset, num_words);
+                    }
+                    break;
+                }
+                std::memcpy(&regs.reg_array[word_offset], header + 2, set_size);
                 // bbport: interleaves with the graphics stream at an unpredictable point, so
                 // draw-preparation workers cannot reproduce it: make their checksums differ.
                 gfx_reg_checksum = HashRegisterPacket(gfx_reg_checksum ^ 0xA5C0A5C0A5C0ull,

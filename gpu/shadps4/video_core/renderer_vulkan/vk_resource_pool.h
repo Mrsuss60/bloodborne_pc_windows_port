@@ -70,7 +70,7 @@ class DescriptorHeap final {
 public:
     explicit DescriptorHeap(const Instance& instance, Semaphore* work_semaphore,
                             std::span<const vk::DescriptorPoolSize> pool_sizes,
-                            u32 descriptor_heap_count = 1024);
+                            u32 descriptor_heap_count = 2048);
     ~DescriptorHeap();
 
     vk::DescriptorSet Commit(vk::DescriptorSetLayout set_layout);

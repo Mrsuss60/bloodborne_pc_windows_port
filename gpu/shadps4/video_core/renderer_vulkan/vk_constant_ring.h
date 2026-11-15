@@ -7,9 +7,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
-#include <map>
+#include <bit>
+#include <vector>
 #include "shim/bb_env.h" 
 
 #include "common/assert.h"
@@ -25,8 +27,12 @@ public:
     static u64 CapacityFor(const Instance& instance) {
         const char* env = bb_env("BB_CONSTANT_RING_MB");
         const u64 mb = env ? std::strtoull(env, nullptr, 10) : 0;
-        const bool small = !instance.IsIntegrated() && instance.GetTotalMemoryBudget() <= (3ull << 30);
-        return (mb ? mb : small ? 16ull : 32ull) << 20;
+        if (mb) return mb << 20;
+        const u64 budget = instance.GetTotalMemoryBudget();
+        if (instance.IsIntegrated()) return 32ull << 20;
+        if (budget <= (2ull << 30)) return 24ull << 20;
+        if (budget <= (3ull << 30)) return 48ull << 20;
+        return 64ull << 20;
     }
     const u64 Capacity;
 
@@ -34,6 +40,9 @@ public:
         : Capacity{CapacityFor(instance)}, scheduler{scheduler_},
           buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "bbport constant ring"} {
         ASSERT(!buffer.mapped_data.empty());
+        const size_t ring_slots = std::bit_ceil(static_cast<size_t>((Capacity >> 16) + 4));
+        hold_until.assign(ring_slots, 0);
+        hold_mask = ring_slots - 1;
     }
 
     [[nodiscard]] vk::Buffer Handle() const noexcept {
@@ -48,20 +57,24 @@ public:
             at += Capacity - at % Capacity; // wrap to the ring start
         }
         const auto in_use = [&] { return at + size > Capacity && at + size - Capacity > retired; };
-        if (in_use()) {
+        if (in_use() || (position > retired + (Capacity / 2))) {
             Retire();
             if (in_use()) {
                 return std::nullopt;
             }
         }
-        while (!holds.empty() && (holds.begin()->first << 16) + Capacity < at + size) {
-            if (retired < holds.begin()->second) {
-                Retire();
-                if (retired < holds.begin()->second) {
-                    return std::nullopt;
+        while ((hold_head << 16) + Capacity < at + size) {
+            const u64 until = hold_until[hold_head & hold_mask];
+            if (until != 0) {
+                if (retired < until) {
+                    Retire();
+                    if (retired < until) {
+                        return std::nullopt;
+                    }
                 }
+                hold_until[hold_head & hold_mask] = 0;
             }
-            holds.erase(holds.begin());
+            ++hold_head;
         }
         position = at + size;
         last_at = at;
@@ -76,7 +89,8 @@ public:
         if (at + size > position || at + Capacity / 4 < position) {
             return std::nullopt;
         }
-        u64& until = holds[at >> 16];
+        const u64 block = at >> 16;
+        u64& until = hold_until[block & hold_mask];
         until = std::max(until, position + 1);
         return at % Capacity;
     }
@@ -141,7 +155,9 @@ private:
     u64 position = 0;     ///< stage A
     u64 retired = 0;      ///< stage A: the GPU is done with everything before this
     u64 last_at = 0;
-    std::map<u64, u64> holds;
+    std::vector<u64> hold_until;
+    u64 hold_head = 0;
+    size_t hold_mask = 0;
     u64 pending_end = 0, pending_tick = 0, last_published = 0; ///< stage B
     std::array<StampEntry, 1024> stamps{};
     alignas(64) std::atomic<u64> stamps_head{0}; ///< stage B writes

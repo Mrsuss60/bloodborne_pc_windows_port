@@ -91,7 +91,11 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_} {
     blit_helper = std::make_unique<VideoCore::BlitHelper>(instance, scheduler);
 
-    memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+    memory_barrier.dstStageMask =
+        vk::PipelineStageFlagBits2::eDrawIndirect | vk::PipelineStageFlagBits2::eIndexInput |
+        vk::PipelineStageFlagBits2::eVertexAttributeInput |
+        vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader |
+        vk::PipelineStageFlagBits2::eAllTransfer;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
 }
@@ -104,9 +108,9 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
                          std::span<const vk::BufferCopy> copies) {
     scheduler.EndRendering();
 
-    // bbport: many regions (HLE copy shaders) are tracked as one bounding range per buffer:
-    // conservative for barriers, and two tree lookups instead of two per region.
-    const bool bounded = copies.size() > 4;
+    // bbport: consolidate multiple subresource copy regions into single bounding range per buffer:
+    // reduces interval tree lookups from 2*N to 2 and batches barriers cleanly.
+    const bool bounded = copies.size() > 1;
     u64 src_min = ~0ULL, src_max = 0, dst_min = ~0ULL, dst_max = 0;
     if (bounded) {
         for (const auto& copy : copies) {
@@ -224,9 +228,21 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
                 vk::AccessFlagBits2::eTransferWrite);
-    for (const auto& copy : upload_copies) {
-        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
-        needs_flush |= IsBufferAccessed(src, copy.bufferOffset, copy_size);
+
+    const bool bounded = upload_copies.size() > 1;
+    u64 min_offset = ~0ULL, max_offset = 0;
+    if (bounded) {
+        for (const auto& copy : upload_copies) {
+            const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+            min_offset = std::min<u64>(min_offset, copy.bufferOffset);
+            max_offset = std::max<u64>(max_offset, copy.bufferOffset + copy_size);
+        }
+        needs_flush |= IsBufferAccessed(src, min_offset, max_offset - min_offset);
+    } else {
+        for (const auto& copy : upload_copies) {
+            const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+            needs_flush |= IsBufferAccessed(src, copy.bufferOffset, copy_size);
+        }
     }
     if (needs_flush) {
         FlushBarriers();
@@ -238,10 +254,15 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                                  regions.size(), regions.data());
     });
 
-    for (const auto& copy : upload_copies) {
-        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
-        AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+    if (bounded) {
+        AccessBuffer(src, min_offset, max_offset - min_offset, vk::PipelineStageFlagBits2::eCopy,
                      vk::AccessFlagBits2::eTransferRead);
+    } else {
+        for (const auto& copy : upload_copies) {
+            const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+            AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                         vk::AccessFlagBits2::eTransferRead);
+        }
     }
 
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -256,9 +277,21 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
                 vk::AccessFlagBits2::eTransferRead);
-    for (const auto& copy : download_copies) {
-        const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
-        needs_flush |= IsBufferAccessed(dst, copy.bufferOffset, copy_size, true);
+
+    const bool bounded = download_copies.size() > 1;
+    u64 min_offset = ~0ULL, max_offset = 0;
+    if (bounded) {
+        for (const auto& copy : download_copies) {
+            const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
+            min_offset = std::min<u64>(min_offset, copy.bufferOffset);
+            max_offset = std::max<u64>(max_offset, copy.bufferOffset + copy_size);
+        }
+        needs_flush |= IsBufferAccessed(dst, min_offset, max_offset - min_offset, true);
+    } else {
+        for (const auto& copy : download_copies) {
+            const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
+            needs_flush |= IsBufferAccessed(dst, copy.bufferOffset, copy_size, true);
+        }
     }
     if (needs_flush) {
         FlushBarriers();
@@ -270,10 +303,15 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                                  regions.size(), regions.data());
     });
 
-    for (const auto& copy : download_copies) {
-        const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
-        AccessBuffer(dst, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+    if (bounded) {
+        AccessBuffer(dst, min_offset, max_offset - min_offset, vk::PipelineStageFlagBits2::eCopy,
                      vk::AccessFlagBits2::eTransferWrite);
+    } else {
+        for (const auto& copy : download_copies) {
+            const auto copy_size = BufferImageCopySize(copy, src->info.pixel_format);
+            AccessBuffer(dst, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                         vk::AccessFlagBits2::eTransferWrite);
+        }
     }
 }
 
@@ -585,6 +623,9 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
 void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                            const VideoCore::SubresourceRange& src_range,
                            const VideoCore::SubresourceRange& dst_range) {
+    if (!src || !dst || !src->backing || !dst->backing) {
+        return;
+    }
     SetBackingSamples(dst, 1, false);
     scheduler.EndRendering();
 
@@ -725,8 +766,12 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
             vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
         constexpr auto dst_layout = vk::ImageLayout::eColorAttachmentOptimal;
         image_barriers.push_back(vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                            vk::PipelineStageFlagBits2::eComputeShader |
+                            vk::PipelineStageFlagBits2::eAllTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
+                             vk::AccessFlagBits2::eShaderWrite |
+                             vk::AccessFlagBits2::eTransferWrite,
             .dstStageMask = dst_stage,
             .dstAccessMask = dst_access,
             .oldLayout = vk::ImageLayout::eUndefined,

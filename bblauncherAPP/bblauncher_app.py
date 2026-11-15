@@ -129,13 +129,6 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.setFixedSize(1200, 720)
         self.setStyleSheet(STYLE_SHEET)
 
-        # Deferred background warming for secondary tabs after window is already shown
-        QTimer.singleShot(100, self._build_display_tab_now)
-        QTimer.singleShot(300, self._build_patches_tab_now)
-        QTimer.singleShot(500, self._build_mk_tab_now)
-        QTimer.singleShot(700, self._build_advanced_tab_now)
-        QTimer.singleShot(900, self._build_saves_tab_now)
-
         app = QApplication.instance()
         if app is not None:
             self._wheel_guard = WheelGuard(self)

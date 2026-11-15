@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: speculative draw preparation on worker threads (docs/parallel_gpu.md, steps 1-2).
 //
@@ -24,10 +25,10 @@
 #include <thread>
 #include <vector>
 
+#include "bbport_toggles.h"
 #include "common/types.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
-#include "bbport_toggles.h"
 #include <xxhash.h>
 
 namespace Vulkan {
@@ -39,6 +40,7 @@ struct PreparedStage {
     VAddr pgm_base;
     const u32* flat; ///< flattened user data the worker computed, owned by the submission
     u32 flat_size;
+    u64 flat_hash;
     // Resource sharps read from `flat` in the order of the program's resource lists, and the
     // texture description hash of each image (docs/parallel_gpu.md, step 2). Valid for the
     // GPU thread exactly when `flat` matched: sharps depend on nothing else.
@@ -122,6 +124,11 @@ public:
         return worker_count != 0;
     }
 
+    struct FlatChunkPool {
+        std::mutex mutex;
+        std::vector<std::unique_ptr<u32[]>> chunks;
+    };
+
     struct Submission;
     /// Game submit thread, outside the queue lock: copies and scans a top-level graphics
     /// command buffer. Null when disabled.
@@ -145,12 +152,27 @@ public:
         std::vector<u32> commands;
         std::unique_ptr<PreparedDraw[]> draws;
         u32 num_draws{};
+        std::shared_ptr<FlatChunkPool> chunk_pool;
         std::vector<std::unique_ptr<u32[]>> flat_chunks; ///< from the claiming worker
+        std::vector<u8> flat_chunk_poolable;             ///< 1 when chunk has ChunkWords capacity
         u64 start_checksum{}, end_checksum{}; ///< set by the scanner
         AmdGpu::RegDelta delta;                ///< registers written, values at the end
         std::atomic<bool> scanned{false};
         std::atomic<bool> claimed{false};
         std::atomic<bool> gpu_done{false};
+
+        ~Submission() {
+            if (!chunk_pool || flat_chunks.empty()) {
+                return;
+            }
+            std::scoped_lock lk{chunk_pool->mutex};
+            for (size_t i = 0; i < flat_chunks.size(); ++i) {
+                if (i < flat_chunk_poolable.size() && flat_chunk_poolable[i] &&
+                    flat_chunks[i] && chunk_pool->chunks.size() < 64) {
+                    chunk_pool->chunks.push_back(std::move(flat_chunks[i]));
+                }
+            }
+        }
     };
 
 private:
@@ -188,6 +210,7 @@ private:
     u32 worker_count = 0; ///< fixed before the worker threads start
     std::jthread scanner;
     std::vector<std::jthread> workers;
+    std::shared_ptr<FlatChunkPool> flat_chunk_pool = std::make_shared<FlatChunkPool>();
 };
 
 } // namespace Vulkan

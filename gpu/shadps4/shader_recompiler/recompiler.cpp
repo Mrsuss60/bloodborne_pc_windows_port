@@ -81,9 +81,8 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     // Clear any previous pooled data.
     pools.ReleaseContents();
 
-    // Create control flow graph
-    Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
-    Gcn::CFG cfg{gcn_block_pool, program.ins_list};
+    // Create control flow graph using reused pool from Pools
+    Gcn::CFG cfg{pools.gcn_block_pool, program.ins_list};
     EmitControlFlowGraph(program, pools, cfg, runtime_info, profile);
 
     // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate

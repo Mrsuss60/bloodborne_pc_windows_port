@@ -7,6 +7,7 @@
 #include "common/singleton.h"
 #include "common/types.h"
 
+#include <atomic>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -35,7 +36,7 @@ public:
     /// leaves through _Exit, so nothing else flushes them either).
     void Flush();
     [[nodiscard]] bool IsOpened() const {
-        return opened;
+        return opened.load(std::memory_order_acquire);
     }
     [[nodiscard]] const std::filesystem::path& Directory() const {
         return cache_path;
@@ -57,7 +58,7 @@ public:
 private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
-    bool opened{};
+    std::atomic<bool> opened{false};
 };
 
 } // namespace Storage

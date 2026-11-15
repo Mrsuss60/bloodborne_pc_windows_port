@@ -153,36 +153,66 @@ public:
         }
         cv.notify_all();
         for (auto& worker : workers) {
-            worker.join();
+#ifdef _WIN32
+            HANDLE h = (HANDLE)worker.native_handle();
+            if (h && WaitForSingleObject(h, 150) == WAIT_TIMEOUT) {
+                worker.detach();
+                continue;
+            }
+#endif
+            if (worker.joinable()) {
+                worker.join();
+            }
         }
     }
     void Submit(std::function<void()> job) {
         {
             std::scoped_lock lk{mutex};
-            jobs.push_back(std::move(job));
+            high_jobs.push_back(std::move(job));
         }
         cv.notify_one();
+    }
+    void SubmitLow(std::function<void()> job) {
+        {
+            std::scoped_lock lk{mutex};
+            low_jobs.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+    void DiscardPending() {
+        std::scoped_lock lk{mutex};
+        high_jobs.clear();
+        low_jobs.clear();
     }
 
 private:
     void Run() {
+#ifdef _WIN32
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
         for (;;) {
             std::function<void()> job;
             {
                 std::unique_lock lk{mutex};
-                cv.wait(lk, [&] { return stop || !jobs.empty(); });
-                if (jobs.empty()) {
+                cv.wait(lk, [&] { return stop || !high_jobs.empty() || !low_jobs.empty(); });
+                if (high_jobs.empty() && low_jobs.empty()) {
                     return; // stopping, every job done
                 }
-                job = std::move(jobs.front());
-                jobs.pop_front();
+                if (!high_jobs.empty()) {
+                    job = std::move(high_jobs.front());
+                    high_jobs.pop_front();
+                } else {
+                    job = std::move(low_jobs.front());
+                    low_jobs.pop_front();
+                }
             }
             job();
         }
     }
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<std::function<void()>> jobs;
+    std::deque<std::function<void()>> high_jobs;
+    std::deque<std::function<void()>> low_jobs;
     std::vector<std::thread> workers;
     bool stop = false;
 };
@@ -194,6 +224,7 @@ public:
     ~PipelineCache();
 
     void WarmUp();
+    void StartShaderImport();
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
@@ -203,7 +234,8 @@ public:
         std::function<std::unique_ptr<GraphicsPipeline>()> make;
     };
     bool LoadGraphicsPipeline(Serialization::Archive& ar, std::vector<PreloadJob>& jobs);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                           vk::ShaderModule precompiled = {});
 
     /// `indirect`: the draw's arguments are in memory (bbport: never skipped while compiling).
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
@@ -242,7 +274,7 @@ public:
 
 private:
     bool RefreshGraphicsKey(PipelineSelection& sel);
-    bool RefreshGraphicsStages(PipelineSelection& sel);
+    bool RefreshGraphicsStages(PipelineSelection& sel, bool rebind_motion_only = false);
     bool RefreshComputeKey();
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
@@ -329,8 +361,10 @@ private:
         bool saved = false;
         std::function<std::unique_ptr<GraphicsPipeline>()> make;
         std::atomic<bool> started{false};
+        std::atomic<bool> ready{false};
     };
     bool AsyncSkippable(const PipelineSelection& sel, bool indirect);
+    void RetirePendingGraphics();
     const GraphicsPipeline* FinishPipeline(const GraphicsPipelineKey& key, PendingPipeline& job);
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>> pending_graphics;
     u64 async_started = 0, async_skipped = 0, async_waited = 0; ///< statistics
@@ -344,7 +378,6 @@ private:
 
     struct ShaderImport;
     void SaveProfile();
-    void StartShaderImport();
 #ifdef _WIN32
     static bool LaunchShaderImport(ShaderImport& state);
 #endif
@@ -354,18 +387,43 @@ private:
         }
     }
     void MergeShaderImport(bool at_start);
-    void MergeImportedProgram(ShaderImport& state, size_t index);
-    void AdoptImportedProgram(ShaderImport& state, u64 hash, u64 perms);
+    void StartImportPrecompile(ShaderImport& state);
+    bool MergeImportedProgram(ShaderImport& state, size_t index,
+                              const std::function<bool()>& in_budget);
+    bool AdoptImportedProgram(ShaderImport& state, u64 hash, u64 perms,
+                              const std::function<bool()>& in_budget);
     void MergeImportedKey(ShaderImport& state, std::vector<u8>&& bytes);
     void QueueImportedCompute(ShaderImport& state, Serialization::Archive& ar);
     void QueueImportedGraphics(ShaderImport& state, Serialization::Archive& ar);
     std::optional<size_t> AdoptImportedPermutation(std::vector<u8>&& meta, std::vector<u32>&& spv,
-                                                   std::vector<u8>&& input);
+                                                   std::vector<u8>&& input,
+                                                   vk::ShaderModule precompiled = {});
     std::atomic<bool> import_ready{false};
     std::unique_ptr<ShaderImport> import;
 };
 
 struct PipelineCache::ShaderImport {
+    struct Precompiled {
+        vk::Device device;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::unordered_map<u64, vk::ShaderModule> modules;
+        std::atomic<u32> pending{0};
+
+        ~Precompiled() {
+            if (!device) {
+                return;
+            }
+            std::scoped_lock lk{mutex};
+            for (const auto& [_, mod] : modules) {
+                if (mod) {
+                    device.destroyShaderModule(mod);
+                }
+            }
+            modules.clear();
+        }
+    };
+
 #ifdef _WIN32
     std::atomic<void*> process{nullptr};
     std::wstring exe, command;
@@ -376,9 +434,10 @@ struct PipelineCache::ShaderImport {
     std::atomic<bool> running{false};
     std::thread watcher;
     bool listed = false, done = false;
+    bool adopting_program = false;
     std::vector<std::pair<u64, std::vector<std::filesystem::path>>> programs;
     std::vector<std::filesystem::path> keys;
-    size_t next_program = 0, next_key = 0;
+    size_t next_program = 0, next_perm = 0, next_key = 0;
     u32 frame = ~0u;
     u32 merged = 0, skipped = 0, queued = 0, compute = 0, adopted = 0;
     std::unordered_map<u64, u64> remap;
@@ -386,6 +445,21 @@ struct PipelineCache::ShaderImport {
     std::mutex compute_mutex;
     std::vector<std::pair<ComputePipelineKey, std::unique_ptr<ComputePipeline>>> compute_made;
     std::atomic<u32> compute_queued{0};
+    std::shared_ptr<Precompiled> precompiled;
+
+    vk::ShaderModule TakePrecompiled(u64 perm_hash) {
+        if (!precompiled) {
+            return {};
+        }
+        std::scoped_lock lk{precompiled->mutex};
+        const auto it = precompiled->modules.find(perm_hash);
+        if (it == precompiled->modules.end()) {
+            return {};
+        }
+        vk::ShaderModule mod = it->second;
+        precompiled->modules.erase(it);
+        return mod;
+    }
 
     ~ShaderImport() {
 #ifdef _WIN32
@@ -399,6 +473,13 @@ struct PipelineCache::ShaderImport {
         }
 #endif
         if (watcher.joinable()) {
+#ifdef _WIN32
+            HANDLE h = (HANDLE)watcher.native_handle();
+            if (h && WaitForSingleObject(h, 150) == WAIT_TIMEOUT) {
+                watcher.detach();
+                return;
+            }
+#endif
             watcher.join();
         }
     }

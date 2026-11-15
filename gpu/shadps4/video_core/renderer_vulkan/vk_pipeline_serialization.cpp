@@ -15,6 +15,7 @@
 #include <future>
 #include <string>
 #include <unordered_set>
+#include "bbport_settings.h"
 #include "common/hash.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h" 
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -245,6 +246,7 @@ void GraphicsPipeline::SerializationSupport::Serialize(Serialization::Archive& a
     sdata.Write(multisampling);
     sdata.Write(tcs);
     sdata.Write(tes);
+    sdata.Write(fragment);
 }
 
 bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
@@ -256,6 +258,11 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     sdata.Read(multisampling);
     sdata.Read(tcs);
     sdata.Read(tes);
+    if (!ar.IsEoS()) {
+        sdata.Read(fragment);
+    } else {
+        fragment.clear();
+    }
     return true;
 }
 
@@ -354,7 +361,14 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     return true;
 }
 
-bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
+bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                                      vk::ShaderModule precompiled) {
+    bool consumed = false;
+    SCOPE_EXIT {
+        if (!consumed && precompiled) {
+            instance.GetDevice().destroyShaderModule(precompiled);
+        }
+    };
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
@@ -379,38 +393,52 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         }
     }
 
-    std::vector<u32> spv{};
-    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
-                                       spv);
-    if (spv.empty() || spv[0] != 0x07230203u) {
-        LOG_WARNING(Render_Vulkan, "Cached shader binary {}_{:x}_{} is missing or invalid SPIR-V",
-                    program->info.hw_stage, program->info.pgm_hash, perm_idx);
-        return false;
+    vk::ShaderModule module = precompiled;
+    if (!module) {
+        std::vector<u32> spv{};
+        Storage::DataBase::Instance().Load(
+            Storage::BlobType::ShaderBinary,
+            fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx), spv);
+        if (spv.empty() || spv[0] != 0x07230203u) {
+            LOG_WARNING(Render_Vulkan,
+                        "Cached shader binary {}_{:x}_{} is missing or invalid SPIR-V",
+                        program->info.hw_stage, program->info.pgm_hash, perm_idx);
+            return false;
+        }
+
+        module = CompileSPV(spv, instance.GetDevice());
+        if (!module) {
+            return false;
+        }
     }
 
-    vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
-    if (!module) {
-        return false;
-    }
+    const u64 flat_hash =
+        XXH3_64bits(program->info.flattened_ud_buf.data(),
+                    program->info.flattened_ud_buf.size() * sizeof(u32));
 
     if (it_pgm == program_cache.end()) {
         Program* live = program.get();
-        live->InsertPermut(module, std::move(spec), perm_idx);
+        live->InsertPermut(module, std::move(spec), perm_idx, flat_hash);
+        consumed = true;
+        live->info_template = std::make_unique<Shader::Info>(live->info);
         program_cache.emplace(live->info.pgm_hash, std::move(program));
         sel.infos[stage] = &live->info;
     } else {
         Program* live = it_pgm.value().get();
+        if (!live->info_template) {
+            live->info_template = std::make_unique<Shader::Info>(live->info);
+        }
         // `spec` was built against the temporary program; point it at the live one before it is
         // stored (the previous code left a dangling Shader::Info in the module list).
         spec.info = &live->info;
         if (perm_idx < live->modules.size() && live->modules[perm_idx].spec.Valid()) {
             // The stored index is occupied by a different specialization. Appending keeps the
             // modules referenced by pipelines loaded earlier in this warm-up valid.
-            live->AddPermut(module, std::move(spec));
+            live->AddPermut(module, std::move(spec), flat_hash);
         } else {
-            live->InsertPermut(module, std::move(spec), perm_idx);
+            live->InsertPermut(module, std::move(spec), perm_idx, flat_hash);
         }
+        consumed = true;
         sel.infos[stage] = &live->info;
     }
     sel.modules[stage] = module;
@@ -513,13 +541,6 @@ void PipelineCache::WarmUp() {
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
     constexpr u32 CacheMagic = 0x42425043u;
-    const auto save_profile = [&]() {
-        u32 hdr[4] = {CacheMagic, Serialization::ShaderBinaryVersion, Serialization::ShaderMetaVersion, Serialization::PipelineKeyVersion};
-        std::vector<u8> data(sizeof(hdr) + sizeof(profile));
-        std::memcpy(data.data(), hdr, sizeof(hdr));
-        std::memcpy(data.data() + sizeof(hdr), &profile, sizeof(profile));
-        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile", std::move(data));
-    };
     if (profile_data.empty()) {
         Storage::DataBase::Instance().FinishPreload();
         SaveProfile();
@@ -585,11 +606,15 @@ void PipelineCache::WarmUp() {
                  "Cached shader profile matches this system; updating its version header to {} "
                  "without rebuilding the cache",
                  Serialization::ShaderBinaryVersion);
-        save_profile();
+        SaveProfile();
     }
 
     const char* env_warmup = std::getenv("BB_WARMUP_ASYNC");
-    const bool warmup_async = !env_warmup || (std::strcmp(env_warmup, "0") != 0);
+    const char* env_async = std::getenv("BB_ASYNC_PIPELINES");
+    const bool async_disabled = (env_async && env_async[0] == '0') ||
+                                (!env_async && BbSettings::Get().async_pipelines.load() == 0);
+    const bool warmup_async =
+        env_warmup ? (std::strcmp(env_warmup, "0") != 0) : !async_disabled;
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
@@ -631,10 +656,7 @@ void PipelineCache::WarmUp() {
                       e.what());
             Storage::DataBase::Instance().Clear();
             Storage::DataBase::Instance().FinishPreload();
-            profile_data.resize(sizeof(profile));
-            std::memcpy(profile_data.data(), &profile, sizeof(profile));
-            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                               std::move(profile_data));
+            SaveProfile();
             return;
         }
     } else {
@@ -663,6 +685,7 @@ void PipelineCache::WarmUp() {
         std::vector<WarmUpGraphicsEntry> staged_graphics;
         std::vector<WarmUpComputeEntry> staged_compute;
         std::vector<StagedPermut> staged_permutations;
+        tsl::robin_map<Program*, boost::container::small_vector<size_t, 4>> staged_by_program;
         tsl::robin_map<u64, std::shared_future<vk::ShaderModule>> spv_futures;
 
         auto stage_shader = [&](Serialization::Archive& ar,
@@ -705,25 +728,24 @@ void PipelineCache::WarmUp() {
             // is the shader's identity. Earlier sessions appended permutations in a different
             // order, so an equal specialization can be staged under another index. Reuse it and
             // keep the pipeline; this used to discard several hundred preloads per launch.
-            auto it = std::ranges::find_if(staged_permutations, [&](const StagedPermut& p) {
-                return p.program == program_ptr && p.spec == spec;
-            });
-            if (it != staged_permutations.end()) {
-                if (it->perm_idx != perm_idx) {
-                    ++num_reused_permutations;
+            auto& indices = staged_by_program[program_ptr];
+            for (const size_t idx : indices) {
+                const auto& p = staged_permutations[idx];
+                if (p.spec == spec) {
+                    if (p.perm_idx != perm_idx) {
+                        ++num_reused_permutations;
+                    }
+                    out_future = p.future;
+                    return true;
                 }
-                out_future = it->future;
-                return true;
             }
-
-            auto conflict_it = std::ranges::find_if(staged_permutations, [&](const StagedPermut& p) {
-                return p.program == program_ptr && p.perm_idx == perm_idx;
-            });
-            if (conflict_it != staged_permutations.end()) {
-                LOG_WARNING(Render_Vulkan,
-                            "Cached permutation index {} of {}_{:x} already used with different spec, skipping preload",
-                            perm_idx, program_ptr->info.hw_stage, program_ptr->info.pgm_hash);
-                return false;
+            for (const size_t idx : indices) {
+                if (staged_permutations[idx].perm_idx == perm_idx) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Cached permutation index {} of {}_{:x} already used with different spec, skipping preload",
+                                perm_idx, program_ptr->info.hw_stage, program_ptr->info.pgm_hash);
+                    return false;
+                }
             }
 
             auto task = std::make_shared<std::packaged_task<vk::ShaderModule()>>(
@@ -732,7 +754,8 @@ void PipelineCache::WarmUp() {
                 });
             out_future = task->get_future().share();
             spv_futures.emplace(perm_hash, out_future);
-            GetCompiler().Submit([task]() { (*task)(); });
+            GetCompiler().SubmitLow([task]() { (*task)(); });
+            indices.push_back(staged_permutations.size());
             staged_permutations.push_back(StagedPermut{
                 .program = program_ptr,
                 .perm_idx = perm_idx,
@@ -826,10 +849,7 @@ void PipelineCache::WarmUp() {
                       e.what());
             Storage::DataBase::Instance().Clear();
             Storage::DataBase::Instance().FinishPreload();
-            profile_data.resize(sizeof(profile));
-            std::memcpy(profile_data.data(), &profile, sizeof(profile));
-            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                               std::move(profile_data));
+            SaveProfile();
             return;
         }
 
@@ -838,35 +858,51 @@ void PipelineCache::WarmUp() {
             vk::ShaderModule mod = item.future.get();
             if (mod) {
                 std::unique_lock lk{programs_mutex};
-                item.program->InsertPermut(mod, std::move(item.spec), item.perm_idx);
-            }
-        }
-
-        // Pass 2: synchronous pipeline instantiation on startup thread
-        for (auto& entry : staged_compute) {
-            vk::ShaderModule mod = entry.future.get();
-            if (!mod) {
-                continue;
-            }
-            const auto [it, is_new] = compute_pipelines.try_emplace(entry.key);
-            if (is_new) {
-                try {
-                    it.value() = std::make_unique<ComputePipeline>(
-                        instance, scheduler, desc_heap, profile, *pipeline_cache, entry.key,
-                        *entry.info, mod, entry.sdata, true);
-                } catch (const std::exception& e) {
-                    /* bbport: one driver-refused cached pipeline is skipped, not fatal. */
-                    compute_pipelines.erase(entry.key);
-                    LOG_WARNING(Render_Vulkan, "Cached compute pipeline failed to create: {}",
-                                e.what());
-                    continue;
+                if (!item.program->info_template) {
+                    item.program->info_template = std::make_unique<Shader::Info>(item.program->info);
                 }
-                ++num_pipelines;
+                const u64 flat_hash =
+                    XXH3_64bits(item.program->info.flattened_ud_buf.data(),
+                                item.program->info.flattened_ud_buf.size() * sizeof(u32));
+                item.program->InsertPermut(mod, std::move(item.spec), item.perm_idx, flat_hash);
             }
         }
 
+        // Pass 2: pipeline instantiation
         const std::array<Shader::RuntimeInfo, MaxShaderStages> empty_runtime_infos{};
         if (warmup_async) {
+            struct ComputeResult {
+                ComputePipelineKey key;
+                std::unique_ptr<ComputePipeline> pipeline;
+            };
+            std::vector<std::future<ComputeResult>> compute_futures;
+            compute_futures.reserve(staged_compute.size());
+            for (auto& entry : staged_compute) {
+                if (compute_pipelines.find(entry.key) != compute_pipelines.end()) {
+                    continue;
+                }
+                auto task = std::make_shared<std::packaged_task<ComputeResult()>>(
+                    [this, key = entry.key, info = entry.info, future = entry.future,
+                     sdata = entry.sdata]() mutable -> ComputeResult {
+                        vk::ShaderModule mod = future.get();
+                        if (!mod) {
+                            return {};
+                        }
+                        try {
+                            auto pl = std::make_unique<ComputePipeline>(
+                                instance, scheduler, desc_heap, profile, *pipeline_cache, key,
+                                *info, mod, sdata, true);
+                            return {key, std::move(pl)};
+                        } catch (const std::exception& e) {
+                            LOG_WARNING(Render_Vulkan, "Cached compute pipeline failed to create: {}",
+                                        e.what());
+                            return {};
+                        }
+                    });
+                compute_futures.push_back(task->get_future());
+                GetCompiler().Submit([task]() { (*task)(); });
+            }
+
             for (auto& entry : staged_graphics) {
                 if (graphics_pipelines.find(entry.key) != graphics_pipelines.end() ||
                     pending_graphics.find(entry.key) != pending_graphics.end()) {
@@ -895,7 +931,8 @@ void PipelineCache::WarmUp() {
                 pending_graphics.emplace(entry.key, job);
                 ++num_pipelines;
                 g_bb_background_pipelines_total.fetch_add(1, std::memory_order_relaxed);
-                GetCompiler().Submit([job] {
+                const size_t key_hash = std::hash<GraphicsPipelineKey>{}(entry.key);
+                GetCompiler().SubmitLow([job, key_hash] {
                     SCOPE_EXIT {
                         g_bb_background_pipelines_done.fetch_add(1, std::memory_order_relaxed);
                     };
@@ -905,15 +942,51 @@ void PipelineCache::WarmUp() {
                     std::unique_ptr<GraphicsPipeline> pipeline;
                     try {
                         pipeline = job->make();
-                    } catch (const std::exception&) {
+                    } catch (const std::exception& e) {
+                        LOG_WARNING(Render_Vulkan, "WarmUp graphics pipeline {:#x} failed: {}",
+                                    key_hash, e.what());
                     }
                     std::unique_lock lk{job->mutex};
                     job->pipeline = std::move(pipeline);
                     job->done = true;
+                    job->ready.store(true, std::memory_order_release);
                     job->cv.notify_all();
                 });
             }
+
+            for (auto& fut : compute_futures) {
+                auto res = fut.get();
+                if (res.pipeline) {
+                    const auto [it, is_new] =
+                        compute_pipelines.try_emplace(res.key, std::move(res.pipeline));
+                    if (is_new) {
+                        ++num_pipelines;
+                    }
+                }
+            }
         } else {
+            for (auto& entry : staged_compute) {
+                vk::ShaderModule mod = entry.future.get();
+                if (!mod) {
+                    continue;
+                }
+                const auto [it, is_new] = compute_pipelines.try_emplace(entry.key);
+                if (is_new) {
+                    try {
+                        it.value() = std::make_unique<ComputePipeline>(
+                            instance, scheduler, desc_heap, profile, *pipeline_cache, entry.key,
+                            *entry.info, mod, entry.sdata, true);
+                    } catch (const std::exception& e) {
+                        /* bbport: one driver-refused cached pipeline is skipped, not fatal. */
+                        compute_pipelines.erase(entry.key);
+                        LOG_WARNING(Render_Vulkan, "Cached compute pipeline failed to create: {}",
+                                    e.what());
+                        continue;
+                    }
+                    ++num_pipelines;
+                }
+            }
+
             for (auto& entry : staged_graphics) {
                 bool all_stages_ok = true;
                 std::array<vk::ShaderModule, MaxShaderStages> modules{};
@@ -992,13 +1065,25 @@ void PipelineCache::SaveDriverPipelineCache() {
         return;
     }
     try {
+        const auto device = instance.GetDevice();
         vk::Result res{vk::Result::eSuccess};
         std::vector<u8> data;
-        {
-            /* Vulkan requires external synchronization on the VkPipelineCache handle, and the
-             * async compiler workers create pipelines concurrently (see vk_graphics_pipeline.cpp). */
+        // Clone via mergePipelineCaches under lock so getPipelineCacheData does not stall
+        // pipeline creation on GPU or worker threads.
+        auto [tmp_res, tmp_cache] = device.createPipelineCacheUnique({});
+        bool merged = false;
+        if (tmp_res == vk::Result::eSuccess && tmp_cache) {
             std::scoped_lock lock{PipelineCreationMutex()};
-            auto result = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+            merged = (device.mergePipelineCaches(*tmp_cache, {*pipeline_cache}) ==
+                      vk::Result::eSuccess);
+        }
+        if (merged) {
+            auto result = device.getPipelineCacheData(*tmp_cache);
+            res = result.result;
+            data = std::move(result.value);
+        } else {
+            std::scoped_lock lock{PipelineCreationMutex()};
+            auto result = device.getPipelineCacheData(*pipeline_cache);
             res = result.result;
             data = std::move(result.value);
         }
@@ -1065,11 +1150,23 @@ void PipelineCache::StopDriverCacheSaver() {
         driver_save_stop = true;
     }
     driver_save_cv.notify_all();
+#ifdef _WIN32
+    HANDLE h = (HANDLE)driver_save_thread.native_handle();
+    if (h && WaitForSingleObject(h, 150) == WAIT_TIMEOUT) {
+        driver_save_thread.detach();
+        return;
+    }
+#endif
     driver_save_thread.join();
 }
 
 void PipelineCache::Sync() {
     StopDriverCacheSaver();
+    if (compiler) {
+        compiler->DiscardPending();
+        compiler.reset();
+    }
+    import.reset();
     SaveDriverPipelineCache();
     Storage::DataBase::Instance().Close();
 }

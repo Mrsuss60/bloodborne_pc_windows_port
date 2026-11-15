@@ -93,16 +93,23 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     is_rendering = true;
     render_state = new_state;
 
-    std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
-    for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
+    u32 color_count = render_state.num_color_attachments;
+    while (color_count > 0 && !render_state.color_attachments[color_count - 1].image_view) {
+        --color_count;
+    }
+
+    std::array<vk::RenderingAttachmentInfo, 8> color_attachments{};
+    for (u32 i = 0; i < color_count; ++i) {
         const auto& cb = render_state.color_attachments[i];
-        color_attachments[i] = vk::RenderingAttachmentInfo{
-            .imageView = cb.image_view,
-            .imageLayout = cb.image_layout,
-            .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-            .storeOp = vk::AttachmentStoreOp::eStore,
-            .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
-        };
+        if (cb.image_view) {
+            color_attachments[i] = vk::RenderingAttachmentInfo{
+                .imageView = cb.image_view,
+                .imageLayout = cb.image_layout,
+                .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+                .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
+            };
+        }
     }
 
     const auto& db = render_state.depth_stencil_attachment;
@@ -131,8 +138,8 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                 .extent = {render_state.width, render_state.height},
             },
         .layerCount = render_state.num_layers,
-        .colorAttachmentCount = render_state.num_color_attachments,
-        .pColorAttachments = color_attachments.data(),
+        .colorAttachmentCount = color_count,
+        .pColorAttachments = color_count > 0 ? color_attachments.data() : nullptr,
         .pDepthAttachment = db.has_depth ? &depth_attachment : nullptr,
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
@@ -144,7 +151,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
     Record([info = rendering_info, color_attachments, depth_attachment,
             stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
-        info.pColorAttachments = color_attachments.data();
+        info.pColorAttachments = info.colorAttachmentCount > 0 ? color_attachments.data() : nullptr;
         if (info.pDepthAttachment) {
             info.pDepthAttachment = &depth_attachment;
         }
@@ -383,7 +390,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
         // hardware threads (Steam Deck: 8) the spin would take time from guest threads.
         static const auto spin_time = std::chrono::microseconds(
-            BbThreads::Available() >= 12 ? 200 : 20);
+            BbThreads::Available() >= 12 ? 200 : BbThreads::Available() <= 4 ? 4 : 20);
         const auto spin_until = std::chrono::steady_clock::now() + spin_time;
         for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
             __builtin_ia32_pause();
@@ -522,9 +529,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
+    static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands,
     };
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {

@@ -23,6 +23,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -3293,5 +3294,18 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("ut57TBmRQN0", "libSceGnmWaitFreeSubmit", 1, "libSceGnmDriver",
                  Func_BADE7B4C199140DD);
 };
+
+void FlushCachesOnExit() {
+    static std::atomic<bool> flushed{false};
+    if (flushed.exchange(true)) {
+        return;
+    }
+    if (liverpool) {
+        liverpool->StopProcessing();
+    }
+    if (presenter) {
+        presenter->GetRasterizer().GetPipelineCache().Sync();
+    }
+}
 
 } // namespace Libraries::GnmDriver

@@ -132,6 +132,12 @@ WindowSDL::~WindowSDL() {
     SDL_DestroyWindow(window);
 }
 
+void WindowSDL::Hide() {
+    if (window) {
+        SDL_HideWindow(window);
+    }
+}
+
 void WindowSDL::BeginTextInput(const std::string& initial, const std::string& prompt) {
     std::scoped_lock lock{text_mutex};
     text = initial;

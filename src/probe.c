@@ -201,9 +201,11 @@ void host_native_mouse_inject(void *cam, void *rsi_ctx, float dt) {
     const uint8_t lock_on_byte = *(volatile uint8_t*)(cam_addr + 0x260);
     const int captured = bbgpu_mouse_captured();
 
-    /* Diagnostic log once every 120 camera updates (approx 2s at 60 FPS) */
-    static uint64_t s_diag_counter = 0;
-    if ((s_diag_counter++ % 120) == 0) {
+    /* Diagnostic log once every 5 minutes (300,000 ms) */
+    static uint64_t s_last_diag_tick = 0;
+    uint64_t now_tick = GetTickCount64();
+    if (s_last_diag_tick == 0 || (now_tick - s_last_diag_tick) >= 300000ULL) {
+        s_last_diag_tick = now_tick;
         printf("[NATIVE MOUSE DIAG] cam=%p pitch=%.3f yaw=%.3f lock_on=%u captured=%d\n",
                cam, *(float*)(cam_addr + 0x140), *(float*)(cam_addr + 0x144), lock_on_byte, captured);
         fflush(stdout);
@@ -2300,11 +2302,31 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
             ((const unsigned char *)rip)[0] == 0xc7 &&
             ((const unsigned char *)rip)[1] == 0x04 &&
             ((const unsigned char *)rip)[2] == 0x25) {
+            static int stop = -1;
+            if (stop < 0) { const char *e = getenv("BB_GAME_ASSERT_STOP"); stop = e && e[0] == '1'; }
             InterlockedExchange(&g_crash_exit_code, 141);
             crash_begin();
             write_crash_dump(ep, fault_addr, rip, code);
             veh_write("[GAME ASSERT] Deliberate abort trap at guest offset 0x20b56d2 "
                       "(the last assertion that reached 0x20b55b0 is in the crash dump)\n");
+            if (stop) {
+                if (g_crash_test_hang) Sleep(INFINITE);
+                TerminateProcess(GetCurrentProcess(), 141);
+            }
+            uintptr_t frame_bp = ep->ContextRecord->Rbp;
+            if (frame_bp >= 0x1000 && !IsBadReadPtr((const void *)(frame_bp - 0x20), 0x30)) {
+                ep->ContextRecord->R15 = *(DWORD64 *)(frame_bp - 0x08);
+                ep->ContextRecord->R14 = *(DWORD64 *)(frame_bp - 0x10);
+                ep->ContextRecord->R12 = *(DWORD64 *)(frame_bp - 0x18);
+                ep->ContextRecord->Rbx = *(DWORD64 *)(frame_bp - 0x20);
+                ep->ContextRecord->Rip = *(DWORD64 *)(frame_bp + 0x08);
+                ep->ContextRecord->Rsp = frame_bp + 0x10;
+                ep->ContextRecord->Rbp = *(DWORD64 *)(frame_bp);
+                ep->ContextRecord->Rax = 0;
+                if (cur) cur->exception_count++;
+                veh_write("[GAME ASSERT] Recovered from abort trap (retail behaviour continuing)\n");
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             if (g_crash_test_hang) Sleep(INFINITE);
             TerminateProcess(GetCurrentProcess(), 141);
         }
@@ -2613,7 +2635,7 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                     return EXCEPTION_CONTINUE_EXECUTION;
                 } else if ((off >= 0x28d0164 && off < 0x28d02b4) ||
                            (off >= 0x28d02c4 && off < 0x28d046b) ||
-                           (off >= 0x28d0484 && off < 0x28d0505)) { // 0x28d0160, 0x28d02c0, 0x28d0480 (push rbp, r14, rbx)
+                           (off >= 0x28d0484 && off < 0x28d064e)) { // 0x28d0160, 0x28d02c0, 0x28d0480..0x28d064e (push rbp, r14, rbx)
                     ep->ContextRecord->Rbx = *(DWORD64 *)(rsp);
                     ep->ContextRecord->R14 = *(DWORD64 *)(rsp + 0x08);
                     ep->ContextRecord->Rbp = *(DWORD64 *)(rsp + 0x10);
@@ -2990,8 +3012,6 @@ int main(int argc, char **argv) {
                                            strtoull(argv[6], NULL, 16));
     if (argc == 3 && !strcmp(argv[1], "--rebuild-shader-cache"))
         return bbgpu_rebuild_shader_cache(argv[2]);
-    if (argc == 9 && !strcmp(argv[1], "--merge-shader-metas"))
-        return bbgpu_merge_shader_metas(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7], atoi(argv[8]));
 
 #ifdef _WIN32
     runtime_memory_reserve_space();
@@ -3259,8 +3279,6 @@ int main(int argc, char **argv) {
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
-        /* Rebuild caches from older compiler versions if needed */
-        bbgpu_rebuild_shader_caches();
     }
     image_size = size;
     resolved_targets = calloc(import_count + 1, sizeof(void *));
@@ -3282,7 +3300,7 @@ int main(int argc, char **argv) {
             is_unbound[i] = 1;
         }
     }
-    unsigned char *thunks = allocate(round_page((import_count + 16) * 32));
+    unsigned char *thunks = allocate(round_page((import_count + 32) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
@@ -3645,7 +3663,194 @@ int main(int argc, char **argv) {
                (void *)t, live_target, live_max_dt, g_live_clock_deltatime);
     } while (0);
 
-    protect(thunks, round_page((import_count + 16) * 32), 5);
+    /* Particle, blood splatter, and cloth vertex stream null pointer recovery hooks
+     * (Issue #127 / Discord 231500: prevents ~180k VEH exception dispatches on GXWorker threads). */
+    do {
+        const char *stream_env = getenv("BB_STREAM_GUARD");
+        if (stream_env && stream_env[0] == '0') break;
+        if (!is_cusa03173_v109() || size < 0x28d064e) break;
+
+        uint64_t dummy_addr = (uint64_t)(image + 0x489ab80);
+        int installed = 0;
+
+        /* Func 1: 0x28ce7b0, stream dereference at 0x28ce9b0 */
+        static const unsigned char f1_expected[8] = { 0x48, 0x8b, 0x7c, 0x24, 0xa0, 0x8b, 0x04, 0x07 };
+        if (memcmp(image + 0x28ce9b0, f1_expected, sizeof(f1_expected)) == 0) {
+            unsigned char *t = thunks + (import_count + 10) * 32;
+            uint64_t return_addr = (uint64_t)(image + 0x28ce9b8);
+            unsigned char stub[61] = {
+                0x48, 0x8b, 0x7c, 0x24, 0xa0,                         /* mov rdi, [rsp - 0x60] */
+                0x48, 0x85, 0xff,                                     /* test rdi, rdi */
+                0x75, 0x19,                                           /* jne test_rdi (offset 0x23) */
+                0x48, 0x8b, 0x7c, 0x24, 0x70,                         /* mov rdi, [rsp + 0x70] */
+                0x48, 0x85, 0xff,                                     /* test rdi, rdi */
+                0x75, 0x0a,                                           /* jne save_ptr (offset 0x1e) */
+                0x48, 0xbf, 0, 0, 0, 0, 0, 0, 0, 0,                   /* movabs rdi, dummy_addr */
+                0x48, 0x89, 0x7c, 0x24, 0xa0,                         /* save_ptr: mov [rsp - 0x60], rdi */
+                0x48, 0x85, 0xff,                                     /* test_rdi: test rdi, rdi */
+                0x75, 0x04,                                           /* jne do_read (offset 0x2c) */
+                0x31, 0xc0,                                           /* xor eax, eax */
+                0xeb, 0x03,                                           /* jmp do_ret (offset 0x2f) */
+                0x8b, 0x04, 0x07,                                     /* do_read: mov eax, [rdi + rax] */
+                0xff, 0x25, 0x00, 0x00, 0x00, 0x00,                   /* do_ret: jmp *(%rip + 0) */
+                0, 0, 0, 0, 0, 0, 0, 0                                /* return_addr */
+            };
+            memcpy(stub + 22, &dummy_addr, 8);
+            memcpy(stub + 53, &return_addr, 8);
+            memcpy(t, stub, sizeof(stub));
+
+            int64_t disp = (int64_t)t - (int64_t)(image + 0x28ce9b0 + 5);
+            if (disp >= INT32_MIN && disp <= INT32_MAX) {
+                int32_t rel = (int32_t)disp;
+                unsigned char jmp_over[8] = { 0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+                memcpy(jmp_over + 1, &rel, 4);
+                memcpy(image + 0x28ce9b0, jmp_over, sizeof(jmp_over));
+#ifdef _WIN32
+                FlushInstructionCache(GetCurrentProcess(), image + 0x28ce9b0, sizeof(jmp_over));
+                FlushInstructionCache(GetCurrentProcess(), t, sizeof(stub));
+#else
+                __builtin___clear_cache((char *)(image + 0x28ce9b0), (char *)(image + 0x28ce9b0 + sizeof(jmp_over)));
+                __builtin___clear_cache((char *)t, (char *)(t + sizeof(stub)));
+#endif
+                installed++;
+            }
+        }
+
+        /* Func 2: 0x28ceec0, stream dereference at 0x28cf0d1 */
+        static const unsigned char f2_expected[8] = { 0x48, 0x8b, 0x4c, 0x24, 0xa0, 0x8b, 0x0c, 0x01 };
+        if (memcmp(image + 0x28cf0d1, f2_expected, sizeof(f2_expected)) == 0) {
+            unsigned char *t = thunks + (import_count + 12) * 32;
+            uint64_t return_addr = (uint64_t)(image + 0x28cf0d9);
+            unsigned char stub[61] = {
+                0x48, 0x8b, 0x4c, 0x24, 0xa0,                         /* mov rcx, [rsp - 0x60] */
+                0x48, 0x85, 0xc9,                                     /* test rcx, rcx */
+                0x75, 0x19,                                           /* jne test_rcx (offset 0x23) */
+                0x48, 0x8b, 0x4c, 0x24, 0x60,                         /* mov rcx, [rsp + 0x60] */
+                0x48, 0x85, 0xc9,                                     /* test rcx, rcx */
+                0x75, 0x0a,                                           /* jne save_ptr (offset 0x1e) */
+                0x48, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0,                   /* movabs rcx, dummy_addr */
+                0x48, 0x89, 0x4c, 0x24, 0xa0,                         /* save_ptr: mov [rsp - 0x60], rcx */
+                0x48, 0x85, 0xc9,                                     /* test_rcx: test rcx, rcx */
+                0x75, 0x04,                                           /* jne do_read (offset 0x2c) */
+                0x31, 0xc9,                                           /* xor ecx, ecx */
+                0xeb, 0x03,                                           /* jmp do_ret (offset 0x2f) */
+                0x8b, 0x0c, 0x01,                                     /* do_read: mov ecx, [rcx + rax] */
+                0xff, 0x25, 0x00, 0x00, 0x00, 0x00,                   /* do_ret: jmp *(%rip + 0) */
+                0, 0, 0, 0, 0, 0, 0, 0                                /* return_addr */
+            };
+            memcpy(stub + 22, &dummy_addr, 8);
+            memcpy(stub + 53, &return_addr, 8);
+            memcpy(t, stub, sizeof(stub));
+
+            int64_t disp = (int64_t)t - (int64_t)(image + 0x28cf0d1 + 5);
+            if (disp >= INT32_MIN && disp <= INT32_MAX) {
+                int32_t rel = (int32_t)disp;
+                unsigned char jmp_over[8] = { 0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+                memcpy(jmp_over + 1, &rel, 4);
+                memcpy(image + 0x28cf0d1, jmp_over, sizeof(jmp_over));
+#ifdef _WIN32
+                FlushInstructionCache(GetCurrentProcess(), image + 0x28cf0d1, sizeof(jmp_over));
+                FlushInstructionCache(GetCurrentProcess(), t, sizeof(stub));
+#else
+                __builtin___clear_cache((char *)(image + 0x28cf0d1), (char *)(image + 0x28cf0d1 + sizeof(jmp_over)));
+                __builtin___clear_cache((char *)t, (char *)(t + sizeof(stub)));
+#endif
+                installed++;
+            }
+        }
+
+        /* Func 3: 0x28cf580, stream dereference at 0x28cf79b */
+        static const unsigned char f3_expected[8] = { 0x48, 0x8b, 0x54, 0x24, 0x98, 0x8b, 0x04, 0x02 };
+        if (memcmp(image + 0x28cf79b, f3_expected, sizeof(f3_expected)) == 0) {
+            unsigned char *t = thunks + (import_count + 14) * 32;
+            uint64_t return_addr = (uint64_t)(image + 0x28cf7a3);
+            unsigned char stub[61] = {
+                0x48, 0x8b, 0x54, 0x24, 0x98,                         /* mov rdx, [rsp - 0x68] */
+                0x48, 0x85, 0xd2,                                     /* test rdx, rdx */
+                0x75, 0x19,                                           /* jne test_rdx (offset 0x23) */
+                0x48, 0x8b, 0x54, 0x24, 0x48,                         /* mov rdx, [rsp + 0x48] */
+                0x48, 0x85, 0xd2,                                     /* test rdx, rdx */
+                0x75, 0x0a,                                           /* jne save_ptr (offset 0x1e) */
+                0x48, 0xba, 0, 0, 0, 0, 0, 0, 0, 0,                   /* movabs rdx, dummy_addr */
+                0x48, 0x89, 0x54, 0x24, 0x98,                         /* save_ptr: mov [rsp - 0x68], rdx */
+                0x48, 0x85, 0xd2,                                     /* test_rdx: test rdx, rdx */
+                0x75, 0x04,                                           /* jne do_read (offset 0x2c) */
+                0x31, 0xc0,                                           /* xor eax, eax */
+                0xeb, 0x03,                                           /* jmp do_ret (offset 0x2f) */
+                0x8b, 0x04, 0x02,                                     /* do_read: mov eax, [rdx + rax] */
+                0xff, 0x25, 0x00, 0x00, 0x00, 0x00,                   /* do_ret: jmp *(%rip + 0) */
+                0, 0, 0, 0, 0, 0, 0, 0                                /* return_addr */
+            };
+            memcpy(stub + 22, &dummy_addr, 8);
+            memcpy(stub + 53, &return_addr, 8);
+            memcpy(t, stub, sizeof(stub));
+
+            int64_t disp = (int64_t)t - (int64_t)(image + 0x28cf79b + 5);
+            if (disp >= INT32_MIN && disp <= INT32_MAX) {
+                int32_t rel = (int32_t)disp;
+                unsigned char jmp_over[8] = { 0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+                memcpy(jmp_over + 1, &rel, 4);
+                memcpy(image + 0x28cf79b, jmp_over, sizeof(jmp_over));
+#ifdef _WIN32
+                FlushInstructionCache(GetCurrentProcess(), image + 0x28cf79b, sizeof(jmp_over));
+                FlushInstructionCache(GetCurrentProcess(), t, sizeof(stub));
+#else
+                __builtin___clear_cache((char *)(image + 0x28cf79b), (char *)(image + 0x28cf79b + sizeof(jmp_over)));
+                __builtin___clear_cache((char *)t, (char *)(t + sizeof(stub)));
+#endif
+                installed++;
+            }
+        }
+
+        /* Func 4: 0x28cfba0, stream dereference at 0x28cfddd */
+        static const unsigned char f4_expected[9] = { 0x48, 0x8b, 0x74, 0x24, 0xa0, 0x44, 0x8b, 0x04, 0x0e };
+        if (memcmp(image + 0x28cfddd, f4_expected, sizeof(f4_expected)) == 0) {
+            unsigned char *t = thunks + (import_count + 16) * 32;
+            uint64_t return_addr = (uint64_t)(image + 0x28cfde6);
+            unsigned char stub[63] = {
+                0x48, 0x8b, 0x74, 0x24, 0xa0,                         /* mov rsi, [rsp - 0x60] */
+                0x48, 0x85, 0xf6,                                     /* test rsi, rsi */
+                0x75, 0x19,                                           /* jne test_rsi (offset 0x23) */
+                0x48, 0x8b, 0x74, 0x24, 0x58,                         /* mov rsi, [rsp + 0x58] */
+                0x48, 0x85, 0xf6,                                     /* test rsi, rsi */
+                0x75, 0x0a,                                           /* jne save_ptr (offset 0x1e) */
+                0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0,                   /* movabs rsi, dummy_addr */
+                0x48, 0x89, 0x74, 0x24, 0xa0,                         /* save_ptr: mov [rsp - 0x60], rsi */
+                0x48, 0x85, 0xf6,                                     /* test_rsi: test rsi, rsi */
+                0x75, 0x05,                                           /* jne do_read (offset 0x2d) */
+                0x45, 0x31, 0xc0,                                     /* xor r8d, r8d */
+                0xeb, 0x04,                                           /* jmp do_ret (offset 0x31) */
+                0x44, 0x8b, 0x04, 0x0e,                               /* do_read: mov r8d, [rsi + rcx] */
+                0xff, 0x25, 0x00, 0x00, 0x00, 0x00,                   /* do_ret: jmp *(%rip + 0) */
+                0, 0, 0, 0, 0, 0, 0, 0                                /* return_addr */
+            };
+            memcpy(stub + 22, &dummy_addr, 8);
+            memcpy(stub + 55, &return_addr, 8);
+            memcpy(t, stub, sizeof(stub));
+
+            int64_t disp = (int64_t)t - (int64_t)(image + 0x28cfddd + 5);
+            if (disp >= INT32_MIN && disp <= INT32_MAX) {
+                int32_t rel = (int32_t)disp;
+                unsigned char jmp_over[9] = { 0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90 };
+                memcpy(jmp_over + 1, &rel, 4);
+                memcpy(image + 0x28cfddd, jmp_over, sizeof(jmp_over));
+#ifdef _WIN32
+                FlushInstructionCache(GetCurrentProcess(), image + 0x28cfddd, sizeof(jmp_over));
+                FlushInstructionCache(GetCurrentProcess(), t, sizeof(stub));
+#else
+                __builtin___clear_cache((char *)(image + 0x28cfddd), (char *)(image + 0x28cfddd + sizeof(jmp_over)));
+                __builtin___clear_cache((char *)t, (char *)(t + sizeof(stub)));
+#endif
+                installed++;
+            }
+        }
+
+        if (installed > 0) {
+            printf("[STREAM GUARD] %d null stream recovery thunks installed for particle/cloth generators\n", installed);
+        }
+    } while (0);
+
+    protect(thunks, round_page((import_count + 32) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
     for (uint64_t i = 0; i < ns; ++i) {

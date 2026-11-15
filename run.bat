@@ -145,24 +145,23 @@ popd
 if "%live%"=="auto" for /f "delims=" %%c in ('out\bb-gpu-capabilities.exe --live-resolution 2^>nul') do set "live=%%c"
 if not "%live%"=="1" set "live=0"
 :live_chosen
+set "render_pixels=0"
 
 if "%live%"=="1" (
-    echo Output %scaled_output%: live resolution changes ^(live_resolution=0: startup patch^)
+    echo Output %scaled_output%: live resolution changes ^(live_resolution=1: live changes^)
 ) else if not "%scaled_output%"=="" (
     set "BB_RENDER_RES=%scaled_render%"
     set "BB_OUTPUT_RES=%scaled_output%"
     set "BB_AUTO_RENDER_RES=1"
-    if "%BB_DMEM_MB%"=="" set "BB_DMEM_MB=9152"
 )
-REM Outside the block, so the message shows the memory just set.
-if defined BB_AUTO_RENDER_RES echo Output %scaled_output%: scene %scaled_render%, direct memory %BB_DMEM_MB% MiB ^(live_resolution=1: live changes^)
 
-REM Explicit launcher resolutions skip scaled_output above, but patches.py still adds
-REM Increased Graphics Heap Sizes above 1080p. Match that patch's direct-memory budget.
-set "render_pixels=0"
 if defined BB_RENDER_RES for /f "tokens=1,2 delims=xX" %%a in ("%BB_RENDER_RES%") do set /a "render_pixels=%%a*%%b" >nul 2>nul
 if %render_pixels% GTR 2073600 if not defined BB_DMEM_MB set "BB_DMEM_MB=9152"
-if %render_pixels% GTR 2073600 echo Render %BB_RENDER_RES%: direct memory %BB_DMEM_MB% MiB
+
+REM Outside the block, so the message shows the memory just set.
+if defined BB_AUTO_RENDER_RES if defined BB_DMEM_MB echo Output %scaled_output%: scene %scaled_render%, direct memory %BB_DMEM_MB% MiB ^(live_resolution=0: startup patch^)
+if defined BB_AUTO_RENDER_RES if not defined BB_DMEM_MB echo Output %scaled_output%: scene %scaled_render% ^(live_resolution=0: startup patch^)
+if not defined BB_AUTO_RENDER_RES if %render_pixels% GTR 2073600 echo Render %BB_RENDER_RES%: direct memory %BB_DMEM_MB% MiB
 
 set "patches_dir=%BB_PATCHES_DIR%"
 if "%patches_dir%"=="" set "patches_dir=%BB_DATA_DIR%\patches"

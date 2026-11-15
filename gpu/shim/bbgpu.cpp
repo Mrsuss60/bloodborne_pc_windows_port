@@ -28,12 +28,14 @@
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+#include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_shader_rebuild.h"
 
 extern "C" {
 // runtime_memory.c
@@ -226,6 +228,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
+    BbShaderRebuild::RebuildCaches();
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
@@ -241,8 +244,24 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
             SDL_Delay(2);
         }
         LOG_INFO(Frontend, "Window closed by user");
+        if (window) {
+            window->Hide();
+        }
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+#ifdef _WIN32
+            TerminateProcess(GetCurrentProcess(), 0);
+#else
+            std::_Exit(0);
+#endif
+        }).detach();
+        Libraries::GnmDriver::FlushCachesOnExit();
         std::fflush(stdout);
+#ifdef _WIN32
+        TerminateProcess(GetCurrentProcess(), 0);
+#else
         std::_Exit(0);
+#endif
     });
     g_window_thread.detach();
     {

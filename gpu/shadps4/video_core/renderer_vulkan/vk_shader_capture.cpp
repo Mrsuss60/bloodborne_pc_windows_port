@@ -19,6 +19,8 @@
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 
+extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
+
 namespace BbShaderCapture {
 
 namespace {
@@ -41,8 +43,21 @@ const char* Directory() {
 
 /// Bytes of a program at `code` up to and including its s_setpc_b64 (fetch shaders return so).
 size_t ProgramBytes(const u8* code) {
+    if (!code) {
+        return 0;
+    }
+    uintptr_t vma_end = 0;
+    size_t max_words = 1024;
+    if (runtime_memory_vma_info(reinterpret_cast<uintptr_t>(code), nullptr, nullptr, &vma_end) &&
+        vma_end > reinterpret_cast<uintptr_t>(code)) {
+        const size_t avail_words = size_t(vma_end - reinterpret_cast<uintptr_t>(code)) / sizeof(u32);
+        max_words = std::min<size_t>(max_words, avail_words);
+    }
+    if (max_words == 0) {
+        return 0;
+    }
     const auto* start = reinterpret_cast<const u32*>(code);
-    Shader::Gcn::GcnCodeSlice code_slice(start, start + 1024);
+    Shader::Gcn::GcnCodeSlice code_slice(start, start + max_words);
     Shader::Gcn::GcnDecodeContext decoder;
     while (!code_slice.atEnd()) {
         const auto inst = decoder.decodeInstruction(code_slice);
@@ -278,21 +293,7 @@ void Write(const Shader::Info& in_info, const Shader::RuntimeInfo& runtime_info,
     out.Value(profile);
     out.Value(in_bindings);
 
-    // The memory read, merged into ranges.
-    std::vector<std::pair<const u8*, size_t>> ranges;
-    for (const auto& read : reads) {
-        ranges.emplace_back(read.address, read.size ? read.size : ProgramBytes(read.address));
-    }
-    std::ranges::sort(ranges);
-    std::vector<std::pair<const u8*, size_t>> merged;
-    for (const auto& [address, size] : ranges) {
-        if (!merged.empty() && address <= merged.back().first + merged.back().second) {
-            auto& last = merged.back();
-            last.second = std::max<size_t>(last.second, size_t(address + size - last.first));
-        } else {
-            merged.emplace_back(address, size);
-        }
-    }
+    const auto merged = MergedReads();
     out.Value(u32(merged.size()));
     for (const auto& [address, size] : merged) {
         out.Value(u64(reinterpret_cast<uintptr_t>(address)));

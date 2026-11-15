@@ -69,7 +69,17 @@ static inline const void* FindBytes(const void* haystack, size_t haystacklen, co
 /// The guest memory one record read, mapped back at its addresses for the translation.
 class GuestMemory {
 public:
+    static inline thread_local GuestMemory* active_instance = nullptr;
+
+    static void ReleaseActive() {
+        if (active_instance) {
+            active_instance->Release();
+            active_instance = nullptr;
+        }
+    }
+
     bool Map(const std::vector<BbShaderCapture::Input::Region>& regions) {
+        active_instance = this;
         std::map<u64, u64> pages;
         for (const auto& region : regions) {
             const u64 first = region.address & ~(Granule - 1);
@@ -112,7 +122,7 @@ public:
         }
         return true;
     }
-    ~GuestMemory() {
+    void Release() {
         for (const auto& [address, size] : mapped) {
 #ifdef _WIN32
             VirtualFree(reinterpret_cast<void*>(address), 0, MEM_RELEASE);
@@ -120,6 +130,13 @@ public:
             munmap(reinterpret_cast<void*>(address), size);
 #endif
         }
+        mapped.clear();
+    }
+    ~GuestMemory() {
+        if (active_instance == this) {
+            active_instance = nullptr;
+        }
+        Release();
     }
 
 private:

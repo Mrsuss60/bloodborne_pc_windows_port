@@ -103,11 +103,11 @@ struct Image {
     }
 
     vk::Image GetImage() const {
-        return backing->image.image;
+        return backing ? backing->image.image : vk::Image{};
     }
 
     vk::DeviceSize GetHostImageSize() const {
-        return backing->image.size_bytes;
+        return backing ? backing->image.size_bytes : 0;
     }
 
     bool IsTracked() {
@@ -120,7 +120,7 @@ struct Image {
 
     bool CanBeDownloaded() {
         return HasGpuValidData() && info.num_samples == 1 && !info.props.has_stencil &&
-               IsVulkanFormatCompatible(info.pixel_format, backing->image.image_ci.format);
+               backing && IsVulkanFormatCompatible(info.pixel_format, backing->image.image_ci.format);
     }
 
     bool SafeToDownload() const {

@@ -86,6 +86,9 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
+    /// bbport: consolidated single-pass write fault handling.
+    void OnWriteFault(VAddr device_addr, u64 size, bool is_redzone, bool assume_locks = false);
+
     /// bbport: a guest write fault at `device_addr` was handled; unprotect its neighbourhood.
     void ExtendWriteFault(VAddr device_addr);
 

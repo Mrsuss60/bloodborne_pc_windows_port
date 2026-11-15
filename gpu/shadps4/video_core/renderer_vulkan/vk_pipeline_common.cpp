@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <span>
+#include <mutex>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
+#include <tsl/robin_map.h>
+#include <xxhash.h>
 
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -13,6 +17,109 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
+
+namespace {
+
+struct CanonicalLayoutKey {
+    VkDevice device{};
+    bool is_compute{};
+    bool push_descriptors{};
+    std::vector<vk::DescriptorSetLayoutBinding> bindings;
+
+    bool operator==(const CanonicalLayoutKey& other) const noexcept {
+        return device == other.device && is_compute == other.is_compute &&
+               push_descriptors == other.push_descriptors && bindings == other.bindings;
+    }
+};
+
+struct CanonicalLayoutKeyHash {
+    size_t operator()(const CanonicalLayoutKey& k) const noexcept {
+        u64 h = u64(reinterpret_cast<uintptr_t>(k.device));
+        h = h * 0x9E3779B97F4A7C15ull ^ (u64(k.is_compute) | (u64(k.push_descriptors) << 1));
+        if (!k.bindings.empty()) {
+            static_assert(std::has_unique_object_representations_v<vk::DescriptorSetLayoutBinding>);
+            h ^= XXH3_64bits(k.bindings.data(),
+                             k.bindings.size() * sizeof(vk::DescriptorSetLayoutBinding));
+        }
+        return size_t(h);
+    }
+};
+
+struct CanonicalLayoutEntry {
+    vk::UniqueDescriptorSetLayout desc_layout;
+    vk::UniquePipelineLayout pipeline_layout;
+};
+
+std::mutex g_layout_cache_mutex;
+tsl::robin_map<CanonicalLayoutKey, CanonicalLayoutEntry, CanonicalLayoutKeyHash> g_layout_cache;
+
+} // namespace
+
+void ClearPipelineLayoutCache() {
+    std::scoped_lock lk{g_layout_cache_mutex};
+    g_layout_cache.clear();
+}
+
+void Pipeline::InitCanonicalLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                    bool push_descriptors) {
+    uses_push_descriptors = push_descriptors;
+    const vk::Device device = instance.GetDevice();
+    CanonicalLayoutKey cache_key{
+        .device = static_cast<VkDevice>(device),
+        .is_compute = is_compute,
+        .push_descriptors = push_descriptors,
+        .bindings = std::vector<vk::DescriptorSetLayoutBinding>(bindings.begin(), bindings.end()),
+    };
+
+    {
+        std::scoped_lock lk{g_layout_cache_mutex};
+        if (const auto it = g_layout_cache.find(cache_key); it != g_layout_cache.end()) {
+            desc_layout = *it->second.desc_layout;
+            pipeline_layout = *it->second.pipeline_layout;
+            return;
+        }
+    }
+
+    const auto flags = push_descriptors
+                           ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                           : vk::DescriptorSetLayoutCreateFlagBits{};
+    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
+        .flags = flags,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    };
+    auto [ds_res, ds_layout] = device.createDescriptorSetLayoutUnique(desc_layout_ci);
+    if (ds_res != vk::Result::eSuccess) {
+        throw std::runtime_error(
+            fmt::format("Failed to create {} descriptor set layout: {}",
+                        is_compute ? "compute" : "graphics", vk::to_string(ds_res)));
+    }
+
+    const vk::PushConstantRange push_constants = {
+        .stageFlags = is_compute ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits,
+        .offset = 0,
+        .size = sizeof(Shader::PushData),
+    };
+    const vk::DescriptorSetLayout raw_ds_layout = *ds_layout;
+    const vk::PipelineLayoutCreateInfo layout_info = {
+        .setLayoutCount = 1U,
+        .pSetLayouts = &raw_ds_layout,
+        .pushConstantRangeCount = 1U,
+        .pPushConstantRanges = &push_constants,
+    };
+    auto [pl_res, pl_layout] = device.createPipelineLayoutUnique(layout_info);
+    if (pl_res != vk::Result::eSuccess) {
+        throw std::runtime_error(
+            fmt::format("Failed to create {} pipeline layout: {}",
+                        is_compute ? "compute" : "graphics", vk::to_string(pl_res)));
+    }
+
+    std::scoped_lock lk{g_layout_cache_mutex};
+    const auto [it, _] = g_layout_cache.try_emplace(
+        std::move(cache_key), CanonicalLayoutEntry{std::move(ds_layout), std::move(pl_layout)});
+    desc_layout = *it->second.desc_layout;
+    pipeline_layout = *it->second.pipeline_layout;
+}
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
@@ -28,7 +135,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    const vk::PipelineLayout layout = *pipeline_layout;
+    const vk::PipelineLayout layout = pipeline_layout;
     scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
         cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
     });
@@ -77,7 +184,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     }
 
     // Descriptor set updates are device calls: they stay on this thread.
-    const auto desc_set = desc_heap.Commit(*desc_layout);
+    const auto desc_set = desc_heap.Commit(desc_layout);
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }

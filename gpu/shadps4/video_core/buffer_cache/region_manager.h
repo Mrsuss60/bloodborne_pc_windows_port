@@ -195,6 +195,69 @@ public:
         UpdateProtection<false, false>();
     }
 
+    /// bbport: consolidated single-pass write fault handling (avoids multiple VirtualProtect calls)
+    void HandleWriteFault(VAddr fault_addr, u64 fault_size, VAddr window_addr, u64 window_size,
+                          bool is_redzone) {
+        const size_t fault_offset = fault_addr - cpu_addr;
+        const size_t fault_start = SanitizeAddress(fault_offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t fault_end =
+            Common::DivCeil(SanitizeAddress(fault_offset + fault_size), TRACKER_BYTES_PER_PAGE);
+        if (fault_start < NUM_PAGES_PER_REGION && fault_end > fault_start) {
+            CountWriteFaults(fault_start, fault_end);
+            cpu.SetRange(fault_start, fault_end);
+        }
+
+        if (window_size > 0) {
+            const size_t win_offset = window_addr - cpu_addr;
+            const size_t win_start = SanitizeAddress(win_offset) / TRACKER_BYTES_PER_PAGE;
+            const size_t win_end =
+                Common::DivCeil(SanitizeAddress(win_offset + window_size), TRACKER_BYTES_PER_PAGE);
+            if (win_start < NUM_PAGES_PER_REGION && win_end > win_start) {
+                RegionBits add(~(gpu | writeable), win_start, win_end);
+                if (!add.None()) {
+                    cpu |= add;
+                }
+            }
+        }
+
+        if (is_redzone && !BbToggle::Disabled2(BbToggle::StickyFaultPages)) {
+            if (fault_start < NUM_PAGES_PER_REGION && fault_end > fault_start) {
+                RegionBits add(~sticky, fault_start, fault_end);
+                if (!add.None()) {
+                    u32 num_new = 0;
+                    for (const auto& [start, end] : add) {
+                        num_new += static_cast<u32>(end - start);
+                    }
+                    const u32 budget = StickyFaultPageBudget();
+                    const u32 used = g_sticky_fault_pages.load(std::memory_order_relaxed);
+                    if (used < budget) {
+                        if (num_new > budget - used) {
+                            const u32 remaining_budget = budget - used;
+                            RegionBits limited{};
+                            u32 remaining = remaining_budget;
+                            for (const auto& [start, end] : add) {
+                                const size_t take = std::min<size_t>(end - start, remaining);
+                                limited.SetRange(start, start + take);
+                                remaining -= static_cast<u32>(take);
+                                if (remaining == 0) {
+                                    break;
+                                }
+                            }
+                            add = limited;
+                            num_new = remaining_budget - remaining;
+                        }
+                        sticky |= add;
+                        cpu |= add;
+                        g_sticky_fault_pages.fetch_add(num_new, std::memory_order_relaxed);
+                        BbStats::sticky_pages.fetch_add(num_new, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+
+        UpdateProtection<false, false>();
+    }
+
     /**
      * Loop over each page in the given range, turn off those bits and notify the tracker if
      * needed. Call the given function on each turned off range.

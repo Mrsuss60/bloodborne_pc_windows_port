@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <optional>
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -18,6 +20,64 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
+
+namespace {
+struct MultiCopyPipeline {
+    vk::Device device;
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout layout;
+    vk::UniquePipeline pipeline;
+};
+std::mutex g_multi_copy_mutex;
+std::optional<MultiCopyPipeline> g_multi_copy_pipe;
+
+const MultiCopyPipeline& GetMultiCopyPipeline(const Instance& instance) {
+    const auto device = instance.GetDevice();
+    std::scoped_lock lk{g_multi_copy_mutex};
+    if (g_multi_copy_pipe && g_multi_copy_pipe->device == device) {
+        return *g_multi_copy_pipe;
+    }
+    MultiCopyPipeline p;
+    p.device = device;
+    std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+    for (u32 i = 0; i < 3; ++i) {
+        bindings[i] = {.binding = i,
+                       .descriptorType = vk::DescriptorType::eStorageBuffer,
+                       .descriptorCount = 1,
+                       .stageFlags = vk::ShaderStageFlagBits::eCompute};
+    }
+    p.set_layout = Check(device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    }));
+    const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                      .offset = 0,
+                                      .size = sizeof(u32)};
+    p.layout = Check(device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = &*p.set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    }));
+    const auto module = CompileSPV(BUFFER_MULTI_COPY_COMP, device);
+    p.pipeline = Check(device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = module,
+                          .pName = "main"},
+                .layout = *p.layout,
+            }));
+    device.destroyShaderModule(module);
+    g_multi_copy_pipe.emplace(std::move(p));
+    return *g_multi_copy_pipe;
+}
+} // namespace
+
+void ClearHleShaderCaches() {
+    std::scoped_lock lk{g_multi_copy_mutex};
+    g_multi_copy_pipe.reset();
+}
 
 bool CopySkipSameOn() {
     static const bool on = !bb_env_off("BB_COPY_SKIP_SAME");
@@ -49,46 +109,7 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     src_min = Common::AlignDown(src_min, align);
     dst_min = Common::AlignDown(dst_min, align);
 
-    struct Pipeline {
-        vk::UniqueDescriptorSetLayout set_layout;
-        vk::UniquePipelineLayout layout;
-        vk::UniquePipeline pipeline;
-    };
-    static Pipeline pipe = [&] {
-        const auto device = instance.GetDevice();
-        Pipeline p;
-        std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
-        for (u32 i = 0; i < 3; ++i) {
-            bindings[i] = {.binding = i,
-                           .descriptorType = vk::DescriptorType::eStorageBuffer,
-                           .descriptorCount = 1,
-                           .stageFlags = vk::ShaderStageFlagBits::eCompute};
-        }
-        p.set_layout = Check(device.createDescriptorSetLayoutUnique({
-            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-            .bindingCount = static_cast<u32>(bindings.size()),
-            .pBindings = bindings.data(),
-        }));
-        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
-                                          .offset = 0,
-                                          .size = sizeof(u32)};
-        p.layout = Check(device.createPipelineLayoutUnique({
-            .setLayoutCount = 1,
-            .pSetLayouts = &*p.set_layout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &range,
-        }));
-        const auto module = CompileSPV(BUFFER_MULTI_COPY_COMP, device);
-        p.pipeline = Check(device.createComputePipelineUnique(
-            {}, vk::ComputePipelineCreateInfo{
-                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
-                              .module = module,
-                              .pName = "main"},
-                    .layout = *p.layout,
-                }));
-        device.destroyShaderModule(module);
-        return p;
-    }();
+    const auto& pipe = GetMultiCopyPipeline(instance);
 
     // The region table goes into the stream buffer (host writes, visible at submission).
     thread_local std::vector<u32> regions;
@@ -113,9 +134,11 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
         runtime.FlushBarriers();
     }
     const u32 count = static_cast<u32>(copies.size());
+    const vk::Pipeline vk_pipe = *pipe.pipeline;
+    const vk::PipelineLayout vk_layout = *pipe.layout;
     scheduler.Record([src = src->Handle(), dst = dst->Handle(), table = stream.Handle(), src_min,
-                      src_size, dst_min, dst_size, table_offset, table_size,
-                      count](vk::CommandBuffer cmdbuf) {
+                      src_size, dst_min, dst_size, table_offset, table_size, count, vk_pipe,
+                      vk_layout](vk::CommandBuffer cmdbuf) {
         const std::array<vk::DescriptorBufferInfo, 3> infos{{
             {src, src_min, src_size},
             {dst, dst_min, dst_size},
@@ -128,10 +151,9 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
                          .descriptorType = vk::DescriptorType::eStorageBuffer,
                          .pBufferInfo = &infos[i]};
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
-        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipe.layout, 0, writes);
-        cmdbuf.pushConstants(*pipe.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count),
-                             &count);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, vk_pipe);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, vk_layout, 0, writes);
+        cmdbuf.pushConstants(vk_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count), &count);
         cmdbuf.dispatch(count, 1, 1);
     });
     runtime.AccessBuffer(src, src_min, src_size, vk::PipelineStageFlagBits2::eComputeShader,
@@ -162,7 +184,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     ASSERT(ctl_buf_sharp.GetStride() == sizeof(CopyShaderControl));
     const auto ctl_buf = reinterpret_cast<const CopyShaderControl*>(ctl_buf_sharp.base_address);
 
-    static std::vector<vk::BufferCopy> copies;
+    thread_local std::vector<vk::BufferCopy> copies;
     copies.clear();
     copies.reserve(cs_program.dim_x);
 
@@ -178,8 +200,13 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         if (local_size == 0) {
             continue;
         }
-        if (skip_same && src_base_ptr && dst_base_ptr) {
-            if (std::memcmp(dst_base_ptr + local_dst_offset, src_base_ptr + local_src_offset, local_size) == 0) {
+        const VAddr src_addr = src_buf_sharp.base_address + local_src_offset;
+        const VAddr dst_addr = dst_buf_sharp.base_address + local_dst_offset;
+        if (skip_same && src_base_ptr && dst_base_ptr &&
+            !buffer_cache.IsRegionGpuModified(src_addr, local_size) &&
+            !buffer_cache.IsRegionGpuModified(dst_addr, local_size)) {
+            if (std::memcmp(dst_base_ptr + local_dst_offset, src_base_ptr + local_src_offset,
+                            local_size) == 0) {
                 continue;
             }
         }

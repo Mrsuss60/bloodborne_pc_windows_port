@@ -122,18 +122,34 @@ void BufferCache::RunGuestCopy(const BbCopy::Item& item) {
     buffer->Flush(dst - buffer->mapped_data.data(), item.size);
 }
 
-// Small guest copies run on the recording thread (it spins for work: no wakeup, and it is
-// idle most of the time); PoolSmallCopies (toggle 524288) batches them for the copy threads.
+// Small guest copies run on the recording thread by default; setting bit 524288 disables
+// SmallCopiesOnRecorder and batches them onto the copy threads.
 // Each source is noted once the copy is queued (a WaitHostCopies started after the note covers it).
 void BufferCache::SmallGuestCopy(const BbCopy::Item& item) {
     if (!scheduler.IsRecordingDeferred()) {
         item.run(item);
-    } else if (!BbToggle::Disabled(BbToggle::PoolSmallCopies)) {
+    } else if (!BbToggle::Disabled(BbToggle::SmallCopiesOnRecorder)) {
         scheduler.RecordHostCopy([item] { item.run(item); });
     } else {
         BbCopy::QueueCopy(item);
     }
     scheduler.NoteHostCopySource(item.source, item.size);
+}
+
+void BufferCache::OnWriteFault(VAddr device_addr, u64 size, bool is_redzone, bool assume_locks) {
+    static const u64 window = [] {
+        const char* env = std::getenv("BB_FAULT_WINDOW");
+        const u64 kib = env ? std::strtoull(env, nullptr, 10) : 256;
+        return std::bit_ceil(std::clamp<u64>(kib, 4, 1024)) * 1024;
+    }();
+    const bool extend = (window > TRACKER_BYTES_PER_PAGE && !BbToggle::Disabled(BbToggle::FaultWindow));
+    const VAddr window_addr = extend ? Common::AlignDown(device_addr, window) : 0;
+    const u64 window_size = extend ? window : 0;
+
+    memory_tracker->HandleWriteFault(device_addr, size, window_addr, window_size, is_redzone,
+        [this, device_addr, size, assume_locks] {
+            ReadMemory(device_addr, size, true, false, assume_locks);
+        });
 }
 
 void BufferCache::ExtendWriteFault(VAddr device_addr) {
@@ -492,8 +508,9 @@ void BufferCache::SynchronizeDmaBuffers() {
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
-    ASSERT_MSG(last_page - first_page <= 1,
-               "Buffer request cannot span more than two VA arena pages");
+    if (last_page - first_page > 1) {
+        return nullptr;
+    }
 
     const auto* first_arena = address_space[first_page];
     const auto* last_arena = address_space[last_page];
@@ -729,9 +746,9 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     // copy below changes image state, so the helper finishes first.
     runtime.BeforeImageAccess();
     Image& image = texture_cache.GetImage(image_id);
-    ASSERT_MSG(device_addr == image.info.guest_address,
-               "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
-               image.info.guest_address);
+    if (device_addr != image.info.guest_address) {
+        return false;
+    }
     const u64 arena_offset = arena->Offset(device_addr);
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {

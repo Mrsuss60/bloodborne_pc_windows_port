@@ -111,7 +111,7 @@ public:
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
     /// Schedules a copy of pending images for download back to CPU memory.
-    void ProcessDownloadImages();
+    void ProcessDownloadImages(bool sync = true);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -146,11 +146,13 @@ public:
         const Image& image = slot_images[image_id];
         const u32 flags = std::atomic_ref<const u32>(reinterpret_cast<const u32&>(image.flags))
                               .load(std::memory_order_acquire);
+        const u64 touched =
+            std::atomic_ref<const u64>(image.lru_touched_tick).load(std::memory_order_acquire);
         constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
         constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
         return (flags & (Dirty | Registered)) == Registered &&
                image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
-               image.lru_touched_tick == gc_tick;
+               touched == gc_tick.load(std::memory_order_acquire);
     }
 
     /// Updates image contents if it was modified by CPU.
@@ -163,11 +165,13 @@ public:
             const Image& image = slot_images[image_id];
             const u32 flags = std::atomic_ref<const u32>(reinterpret_cast<const u32&>(image.flags))
                                   .load(std::memory_order_acquire);
+            const u64 touched =
+                std::atomic_ref<const u64>(image.lru_touched_tick).load(std::memory_order_acquire);
             constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
             constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
             if ((flags & (Dirty | Registered)) == Registered &&
                 image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
-                image.lru_touched_tick == gc_tick) {
+                touched == gc_tick.load(std::memory_order_acquire)) {
                 return;
             }
         }
@@ -208,7 +212,15 @@ public:
     }
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];
-        TouchImage(image);
+        const u64 tick = gc_tick.load(std::memory_order_acquire);
+        const u32 flags = std::atomic_ref<const u32>(reinterpret_cast<const u32&>(image.flags))
+                              .load(std::memory_order_acquire);
+        if (std::atomic_ref<const u64>(image.lru_touched_tick).load(std::memory_order_acquire) !=
+                tick ||
+            (flags & static_cast<u32>(ImageFlagBits::MaybeGpuDirty)) != 0) {
+            std::scoped_lock lock{mutex};
+            TouchImage(image);
+        }
         return image;
     }
 
@@ -394,6 +406,9 @@ private:
     void TouchImage(Image& image);
 
     void FreeImage(ImageId image_id) {
+        if (!slot_images.is_allocated(image_id)) {
+            return;
+        }
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -416,6 +431,7 @@ private:
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     std::unordered_set<VAddr> whole_textures;
+    u64 tracked_image_memory = 0;
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
     std::chrono::steady_clock::time_point gc_report_time{};
@@ -429,7 +445,7 @@ private:
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
-    u64 gc_tick = 0;
+    std::atomic<u64> gc_tick{0};
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
@@ -446,6 +462,8 @@ private:
         BindingType binding{};
         u32 levels = 0;
         u32 layers = 0;
+        u32 pitch = 0;
+        AmdGpu::TileMode tile_mode{};
         u64 generation = ~0ULL;
         ImageId image_id{};
         int view_mip = -1;
@@ -453,6 +471,8 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    // bbport: fast skip for InvalidateMemoryFromGPU when no registered image starts on that 1 MiB bucket.
+    std::array<std::atomic<u32>, 4096> image_head_buckets{};
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

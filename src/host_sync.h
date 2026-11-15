@@ -67,7 +67,10 @@ static inline void host_cond_broadcast(HostCond *c) { WakeAllConditionVariable(c
 typedef uint64_t HostThreadId;
 static inline HostThreadId host_thread_id(void) { return GetCurrentThreadId(); }
 static inline int host_thread_equal(HostThreadId a, HostThreadId b) { return a == b; }
-static inline void host_yield(void) { if (!SwitchToThread()) Sleep(0); }
+static inline void host_yield(void) {
+    YieldProcessor();
+    if (!SwitchToThread()) Sleep(0);
+}
 typedef HANDLE HostThread;
 #else
 #include <pthread.h>

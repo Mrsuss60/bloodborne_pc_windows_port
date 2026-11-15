@@ -26,13 +26,27 @@ typedef struct Sema {
     struct Sema *next;
 } Sema;
 
-static HostMutex lock = HOST_MUTEX_INIT;
+#define MAX_SEMAS 4096
+#define SEMA_STRIPES 64
+
+static HostMutex registry_lock = HOST_MUTEX_INIT;
+static HostMutex stripe_locks[SEMA_STRIPES];
+static Sema *s_sema_table[MAX_SEMAS];
 static Sema *registry;
 static uint32_t next_id=1;
 static size_t created, deleted, acquired, signaled, timed_out;
 
-static Sema *find(uint32_t id) {
-    for (Sema *s=registry;s;s=s->next) if (s->id==id) return s;
+static inline HostMutex *sema_lock(uint32_t id) {
+    return &stripe_locks[id & (SEMA_STRIPES - 1)];
+}
+
+static inline Sema *find(uint32_t id) {
+    if (!id) return NULL;
+    Sema *s = s_sema_table[id & (MAX_SEMAS - 1)];
+    if (s && s->id == id && !s->deleted) return s;
+    for (Sema *p = registry; p; p = p->next) {
+        if (p->id == id && !p->deleted) return p;
+    }
     return NULL;
 }
 
@@ -48,18 +62,21 @@ static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
     if (options) { fputs("STOP: semaphore options are not implemented\n",stderr); exit(21); }
     Sema *s=calloc(1,sizeof(*s));
     if (!s) return ERR(12);
-    host_lock(&lock);
-    if (next_id==UINT32_MAX) { host_unlock(&lock); free(s); return ERR(28); }
+    host_lock(&registry_lock);
+    if (next_id==UINT32_MAX) { host_unlock(&registry_lock); free(s); return ERR(28); }
     s->id=next_id++; s->attr=attr; s->count=s->initial=initial; s->maximum=maximum;
-    s->next=registry; registry=s; *out=s->id; ++created;
+    s->next=registry; registry=s;
+    s_sema_table[s->id & (MAX_SEMAS - 1)] = s;
+    *out=s->id; ++created;
     CHECK_LOW_ADDR((uintptr_t)*out);
     printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
-    host_unlock(&lock);
+    host_unlock(&registry_lock);
     return 0;
 }
 
 static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) {
-    host_lock(&lock);
+    HostMutex *lock = sema_lock(id);
+    host_lock(lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -91,16 +108,17 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
             int e=0;
             if (timeout) {
                 uint64_t now=now_ns();
-                e=now<deadline ? host_cond_timedwait(&w.event,&lock,deadline-now) : ETIMEDOUT;
-            } else host_cond_wait(&w.event,&lock);
+                e=now<deadline ? host_cond_timedwait(&w.event,lock,deadline-now) : ETIMEDOUT;
+            } else host_cond_wait(&w.event,lock);
 #else
             struct timespec end={.tv_sec=(time_t)(deadline/1000000000),.tv_nsec=(long)(deadline%1000000000)};
-            int e=timeout ? pthread_cond_timedwait(&w.event,&lock,&end) : pthread_cond_wait(&w.event,&lock);
+            int e=timeout ? pthread_cond_timedwait(&w.event,lock,&end) : pthread_cond_wait(&w.event,lock);
 #endif
             if (e==ETIMEDOUT && !w.done) {
                 Waiter **p=&s->first;
-                while (*p!=&w) p=&(*p)->next;
-                *p=w.next; w.result=ERR(60); w.done=1; ++timed_out;
+                while (*p && *p!=&w) p=&(*p)->next;
+                if (*p) *p=w.next;
+                w.result=ERR(60); w.done=1; ++timed_out;
             } else if (e!=ETIMEDOUT) host_check(e);
         }
         runtime_thread_clear_blocked();
@@ -115,7 +133,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
 #endif
         if (!--s->active && s->deleted) free(s);
     }
-    host_unlock(&lock);
+    host_unlock(lock);
     restore_guest_fs();
     return result;
 }
@@ -123,7 +141,8 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
 static ABI int32_t sem_wait(uint32_t id,int32_t need,uint32_t *timeout) { return wait_count(id,need,timeout,1); }
 static ABI int32_t sem_poll(uint32_t id,int32_t need) { return wait_count(id,need,NULL,0); }
 static ABI int32_t sem_signal(uint32_t id,int32_t count) {
-    host_lock(&lock);
+    HostMutex *lock = sema_lock(id);
+    host_lock(lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -138,7 +157,7 @@ static ABI int32_t sem_signal(uint32_t id,int32_t count) {
             host_cond_signal(&w->event);
         }
     }
-    host_unlock(&lock);
+    host_unlock(lock);
     restore_guest_fs();
     return result;
 }
@@ -154,7 +173,8 @@ static int32_t wake_all(Sema *s,int32_t result) {
 }
 
 static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
-    host_lock(&lock);
+    HostMutex *lock = sema_lock(id);
+    host_lock(lock);
     Sema *s=find(id);
     int32_t result=0;
     if (!s) result=ERR(3);
@@ -164,28 +184,40 @@ static ABI int32_t sem_cancel(uint32_t id,int32_t count,int32_t *waiters) {
         if (waiters) *waiters=n;
         s->count=count<0 ? s->initial : count;
     }
-    host_unlock(&lock);
+    host_unlock(lock);
     return result;
 }
 
 static ABI int32_t sem_delete(uint32_t id) {
-    host_lock(&lock);
+    HostMutex *stripe = sema_lock(id);
+    host_lock(&registry_lock);
+    host_lock(stripe);
     Sema **p=&registry;
     while (*p && (*p)->id!=id) p=&(*p)->next;
-    if (!*p) { host_unlock(&lock); return ERR(3); }
+    if (!*p) {
+        host_unlock(stripe);
+        host_unlock(&registry_lock);
+        return ERR(3);
+    }
     Sema *s=*p; *p=s->next; s->deleted=1; ++deleted;
+    if (s_sema_table[id & (MAX_SEMAS - 1)] == s) {
+        s_sema_table[id & (MAX_SEMAS - 1)] = NULL;
+    }
     wake_all(s,ERR(13));
-    if (!s->active) free(s);
-    host_unlock(&lock);
+    int active = s->active;
+    host_unlock(stripe);
+    host_unlock(&registry_lock);
+    if (!active) free(s);
     return 0;
 }
 
 /* Read-only test/diagnostic snapshot, not exposed to guest code. */
 unsigned runtime_sema_waiters(uint32_t id) {
-    host_lock(&lock);
+    HostMutex *lock = sema_lock(id);
+    host_lock(lock);
     Sema *s=find(id); unsigned n=0;
     if (s) for (Waiter *w=s->first;w;w=w->next) ++n;
-    host_unlock(&lock);
+    host_unlock(lock);
     return n;
 }
 
@@ -200,8 +232,8 @@ uintptr_t runtime_sema_resolve(const char *name) {
 }
 
 void runtime_sema_report(void) {
-    host_lock(&lock);
+    host_lock(&registry_lock);
     printf("Runtime: semaphores created=%zu, deleted=%zu, acquired=%zu, signals=%zu, timeouts=%zu\n",
            created,deleted,acquired,signaled,timed_out);
-    host_unlock(&lock);
+    host_unlock(&registry_lock);
 }

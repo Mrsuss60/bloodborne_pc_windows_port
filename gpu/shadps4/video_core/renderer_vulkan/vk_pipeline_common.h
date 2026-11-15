@@ -37,7 +37,7 @@ public:
     }
 
     vk::PipelineLayout GetLayout() const noexcept {
-        return *pipeline_layout;
+        return pipeline_layout;
     }
 
     auto GetStages() const {
@@ -62,17 +62,21 @@ public:
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+    void InitCanonicalLayouts(std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                              bool push_descriptors);
 
     const Instance& instance;
     Scheduler& scheduler;
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
     vk::UniquePipeline pipeline;
-    vk::UniquePipelineLayout pipeline_layout;
-    vk::UniqueDescriptorSetLayout desc_layout;
+    vk::PipelineLayout pipeline_layout{};
+    vk::DescriptorSetLayout desc_layout{};
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
 };
+
+void ClearPipelineLayoutCache();
 
 } // namespace Vulkan

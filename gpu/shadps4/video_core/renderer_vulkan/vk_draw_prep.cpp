@@ -56,17 +56,28 @@ u32 DefaultWorkerCount() {
     if (cfg_workers >= 0) {
         return static_cast<u32>(std::clamp(cfg_workers, 0, 16));
     }
-    // Workers are SCHED_IDLE and claim whole buffers, so more of them only use more idle
-    // cores: half the hardware threads (Steam Deck 4, 16-thread desktop 8).
-    return std::clamp<u32>(BbThreads::Available() / 2, 1, 8);
+    const u32 threads = BbThreads::Available();
+    if (threads <= 4) {
+        return 1; // 1 dedicated prep worker prevents core contention on 4-thread processors
+    }
+    return std::clamp<u32>(threads / 2, 1, 8);
 }
 
 /// Flattened user data of one submission: chunks never move, so the GPU thread can read a
 /// prepared draw's data while the worker keeps appending.
 struct FlatArena {
     static constexpr size_t ChunkWords = 16 * 1024;
+    DrawPreparation::FlatChunkPool* pool = nullptr;
     std::vector<std::unique_ptr<u32[]>> chunks;
+    std::vector<u8> chunk_poolable;
     size_t used = ChunkWords;
+
+    void Reset(DrawPreparation::FlatChunkPool* pool_) {
+        pool = pool_;
+        chunks.clear();
+        chunk_poolable.clear();
+        used = ChunkWords;
+    }
 
     const u32* Append(const std::vector<u32>& data) {
         return AppendArray(data.data(), data.size());
@@ -79,7 +90,22 @@ struct FlatArena {
         const size_t words = (count * sizeof(T) + sizeof(u32) - 1) / sizeof(u32);
         used = (used + 1) & ~size_t(1);
         if (chunks.empty() || words > ChunkWords - std::min(used, ChunkWords)) {
-            chunks.push_back(std::make_unique<u32[]>(std::max(ChunkWords, words)));
+            if (words <= ChunkWords && pool) {
+                std::unique_ptr<u32[]> recycled;
+                {
+                    std::scoped_lock lk{pool->mutex};
+                    if (!pool->chunks.empty()) {
+                        recycled = std::move(pool->chunks.back());
+                        pool->chunks.pop_back();
+                    }
+                }
+                chunks.push_back(recycled ? std::move(recycled)
+                                          : std::make_unique<u32[]>(ChunkWords));
+                chunk_poolable.push_back(1);
+            } else {
+                chunks.push_back(std::make_unique<u32[]>(std::max(ChunkWords, words)));
+                chunk_poolable.push_back(words <= ChunkWords ? 1 : 0);
+            }
             used = 0;
         }
         u32* dst = chunks.back().get() + used;
@@ -232,6 +258,7 @@ std::shared_ptr<DrawPreparation::Submission> DrawPreparation::Build(
         return {};
     }
     auto submission = std::make_shared<Submission>();
+    submission->chunk_pool = flat_chunk_pool;
     submission->commands.assign(commands.begin(), commands.end());
     ForEachPacket(submission->commands, [&](const AmdGpu::PM4Header* header) {
         submission->num_draws += IsDirectDraw(header->type3.opcode);
@@ -443,7 +470,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
         path.clear();
         u64 checksum = target->start_checksum;
         u32 ordinal = 0;
-        arena = FlatArena{};
+        arena.Reset(flat_chunk_pool.get());
         ForEachPacket(target->commands, [&](const AmdGpu::PM4Header* header) {
             AmdGpu::Liverpool::ApplyGraphicsRegisterPacket(*regs, header, checksum);
             if (!IsDirectDraw(header->type3.opcode)) {
@@ -469,6 +496,8 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
                             .pgm_base = stage.pgm_base,
                             .flat = arena.Append(*stage.flat),
                             .flat_size = static_cast<u32>(stage.flat->size()),
+                            .flat_hash = XXH3_64bits(stage.flat->data(),
+                                                     stage.flat->size() * sizeof(u32)),
                         };
                         PrepareResources(prep_worker.infos.at(stage.program), draw.stages[i],
                                          arena);
@@ -487,6 +516,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
         });
         // The arena's chunks live as long as the submission.
         target->flat_chunks = std::move(arena.chunks);
+        target->flat_chunk_poolable = std::move(arena.chunk_poolable);
         position = target->seq + 1;
     }
 }

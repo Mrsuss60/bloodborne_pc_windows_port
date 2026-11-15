@@ -77,7 +77,10 @@ public:
         if (!IsHDRSupported()) {
             return;
         }
-        swapchain.SetHDR(enable);
+        if (swapchain.GetHDR() != enable) {
+            std::scoped_lock submit_lock{Scheduler::submit_mutex};
+            swapchain.SetHDR(enable);
+        }
         pp_settings.hdr = enable ? 1 : 0;
     }
 
@@ -136,6 +139,9 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+    vk::Image upscaled_view_image{};
+    vk::Format upscaled_view_format{};
+    vk::ImageView upscaled_view{};
 };
 
 } // namespace Vulkan

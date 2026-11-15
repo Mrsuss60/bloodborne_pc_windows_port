@@ -132,10 +132,11 @@ void PipelineCache::StartShaderImport() {
     if (!import) {
         import = std::make_unique<ShaderImport>();
     } else {
-        import->listed = import->done = false;
+        import->listed = import->done = import->adopting_program = false;
         import->programs.clear();
         import->keys.clear();
-        import->next_program = import->next_key = 0;
+        import->next_program = import->next_perm = import->next_key = 0;
+        import->precompiled.reset();
     }
 #ifdef _WIN32
     {
@@ -243,6 +244,12 @@ bool RemapImportedKey(const std::unordered_map<u64, u64>& remap, std::vector<u8>
         Serialization::Reader reader{in};
         u32 version{}, is_compute{};
         reader.Read(version);
+        if (version != Vulkan::PipelineStore::PipelineKeyVersion) {
+            return false;
+        }
+        if (remap.empty()) {
+            return true;
+        }
         reader.Read(is_compute);
         const auto map = [&](auto& value) {
             if (const auto it = remap.find(u64(value)); it != remap.end()) {
@@ -255,9 +262,7 @@ bool RemapImportedKey(const std::unordered_map<u64, u64>& remap, std::vector<u8>
         Serialization::Writer writer{out};
         writer.Write(version);
         writer.Write(is_compute);
-        if (version != Vulkan::PipelineStore::PipelineKeyVersion) {
-            // another build's
-        } else if (is_compute) {
+        if (is_compute) {
             ComputePipelineKey key{};
             key.Deserialize(in);
             ComputePipeline::SerializationSupport sdata{};
@@ -290,6 +295,48 @@ bool RemapImportedKey(const std::unordered_map<u64, u64>& remap, std::vector<u8>
 }
 
 } // namespace
+
+void PipelineCache::StartImportPrecompile(ShaderImport& state) {
+    auto pre = std::make_shared<ShaderImport::Precompiled>();
+    pre->device = instance.GetDevice();
+    state.precompiled = pre;
+    for (const auto& [hash, files] : state.programs) {
+        for (const auto& file : files) {
+            if (file.extension() != ".spv") {
+                continue;
+            }
+            const std::string stem = file.stem().string();
+            const size_t sep = stem.rfind('_');
+            if (sep == std::string::npos) {
+                continue;
+            }
+            const u64 perm = std::strtoull(stem.c_str() + sep + 1, nullptr, 10);
+            const u64 perm_hash = HashCombine(hash, perm);
+            pre->pending.fetch_add(1, std::memory_order_relaxed);
+            GetCompiler().SubmitLow([pre, file, perm_hash]() {
+                SCOPE_EXIT {
+                    if (pre->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        std::scoped_lock lk{pre->mutex};
+                        pre->cv.notify_all();
+                    }
+                };
+                const auto bytes = ReadImportFile(file);
+                if (bytes.size() < 20 || (bytes.size() & 3) != 0) {
+                    return;
+                }
+                std::vector<u32> spv(bytes.size() / 4);
+                std::memcpy(spv.data(), bytes.data(), bytes.size());
+                if (spv[0] != 0x07230203u) {
+                    return;
+                }
+                if (vk::ShaderModule mod = CompileSPV(spv, pre->device)) {
+                    std::scoped_lock lk{pre->mutex};
+                    pre->modules.emplace(perm_hash, mod);
+                }
+            });
+        }
+    }
+}
 
 void PipelineCache::MergeShaderImport(bool at_start) {
     auto& store = Storage::DataBase::Instance();
@@ -330,6 +377,15 @@ void PipelineCache::MergeShaderImport(bool at_start) {
             }
         }
         state.programs.assign(by_program.begin(), by_program.end());
+        StartImportPrecompile(state);
+    }
+    if (state.precompiled && state.precompiled->pending.load(std::memory_order_acquire) > 0) {
+        if (!at_start) {
+            return;
+        }
+        std::unique_lock lk{state.precompiled->mutex};
+        state.precompiled->cv.wait(
+            lk, [&] { return state.precompiled->pending.load(std::memory_order_acquire) == 0; });
     }
     const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
     if (!at_start && frame == state.frame) {
@@ -340,8 +396,17 @@ void PipelineCache::MergeShaderImport(bool at_start) {
     const auto in_budget = [&] {
         return std::chrono::steady_clock::now() < deadline;
     };
-    while (state.next_program < state.programs.size() && in_budget()) {
-        MergeImportedProgram(state, state.next_program++);
+    {
+        const PipelineSelection saved = sel;
+        SCOPE_EXIT {
+            sel = saved;
+        };
+        while (state.next_program < state.programs.size() && in_budget()) {
+            if (!MergeImportedProgram(state, state.next_program, in_budget)) {
+                break;
+            }
+            ++state.next_program;
+        }
     }
     while (state.next_program == state.programs.size() && state.next_key < state.keys.size() &&
            in_budget()) {
@@ -355,7 +420,7 @@ void PipelineCache::MergeShaderImport(bool at_start) {
             bytes.resize(file.GetSize());
             file.Read(bytes);
         }
-        if (!state.remap.empty() && !RemapImportedKey(state.remap, bytes, path)) {
+        if (!RemapImportedKey(state.remap, bytes, path)) {
             fs::remove(path, ec);
             continue;
         }
@@ -363,6 +428,7 @@ void PipelineCache::MergeShaderImport(bool at_start) {
         MergeImportedKey(state, std::move(bytes));
     }
     if (state.next_program == state.programs.size() && state.next_key == state.keys.size()) {
+        state.precompiled.reset();
         fs::remove_all(from, ec);
         state.done = true;
         g_bb_shader_import_active.store(false, std::memory_order_relaxed);
@@ -376,7 +442,8 @@ void PipelineCache::MergeShaderImport(bool at_start) {
     }
 }
 
-void PipelineCache::MergeImportedProgram(ShaderImport& state, size_t index) {
+bool PipelineCache::MergeImportedProgram(ShaderImport& state, size_t index,
+                                         const std::function<bool()>& in_budget) {
     auto& store = Storage::DataBase::Instance();
     const fs::path dir = store.Directory(), from = dir / "import";
     std::error_code ec;
@@ -385,55 +452,85 @@ void PipelineCache::MergeImportedProgram(ShaderImport& state, size_t index) {
     for (const auto& file : files) {
         perms += file.extension() == ".spv" ? 1 : 0;
     }
-    if (program_cache.find(hash) != program_cache.end()) {
-        AdoptImportedProgram(state, hash, perms);
+    if (state.next_perm == 0) {
+        state.adopting_program = (program_cache.find(hash) != program_cache.end());
+    }
+    if (state.adopting_program) {
+        if (!AdoptImportedProgram(state, hash, perms, in_budget)) {
+            return false;
+        }
         RemoveImportedProgram(from, files, hash, perms);
         ++state.skipped;
-        return;
+        state.next_perm = 0;
+        state.adopting_program = false;
+        return true;
     }
-    if (fs::exists(dir / (Hex(hash) + "_0.spv"), ec)) {
-        RemoveImportedProgram(from, files, hash, perms);
-        ++state.skipped;
-        return;
+    if (state.next_perm == 0) {
+        for (const auto& file : files) {
+            const fs::path dst = dir / file.filename();
+            if (!fs::exists(dst, ec)) {
+                fs::rename(file, dst, ec);
+            } else {
+                fs::remove(file, ec);
+            }
+        }
     }
-    for (const auto& file : files) {
-        fs::rename(file, dir / file.filename(), ec);
-    }
-    const PipelineSelection saved = sel;
-    for (u64 perm = 0; perm < perms; ++perm) {
-        const std::string meta_name = Hex(HashCombine(hash, perm));
-        fs::rename(from / (meta_name + ".meta"), dir / (meta_name + ".meta"), ec);
+    for (u64 perm = state.next_perm; perm < perms; ++perm) {
+        if (perm > state.next_perm && !in_budget()) {
+            state.next_perm = perm;
+            return false;
+        }
+        const u64 perm_hash = HashCombine(hash, perm);
+        const std::string meta_name = Hex(perm_hash);
+        const fs::path meta_dst = dir / (meta_name + ".meta");
+        const fs::path meta_src = from / (meta_name + ".meta");
+        if (!fs::exists(meta_dst, ec)) {
+            fs::rename(meta_src, meta_dst, ec);
+        } else {
+            fs::remove(meta_src, ec);
+        }
+        vk::ShaderModule precompiled = state.TakePrecompiled(perm_hash);
         std::vector<u8> meta;
         store.Load(Storage::BlobType::ShaderMeta, meta_name, meta);
         try {
             Serialization::Archive ar{std::move(meta)};
             std::unique_lock lk{programs_mutex};
-            LoadPipelineStage(ar, 0);
+            LoadPipelineStage(ar, 0, precompiled);
         } catch (const std::exception&) {
         }
     }
-    sel = saved;
+    state.next_perm = 0;
     ++state.merged;
+    return true;
 }
 
-void PipelineCache::AdoptImportedProgram(ShaderImport& state, u64 hash, u64 perms) {
+bool PipelineCache::AdoptImportedProgram(ShaderImport& state, u64 hash, u64 perms,
+                                         const std::function<bool()>& in_budget) {
     const fs::path from = Storage::DataBase::Instance().Directory() / "import";
-    std::unique_lock lk{programs_mutex};
-    for (u64 perm = 0; perm < perms; ++perm) {
+    for (u64 perm = state.next_perm; perm < perms; ++perm) {
+        if (perm > state.next_perm && !in_budget()) {
+            state.next_perm = perm;
+            return false;
+        }
         const u64 perm_hash = HashCombine(hash, perm);
         const std::string name = fmt::format("{}_{}", Hex(hash), perm);
         auto meta = ReadImportFile(from / (Hex(perm_hash) + ".meta"));
         const auto bytes = ReadImportFile(from / (name + ".spv"));
         std::vector<u32> spv(bytes.size() / 4);
         std::memcpy(spv.data(), bytes.data(), spv.size() * 4);
+        vk::ShaderModule precompiled = state.TakePrecompiled(perm_hash);
+        std::unique_lock lk{programs_mutex};
         if (const auto idx = AdoptImportedPermutation(std::move(meta), std::move(spv),
-                                                      ReadImportFile(from / (name + ".in")))) {
+                                                      ReadImportFile(from / (name + ".in")),
+                                                      precompiled)) {
             state.remap[perm_hash] = HashCombine(hash, u64(*idx));
             ++state.adopted;
         } else {
             state.remap[perm_hash] = 0;
         }
     }
+    state.next_perm = 0;
+    return true;
 }
 
 void PipelineCache::MergeImportedKey(ShaderImport& state, std::vector<u8>&& bytes) {
@@ -476,7 +573,7 @@ void PipelineCache::QueueImportedCompute(ShaderImport& state, Serialization::Arc
     const vk::ShaderModule module = sel.modules[0];
     ++state.compute;
     state.compute_queued.fetch_add(1, std::memory_order_relaxed);
-    GetCompiler().Submit([this, &state, key, info, module, sdata]() mutable {
+    GetCompiler().SubmitLow([this, &state, key, info, module, sdata]() mutable {
         std::unique_ptr<ComputePipeline> pipeline;
         try {
             pipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -510,7 +607,7 @@ void PipelineCache::QueueImportedGraphics(ShaderImport& state, Serialization::Ar
         pending_graphics.emplace(key, job);
         ++state.queued;
         g_bb_background_pipelines_total.fetch_add(1, std::memory_order_relaxed);
-        GetCompiler().Submit([job] {
+        GetCompiler().SubmitLow([job, key] {
             SCOPE_EXIT {
                 g_bb_background_pipelines_done.fetch_add(1, std::memory_order_relaxed);
             };
@@ -520,11 +617,14 @@ void PipelineCache::QueueImportedGraphics(ShaderImport& state, Serialization::Ar
             std::unique_ptr<GraphicsPipeline> pipeline;
             try {
                 pipeline = job->make();
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
+                LOG_WARNING(Render_Vulkan, "Imported graphics pipeline {:#x} failed: {}",
+                            std::hash<GraphicsPipelineKey>{}(key), e.what());
             }
             std::scoped_lock lk{job->mutex};
             job->pipeline = std::move(pipeline);
             job->done = true;
+            job->ready.store(true, std::memory_order_release);
             job->cv.notify_all();
         });
     }
@@ -532,7 +632,13 @@ void PipelineCache::QueueImportedGraphics(ShaderImport& state, Serialization::Ar
 
 std::optional<size_t> PipelineCache::AdoptImportedPermutation(std::vector<u8>&& meta,
                                                               std::vector<u32>&& spv,
-                                                              std::vector<u8>&& input) {
+                                                              std::vector<u8>&& input,
+                                                              vk::ShaderModule precompiled) {
+    auto discard_precompiled = [&] {
+        if (precompiled) {
+            instance.GetDevice().destroyShaderModule(precompiled);
+        }
+    };
     Shader::Info info{};
     Shader::StageSpecialization spec{};
     spec.info = &info;
@@ -540,25 +646,30 @@ std::optional<size_t> PipelineCache::AdoptImportedPermutation(std::vector<u8>&& 
     try {
         Serialization::Archive ar{std::move(meta)};
         if (!LoadShaderMeta(ar, info, spec, import_idx)) {
+            discard_precompiled();
             return std::nullopt;
         }
     } catch (const std::exception&) {
+        discard_precompiled();
         return std::nullopt;
     }
     const auto it = program_cache.find(info.pgm_hash);
     if (it == program_cache.end()) {
+        discard_precompiled();
         return std::nullopt;
     }
     Program& program = *it.value();
     auto& modules = program.modules;
     if (const auto found = std::ranges::find(modules, spec, &Program::Module::spec);
         found != modules.end()) {
+        discard_precompiled();
         return size_t(std::distance(modules.begin(), found));
     }
     if (spv.size() < 5 || spv[0] != 0x07230203u) {
+        discard_precompiled();
         return std::nullopt;
     }
-    vk::ShaderModule module = CompileSPV(spv, instance.GetDevice());
+    vk::ShaderModule module = precompiled ? precompiled : CompileSPV(spv, instance.GetDevice());
     if (!module) {
         return std::nullopt;
     }
@@ -568,8 +679,13 @@ std::optional<size_t> PipelineCache::AdoptImportedPermutation(std::vector<u8>&& 
     if (!input.empty()) {
         RegisterShaderInput(std::move(input), info.pgm_hash, idx);
     }
+    if (!program.info_template) {
+        program.info_template = std::make_unique<Shader::Info>(program.info);
+    }
+    const u64 flat_hash = XXH3_64bits(info.flattened_ud_buf.data(),
+                                      info.flattened_ud_buf.size() * sizeof(u32));
     spec.info = &program.info;
-    program.InsertPermut(module, std::move(spec), idx);
+    program.InsertPermut(module, std::move(spec), idx, flat_hash);
     return idx;
 }
 

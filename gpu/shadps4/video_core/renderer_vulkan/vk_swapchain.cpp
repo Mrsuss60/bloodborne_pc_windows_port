@@ -90,12 +90,7 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
-    auto result = instance.GetDevice().waitIdle();
-    if (result != vk::Result::eSuccess) {
-        LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
-                    vk::to_string(result));
-    }
-
+    // Recreate() calls Create() -> Destroy(), which already waits for device idle.
     needs_hdr = hdr;
     Recreate(width, height);
     ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
@@ -115,12 +110,10 @@ bool Swapchain::AcquireNextImage() {
     case vk::Result::eErrorSurfaceLostKHR:
     case vk::Result::eErrorOutOfDateKHR:
     case vk::Result::eErrorUnknown:
-        needs_recreation = true;
-        break;
     default:
-        LOG_CRITICAL(Render_Vulkan, "Swapchain acquire returned unknown result {}",
-                     vk::to_string(result));
-        UNREACHABLE();
+        LOG_WARNING(Render_Vulkan, "Swapchain acquire returned {}, requesting recreation",
+                    vk::to_string(result));
+        needs_recreation = true;
         break;
     }
 

@@ -282,9 +282,10 @@ static int get_host_cores(void) {
 static int ps4_prio_to_win32(int prio, const char *name) {
     int cores = get_host_cores();
     int is_audio = (name && (strstr(name, "Audio") || strstr(name, "audio") || strstr(name, "Sound") || strstr(name, "sound") || strstr(name, "pad")));
-    int is_render = (name && (strstr(name, "Render") || strstr(name, "render") || strstr(name, "Present") || strstr(name, "Flip") || strstr(name, "Display")));
-    int is_main = (name && (strstr(name, "Main") || strstr(name, "main") || strstr(name, "host")));
-    int is_worker = (name && (strstr(name, "Worker") || strstr(name, "worker") || strstr(name, "Pool") || strstr(name, "pool") || strstr(name, "Work") || strstr(name, "work") || strstr(name, "Havok") || strstr(name, "Cloth") || strstr(name, "Job") || strstr(name, "job")));
+    int is_render = (name && (strstr(name, "Render") || strstr(name, "render") || strstr(name, "Present") || strstr(name, "Flip") || strstr(name, "Display") || strstr(name, "GX") || strstr(name, "Gnm")));
+    int is_main = (name && (strstr(name, "Main") || strstr(name, "main") || strstr(name, "host") || strstr(name, "WorldChrMan")));
+    int is_sim = (name && (strstr(name, "Havok") || strstr(name, "Cloth") || strstr(name, "Physics") || strstr(name, "physics")));
+    int is_worker = (name && (strstr(name, "Worker") || strstr(name, "worker") || strstr(name, "Pool") || strstr(name, "pool") || strstr(name, "Work") || strstr(name, "work") || strstr(name, "Job") || strstr(name, "job") || strstr(name, "Async") || strstr(name, "async"))) && !is_render && !is_sim;
 
     /* Audio threads get elevated priority to prevent audio dropouts */
     if (is_audio || prio <= 180) {
@@ -296,11 +297,16 @@ static int ps4_prio_to_win32(int prio, const char *name) {
         return THREAD_PRIORITY_ABOVE_NORMAL;
     }
 
+    /* Simulation threads (Havok physics, cloth) must keep pace every frame */
+    if (is_sim) {
+        return THREAD_PRIORITY_NORMAL;
+    }
+
     /* On 4 cores or fewer (no SMT / low core count), worker pools must NOT preempt main or render threads */
     if (cores <= 4) {
         if (is_worker) return THREAD_PRIORITY_BELOW_NORMAL;
-        if (prio <= 260) return THREAD_PRIORITY_BELOW_NORMAL;
-        if (prio <= 700) return THREAD_PRIORITY_BELOW_NORMAL;
+        if (prio <= 260) return THREAD_PRIORITY_NORMAL;
+        if (prio <= 700) return THREAD_PRIORITY_NORMAL;
         return THREAD_PRIORITY_LOWEST;
     }
 
@@ -434,8 +440,12 @@ static ABI int32_t thread_rename(GuestThread *t,const char *name) {
     snprintf(t->name,sizeof(t->name),"%s",name);
     if (t==current) set_host_name(t->name);
 #ifdef _WIN32
-    if (t->win32_handle && t->attr.prio > 0) {
-        SetThreadPriority(t->win32_handle, ps4_prio_to_win32(t->attr.prio, t->name));
+    if (t->attr.prio > 0) {
+        if (t == current) {
+            SetThreadPriority(GetCurrentThread(), ps4_prio_to_win32(t->attr.prio, t->name));
+        } else if (t->win32_handle) {
+            SetThreadPriority(t->win32_handle, ps4_prio_to_win32(t->attr.prio, t->name));
+        }
     }
 #endif
     return 0;

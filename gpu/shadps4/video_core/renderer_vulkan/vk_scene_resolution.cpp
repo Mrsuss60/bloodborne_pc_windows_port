@@ -57,6 +57,7 @@ bool SceneTargets::Blittable(vk::Format format) const {
     return (features & required) == required;
 }
 bool SceneTargets::ShaderResampled(const VideoCore::Image& image) const {
+    if (!image.backing) return false;
     const auto format = image.backing->image.image_ci.format;
     if (!image.info.props.is_depth) return false;
     const bool stencil = bool(image.aspect_mask & vk::ImageAspectFlagBits::eStencil);
@@ -103,9 +104,9 @@ bool SceneTargets::Eligible(const VideoCore::Image& image) const {
     if (i.resources.levels != 1) {
         // Mip chains (the bloom pyramid at half resolution): one blitted proxy per level.
         return div == 2 && i.resources.levels <= 16 && !i.props.is_depth &&
-               Blittable(image.backing->image.image_ci.format);
+               image.backing && Blittable(image.backing->image.image_ci.format);
     }
-    return Blittable(image.backing->image.image_ci.format) || ShaderResampled(image);
+    return (image.backing && Blittable(image.backing->image.image_ci.format)) || ShaderResampled(image);
 }
 bool SceneTargets::EligibleScene(const VideoCore::Image& image) const {
     const auto native = SceneResolution::Native();
@@ -236,6 +237,7 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
     const bool linear =
         linear_resolve && !BbToggle::Experiment(2) && to_native &&
         original.aspect_mask == vk::ImageAspectFlags{vk::ImageAspectFlagBits::eColor} &&
+        original.backing &&
         bool(Features(original.backing->image.image_ci.format) &
              vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
     for (auto aspect : {vk::ImageAspectFlagBits::eColor, vk::ImageAspectFlagBits::eDepth,
@@ -260,6 +262,7 @@ void SceneTargets::Copy(Entry& e, VideoCore::Image& original, bool to_native) {
 }
 void SceneTargets::Resample(vk::Image src, vk::Image dst, const VideoCore::Image& original,
                             vk::Extent2D dst_size, bool downscale) {
+    if (!original.backing) return;
     const auto device = instance.GetDevice();
     const auto format = original.backing->image.image_ci.format;
     const bool stencil = bool(original.aspect_mask & vk::ImageAspectFlagBits::eStencil);
@@ -479,6 +482,10 @@ SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level) {
         entry->uid = original.image_uid;
         entry->level = level;
         entry->image = VideoCore::UniqueImage(instance.GetDevice(), instance.GetAllocator());
+        if (!original.backing) {
+            recent[recent_next++ % recent.size()] = {key, entry.get()};
+            return *entry;
+        }
         auto ci = original.backing->image.image_ci;
         ci.pNext = nullptr;
         const auto proxy = ProxySize(original, level);
@@ -497,7 +504,7 @@ vk::ImageView SceneTargets::View(Entry& e, const VideoCore::Image& original,
     const auto aspect = original.info.props.is_depth
         ? (info.is_storage ? original.aspect_mask : vk::ImageAspectFlags(vk::ImageAspectFlagBits::eDepth))
         : vk::ImageAspectFlags(vk::ImageAspectFlagBits::eColor);
-    const auto format = original.info.props.is_depth ? original.backing->image.image_ci.format : info.format;
+    const auto format = (original.info.props.is_depth && original.backing) ? original.backing->image.image_ci.format : info.format;
     auto view = Check(instance.GetDevice().createImageViewUnique({
         .image = e.image, .viewType = vk::ImageViewType::e2D, .format = format,
         .components = info.mapping, .subresourceRange = {aspect,0,1,0,1},

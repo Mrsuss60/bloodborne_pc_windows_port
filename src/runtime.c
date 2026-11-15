@@ -220,7 +220,18 @@ static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
     }
     return memcmp(a, b, size);
 }
-static ABI size_t guest_strlen(const char *text) { return strlen(text); }
+static ABI size_t guest_strlen(const char *text) {
+    if (!text) {
+        GuestThread *cur = runtime_thread_current();
+        fprintf(stderr,
+            "[RUNTIME GUARD] Invalid strlen: text is NULL (caller %p, thread '%s', TID %lu)\n",
+            __builtin_return_address(0),
+            cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId());
+        fflush(stderr);
+        return 0;
+    }
+    return strlen(text);
+}
 static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
     printf("Runtime: guest requested exit(%d)\n", status);
     runtime_finalize(NULL);

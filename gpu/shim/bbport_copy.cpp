@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -91,6 +92,7 @@ public:
             if (task.run) {
                 RunAsync(task);
             } else {
+                _mm_pause();
                 std::this_thread::yield();
             }
         }
@@ -109,6 +111,7 @@ public:
         Work(*job);
         // Workers only call the task for indices below count, all done before this returns.
         while (job->done.load(std::memory_order_acquire) < count) {
+            _mm_pause();
             std::this_thread::yield();
         }
         std::scoped_lock lk{mutex};

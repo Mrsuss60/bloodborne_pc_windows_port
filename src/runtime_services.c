@@ -86,7 +86,10 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     case 5: *value=0; break;                    /* summer time */
     case 7: *value=0; break;                    /* parental level off */
     case 1000: *value=1; break;                 /* enter button = cross */
-    default: fprintf(stderr,"STOP: unsupported system parameter %d\n",id); exit(21);
+    default:
+        fprintf(stderr, "[SYSTEM GUARD] Unsupported system parameter %d requested; defaulting to 0\n", id);
+        *value = 0;
+        break;
     }
     return 0;
 }

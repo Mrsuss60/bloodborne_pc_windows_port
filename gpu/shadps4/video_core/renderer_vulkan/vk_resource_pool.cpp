@@ -59,7 +59,7 @@ std::size_t ResourcePool::ManageOverflow() {
     return old_capacity;
 }
 
-constexpr std::size_t COMMAND_BUFFER_POOL_SIZE = 4;
+constexpr std::size_t COMMAND_BUFFER_POOL_SIZE = 16;
 
 CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore)
     : ResourcePool{work_semaphore, COMMAND_BUFFER_POOL_SIZE}, instance{instance} {
@@ -74,6 +74,9 @@ CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore)
                vk::to_string(pool_result));
     cmd_pool = std::move(pool);
     SetObjectName(device, *cmd_pool, "CommandPool");
+    // Pre-allocate initial command buffers to eliminate driver allocation overhead during gameplay
+    ticks.resize(COMMAND_BUFFER_POOL_SIZE, 0);
+    Allocate(0, COMMAND_BUFFER_POOL_SIZE);
 }
 
 CommandPool::~CommandPool() = default;
@@ -84,7 +87,7 @@ void CommandPool::Allocate(std::size_t begin, std::size_t end) {
     const vk::CommandBufferAllocateInfo buffer_alloc_info = {
         .commandPool = *cmd_pool,
         .level = vk::CommandBufferLevel::ePrimary,
-        .commandBufferCount = COMMAND_BUFFER_POOL_SIZE,
+        .commandBufferCount = static_cast<u32>(end - begin),
     };
 
     const vk::Device device = instance.GetDevice();
@@ -153,14 +156,20 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
                    result == vk::Result::eErrorFragmentedPool,
                "Unexpected error during descriptor set allocation: {}", vk::to_string(result));
     pending_pools.emplace_back(curr_pool, work_semaphore->CurrentTick());
-    if (const auto [pool, tick] = pending_pools.front(); work_semaphore->IsFree(tick)) {
-        curr_pool = pool;
-        pending_pools.pop_front();
-
-        const auto reset_result = device.resetDescriptorPool(curr_pool);
-        ASSERT_MSG(reset_result == vk::Result::eSuccess,
-                   "Unexpected error resetting descriptor pool: {}", vk::to_string(reset_result));
-    } else {
+    work_semaphore->Refresh();
+    bool reused = false;
+    for (auto it = pending_pools.begin(); it != pending_pools.end(); ++it) {
+        if (work_semaphore->IsFree(it->second)) {
+            curr_pool = it->first;
+            pending_pools.erase(it);
+            const auto reset_result = device.resetDescriptorPool(curr_pool);
+            ASSERT_MSG(reset_result == vk::Result::eSuccess,
+                       "Unexpected error resetting descriptor pool: {}", vk::to_string(reset_result));
+            reused = true;
+            break;
+        }
+    }
+    if (!reused) {
         CreateDescriptorPool();
     }
 

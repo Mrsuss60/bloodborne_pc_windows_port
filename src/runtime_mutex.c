@@ -46,7 +46,7 @@ static int native_timedlock(NativeMutex *m, uint64_t deadline) {
     for (unsigned attempt = 0;; ++attempt) {
         if (TryAcquireSRWLockExclusive(&m->lock)) { take(m, self); return 0; }
         if (host_realtime_ns() >= deadline) return ETIMEDOUT;
-        if (attempt < 64) YieldProcessor(); else if (attempt < 128) SwitchToThread(); else Sleep(1);
+        if (attempt < 32) YieldProcessor(); else SwitchToThread();
     }
 }
 static int native_unlock(NativeMutex *m) {
@@ -121,12 +121,16 @@ static int32_t orbis_error(int e) {
     unsigned code;
     switch (e) {
     case EPERM: code=1; break;
+    case EDEADLK: code=11; break;
     case ENOMEM: code=12; break;
     case EBUSY: code=16; break;
     case EINVAL: code=22; break;
     case EAGAIN: code=35; break;
-    case EDEADLK: code=11; break;
-    default: fprintf(stderr, "STOP: unmapped host pthread error %d\n", e); exit(21);
+    case ETIMEDOUT: code=60; break;
+    default:
+        fprintf(stderr, "[MUTEX GUARD] Unmapped host pthread error %d, returning EINVAL\n", e);
+        code = (e > 0 && e < 256) ? (unsigned)e : 22;
+        break;
     }
     return (int32_t)(UINT32_C(0x80020000) | code);
 }

@@ -937,7 +937,11 @@ public:
         Record([copy = std::forward<Func>(copy), this,
                 seq = ++host_copies_issued](vk::CommandBuffer) {
             copy();
-            host_copies_done.store(seq, std::memory_order_release);
+            host_copies_done.store(seq, std::memory_order_seq_cst);
+            if (host_copies_waiters.load(std::memory_order_seq_cst) != 0) {
+                std::scoped_lock lk{host_copies_mutex};
+                host_copies_cv.notify_all();
+            }
         });
     }
 
@@ -1083,6 +1087,9 @@ private:
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
+    std::atomic<u32> host_copies_waiters{0};
+    std::mutex host_copies_mutex;
+    std::condition_variable host_copies_cv;
     /// Host copy sources by 64 KiB granule in a direct-mapped table: a slot is pending while its
     /// note is newer than the last completed WaitHostCopies; a slot two granules share is a
     /// wildcard (any granule mapping there counts as pending).
