@@ -434,6 +434,28 @@ int runtime_pad_prompt(const char *name,int prefer_mouse,char *label,int size) {
     return 0;
 }
 
+/* Suppress any mouse button already physically held when capture engages (e.g. clicking inside an
+ * uncaptured or unfocused game window to recapture the cursor) until that button is released. */
+typedef struct {
+    int prev_captured;
+    SDL_MouseButtonFlags suppressed;
+} MouseCaptureLatch;
+
+static MouseCaptureLatch mouse_capture_latch;
+
+static SDL_MouseButtonFlags filter_capture_mouse_buttons(MouseCaptureLatch *latch,
+                                                         int mouse_is_captured,
+                                                         SDL_MouseButtonFlags raw_buttons) {
+    if (mouse_is_captured && !latch->prev_captured) {
+        latch->suppressed = raw_buttons;
+    } else if (!mouse_is_captured) {
+        latch->suppressed = 0;
+    }
+    latch->prev_captured = mouse_is_captured;
+    latch->suppressed &= raw_buttons;
+    return raw_buttons & ~latch->suppressed;
+}
+
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
@@ -441,7 +463,11 @@ static void sample_host(PadData *d) {
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     d->timestamp=now_us();
     SDL_Gamepad *g=current_gamepad();
-    if (bbgpu_overlay_captures_input() || bbgpu_text_input_is_active()) return; /* settings menu open or typing: neutral input */
+    if (bbgpu_overlay_captures_input() || bbgpu_text_input_is_active()) {
+        mouse_capture_latch.prev_captured = 0;
+        mouse_capture_latch.suppressed = 0;
+        return; /* settings menu open or typing: neutral input */
+    }
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     if (g) {
         static const struct { SDL_GamepadButton sdl; uint32_t ps; } map[]={
@@ -492,7 +518,10 @@ static void sample_host(PadData *d) {
     // The buttons the menu pointer takes (1 left, 2 right) choose and go back instead of their bindings.
     const int pointer_owns = mouse_is_captured ? 0 : bbgpu_menu_pointer_mouse_buttons();
     float mouse_x_pos = 0.0f, mouse_y_pos = 0.0f;
-    const SDL_MouseButtonFlags mouse_buttons = (mouse_is_captured || pointer_owns) ? SDL_GetMouseState(&mouse_x_pos, &mouse_y_pos) : 0;
+    const SDL_MouseButtonFlags raw_mouse_buttons =
+        (mouse_is_captured || pointer_owns) ? SDL_GetMouseState(&mouse_x_pos, &mouse_y_pos) : 0;
+    const SDL_MouseButtonFlags mouse_buttons =
+        filter_capture_mouse_buttons(&mouse_capture_latch, mouse_is_captured, raw_mouse_buttons);
     const bool lmb_raw = (mouse_buttons & SDL_BUTTON_LMASK) != 0 && !(pointer_owns & 1);
     const bool rmb_raw = (mouse_buttons & SDL_BUTTON_RMASK) != 0 && !(pointer_owns & 2);
     const bool mmb = (mouse_buttons & SDL_BUTTON_MMASK) != 0;

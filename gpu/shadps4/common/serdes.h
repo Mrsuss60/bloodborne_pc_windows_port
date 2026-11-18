@@ -34,6 +34,10 @@ struct Archive {
         container.resize(container.size() + size);
     }
 
+    void Reserve(size_t extra) {
+        container.reserve(offset + extra);
+    }
+
     void Merge(const Archive& ar) {
         container.insert(container.end(), ar.container.cbegin(), ar.container.cend());
         offset = container.size();
@@ -55,6 +59,7 @@ struct Archive {
     }
 
     std::vector<u8>&& TakeOff() {
+        container.resize(offset);
         offset = 0;
         return std::move(container);
     }
@@ -77,8 +82,8 @@ private:
 struct Writer {
     template <typename T>
     void Write(const T* ptr, size_t size) {
-        if (ar.offset + size >= ar.container.size()) {
-            ar.Grow(size);
+        if (ar.offset + size > ar.container.size()) {
+            ar.container.resize(ar.offset + size);
         }
         std::memcpy(ar.CurrPtr(), reinterpret_cast<const void*>(ptr), size);
         ar.Advance(size);

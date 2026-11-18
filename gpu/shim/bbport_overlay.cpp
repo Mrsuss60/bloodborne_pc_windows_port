@@ -65,6 +65,11 @@ extern std::atomic<u32> g_bb_compiles_total;
 extern std::atomic<u32> g_bb_background_pipelines_total;
 extern std::atomic<u32> g_bb_background_pipelines_done;
 extern std::atomic<bool> g_bb_shader_import_active;
+extern std::atomic<u32> g_bb_recipe_import_done;
+extern std::atomic<u32> g_bb_recipe_import_total;
+extern std::atomic<u32> g_bb_boot_compile_done;
+extern std::atomic<u32> g_bb_boot_compile_total;
+extern std::atomic<bool> g_bb_boot_precompile_active;
 }
 
 namespace BbOverlay {
@@ -99,6 +104,11 @@ using ::Vulkan::g_bb_compiles_total;
 using ::Vulkan::g_bb_background_pipelines_total;
 using ::Vulkan::g_bb_background_pipelines_done;
 using ::Vulkan::g_bb_shader_import_active;
+using ::Vulkan::g_bb_recipe_import_done;
+using ::Vulkan::g_bb_recipe_import_total;
+using ::Vulkan::g_bb_boot_compile_done;
+using ::Vulkan::g_bb_boot_compile_total;
+using ::Vulkan::g_bb_boot_precompile_active;
 
 static long long NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -108,7 +118,10 @@ static long long NowNs() {
 
 struct ShaderProgress {
     u32 done = 0, total = 0, recent = 0;
+    u32 recipe_done = 0, recipe_total = 0;
+    u32 boot_done = 0, boot_total = 0;
     bool importing = false;
+    bool boot_active = false;
 };
 
 static ShaderProgress CurrentShaderProgress() {
@@ -117,12 +130,19 @@ static ShaderProgress CurrentShaderProgress() {
     if (!enabled) {
         return p;
     }
+    p.boot_active = g_bb_boot_precompile_active.load(std::memory_order_acquire);
     p.total = g_bb_background_pipelines_total.load(std::memory_order_relaxed);
     p.done = g_bb_background_pipelines_done.load(std::memory_order_relaxed);
+    p.recipe_done = g_bb_recipe_import_done.load(std::memory_order_relaxed);
+    p.recipe_total = g_bb_recipe_import_total.load(std::memory_order_relaxed);
+    p.boot_done = g_bb_boot_compile_done.load(std::memory_order_relaxed);
+    p.boot_total = g_bb_boot_compile_total.load(std::memory_order_acquire);
     static const long long start = NowNs();
     const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
-    p.importing = g_bb_shader_import_active.load(std::memory_order_relaxed) &&
-                  frame < 30 && NowNs() - start < 8'000'000'000ll;
+    p.importing = p.boot_active
+                      ? g_bb_shader_import_active.load(std::memory_order_relaxed)
+                      : (g_bb_shader_import_active.load(std::memory_order_relaxed) && frame < 30 &&
+                         NowNs() - start < 8'000'000'000ll);
     static u32 last_compiles = 0;
     static long long last_change = 0;
     static u32 window_start_compiles = 0;
@@ -142,11 +162,11 @@ static ShaderProgress CurrentShaderProgress() {
 }
 
 static bool ShaderProgressShown() {
-    if (!BbSettings::Get().show_hud) {
+    const ShaderProgress p = CurrentShaderProgress();
+    if (!p.boot_active && !BbSettings::Get().show_hud) {
         return false;
     }
-    const ShaderProgress p = CurrentShaderProgress();
-    const bool shown = p.done < p.total || p.importing || p.recent != 0;
+    const bool shown = p.boot_active || p.done < p.total || p.importing || p.recent != 0;
     static bool was_shown = false;
     if (shown != was_shown) {
         was_shown = shown;
@@ -158,17 +178,30 @@ static bool ShaderProgressShown() {
 }
 
 static void ShaderProgressLine() {
-    if (!BbSettings::Get().show_hud) {
+    const ShaderProgress p = CurrentShaderProgress();
+    if (!p.boot_active && !BbSettings::Get().show_hud) {
         return;
     }
-    const ShaderProgress p = CurrentShaderProgress();
     char text[128];
-    if (p.done < p.total) {
-        std::snprintf(text, sizeof(text), "Compiling shaders %u / %u", p.done, p.total);
+    if (p.boot_active) {
+        if (p.boot_total > 0) {
+            std::snprintf(text, sizeof(text), "Compiling Shaders %u/%u",
+                          std::min(p.boot_done, p.boot_total), p.boot_total);
+        } else if (p.total > 0) {
+            std::snprintf(text, sizeof(text), "Compiling Shaders %u/%u",
+                          std::min(p.done, p.total), p.total);
+        } else if (p.recipe_total > 0) {
+            std::snprintf(text, sizeof(text), "Preparing Shaders %u/%u",
+                          std::min(p.recipe_done, p.recipe_total), p.recipe_total);
+        } else {
+            std::snprintf(text, sizeof(text), "Preparing Shaders...");
+        }
+    } else if (p.done < p.total) {
+        std::snprintf(text, sizeof(text), "Compiling Shaders %u/%u", p.done, p.total);
     } else if (p.importing) {
-        std::snprintf(text, sizeof(text), "Preparing shaders...");
+        std::snprintf(text, sizeof(text), "Preparing Shaders...");
     } else if (p.recent != 0) {
-        std::snprintf(text, sizeof(text), "Compiling shaders (%u)", p.recent);
+        std::snprintf(text, sizeof(text), "Compiling Shaders (%u)", p.recent);
     } else {
         return;
     }
@@ -1850,8 +1883,8 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    if (initialized) {
-        // Apply persisted cheats even when neither menu is open.
+    if (initialized && !g_bb_boot_precompile_active.load(std::memory_order_acquire)) {
+        // Apply persisted cheats even when neither menu is open (never before guest memory boots).
         BbCheats::Update();
     }
     return initialized && (menu_open || cheat_menu_open || BbSettings::Get().show_fps ||
@@ -1891,19 +1924,24 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
-    if (menu_open) {
-        Menu();
-    }
-    if (cheat_menu_open) {
-        DrawCheatMenu();
-    }
-    if (BbSettings::Get().show_hud && !menu_open && !cheat_menu_open) {
-        HudOverlay();
-    } else if (BbSettings::Get().show_fps && !menu_open && !cheat_menu_open) {
-        FpsCounter();
-    }
-    if (!menu_open && !cheat_menu_open) {
+    const bool boot_precompile = g_bb_boot_precompile_active.load(std::memory_order_acquire);
+    if (boot_precompile) {
         ShaderProgressLine();
+    } else {
+        if (menu_open) {
+            Menu();
+        }
+        if (cheat_menu_open) {
+            DrawCheatMenu();
+        }
+        if (BbSettings::Get().show_hud && !menu_open && !cheat_menu_open) {
+            HudOverlay();
+        } else if (BbSettings::Get().show_fps && !menu_open && !cheat_menu_open) {
+            FpsCounter();
+        }
+        if (!menu_open && !cheat_menu_open) {
+            ShaderProgressLine();
+        }
     }
     if (g_window && g_window->IsTextInputActive()) {
         const std::string prompt = g_window->GetTextInputPrompt();

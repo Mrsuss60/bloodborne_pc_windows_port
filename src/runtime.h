@@ -48,6 +48,7 @@ void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_vma_info(uintptr_t address, int *prot, int *type, uintptr_t *end);
 void runtime_memory_dump_recent_ops(void *file_handle);
+void runtime_memory_set_pool_size(uint64_t size);
 /* Guest-memory accounting for crash dumps: allocations, mappings and *failures*. A guest NULL
  * dereference after a failed allocation was otherwise impossible to tell from a genuine bug. */
 void runtime_memory_report_to(void *file_handle);

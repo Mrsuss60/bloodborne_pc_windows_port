@@ -13,6 +13,10 @@ void* GetRip(void* ctx);
 
 void IncrementRip(void* ctx, u64 length);
 
+void ClearRdi(void* ctx);
+
+void ClearR10(void* ctx);
+
 bool IsWriteError(void* ctx);
 
 } // namespace Common

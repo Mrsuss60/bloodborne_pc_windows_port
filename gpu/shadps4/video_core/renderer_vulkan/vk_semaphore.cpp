@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <limits>
+#include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
-
-#include "common/assert.h"
 
 namespace Vulkan {
 
 #ifdef WAIT_TIMEOUT
 #undef WAIT_TIMEOUT
 #endif
-constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
+constexpr u64 WAIT_TIMEOUT = 10000000000ULL; // 10-second bounded timeout
 
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
@@ -37,8 +37,10 @@ void Semaphore::Refresh() {
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
         auto [counter_result, cntr] = instance.GetDevice().getSemaphoreCounterValue(*semaphore);
-        ASSERT_MSG(counter_result == vk::Result::eSuccess,
-                   "Failed to get master semaphore value: {}", vk::to_string(counter_result));
+        if (counter_result != vk::Result::eSuccess) {
+            LOG_ERROR(Render_Vulkan, "Failed to get master semaphore value: {}", vk::to_string(counter_result));
+            return;
+        }
         counter = cntr;
         if (counter < this_tick) {
             return;
@@ -65,7 +67,11 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
-    while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
+    const auto wait_result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT);
+    if (wait_result != vk::Result::eSuccess) {
+        LOG_CRITICAL(Render_Vulkan, "waitSemaphores for tick {} returned {}, device may be lost or hung",
+                     tick, vk::to_string(wait_result));
+        return;
     }
     Refresh();
 }

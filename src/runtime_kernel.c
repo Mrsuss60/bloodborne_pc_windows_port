@@ -253,10 +253,12 @@ static int32_t get_host_ncpu(void) {
 #ifdef _WIN32
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    return si.dwNumberOfProcessors > 0 ? (int32_t)si.dwNumberOfProcessors : 4;
+    int32_t n = si.dwNumberOfProcessors > 0 ? (int32_t)si.dwNumberOfProcessors : 4;
+    return n > 8 ? 8 : n;
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? (int32_t)n : 4;
+    int32_t ncpu = n > 0 ? (int32_t)n : 4;
+    return ncpu > 8 ? 8 : ncpu;
 #endif
 }
 

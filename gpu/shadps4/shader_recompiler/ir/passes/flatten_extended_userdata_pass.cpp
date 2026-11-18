@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
+#include "bbport_threads.h"
 #include "common/arch.h"
 #include "common/decoder.h"
 #include "common/io_file.h"
@@ -84,55 +87,64 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
         return false; // Not in SRT code range
     }
 
-    // bbport: draw-preparation workers run the same walker concurrently; a second thread that
-    // faulted on the instruction before the first one patched it finds the patch and retries.
-    static std::mutex patch_mutex;
-    std::scoped_lock patch_lock{patch_mutex};
-    const u8* bytes = reinterpret_cast<const u8*>(code);
-    if ((bytes[0] == 0x48 && bytes[1] == 0x31 && bytes[2] == 0xFF) ||
-        (bytes[0] == 0x45 && bytes[1] == 0x31 && bytes[2] == 0xD2)) {
-        return true;
+    // bbport: speculative draw-preparation workers (and draw-pipe verification) run shared SRT
+    // walkers under runtime_fault_recover where guest SRT pointers may be uninitialized (NULL)
+    // or already reused. Return false so the VEH/signal handler jumps straight to
+    // runtime_fault_recover and leaves the draw to the GPU thread.
+    if (runtime_fault_recover != nullptr) {
+        return false;
     }
 
-    // Patch instruction to zero register
+    // bbport: emulate the faulting load in the exception context instead of self-modifying the
+    // shared JIT code in g_srt_codegen. Patching the instruction to `xor` permanently destroys
+    // texture/buffer descriptor loads for all subsequent draws with valid SRT pointers and races
+    // with concurrent draw-prep workers executing the same walker.
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
     ZyanStatus status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
                                                                        const_cast<void*>(code), 15);
-
-    ASSERT(ZYAN_SUCCESS(status) && instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
-           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-           operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
-
-    size_t len = instruction.length;
-    const size_t patch_size = 3;
-    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
-
-    // We can only encounter rdi or r10d as the first operand in a
-    // fault memory access for SRT walker.
-    switch (operands[0].reg.value) {
-    case ZYDIS_REGISTER_RDI:
-        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
-        code_patch[0] = 0x48;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xFF;
-        break;
-    case ZYDIS_REGISTER_R10D:
-        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
-        code_patch[0] = 0x45;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xD2;
-        break;
-    default:
-        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
+    if (!ZYAN_SUCCESS(status) || instruction.mnemonic != ZYDIS_MNEMONIC_MOV ||
+        operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
         return false;
     }
 
-    // Fill nops
-    memset(code_patch + patch_size, 0x90, len - patch_size);
+    switch (operands[0].reg.value) {
+    case ZYDIS_REGISTER_RDI:
+        Common::ClearRdi(context);
+        break;
+    case ZYDIS_REGISTER_R10D:
+        Common::ClearR10(context);
+        break;
+    default:
+        return false;
+    }
 
-    LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
-                fault_address);
+    Common::IncrementRip(context, instruction.length);
+
+    static std::array<std::atomic<const void*>, 64> logged_pcs{};
+    bool should_log = false;
+    for (auto& slot : logged_pcs) {
+        const void* existing = slot.load(std::memory_order_relaxed);
+        if (existing == code) {
+            break;
+        }
+        if (existing == nullptr) {
+            const void* expected = nullptr;
+            if (slot.compare_exchange_strong(expected, code, std::memory_order_relaxed)) {
+                should_log = true;
+                break;
+            }
+            if (expected == code) {
+                break;
+            }
+        }
+    }
+    if (should_log) {
+        LOG_WARNING(Render_Recompiler,
+                    "Skipped faulting SRT walker load at {}, fault address {} (walker preserved)",
+                    code, fault_address);
+    }
 
     return true;
 }

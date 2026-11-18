@@ -131,13 +131,28 @@ void runtime_thread_attach_main(void) {
     static int s_process_prio_configured = 0;
     if (!s_process_prio_configured) {
         s_process_prio_configured = 1;
-        SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
         PROCESS_POWER_THROTTLING_STATE throttling = {0};
         throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
-        throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
         throttling.StateMask = 0;
         SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+        HMODULE avrt = LoadLibraryA("avrt.dll");
+        if (avrt) {
+            typedef HANDLE (WINAPI *pfnAvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
+            pfnAvSetMmThreadCharacteristicsW set_mmcss =
+                (pfnAvSetMmThreadCharacteristicsW)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
+            if (set_mmcss) {
+                DWORD task_idx = 0;
+                set_mmcss(L"Games", &task_idx);
+            }
+        }
     }
 #endif
     GuestThread *t=runtime_thread_current();
@@ -326,6 +341,26 @@ static void *host_start(void *p) {
 #ifdef _WIN32
     if (t->attr.prio > 0) {
         SetThreadPriority(GetCurrentThread(), ps4_prio_to_win32(t->attr.prio, t->name));
+    }
+    const char *tname = t->name;
+    int is_render = (tname && (strstr(tname, "Render") || strstr(tname, "render") || strstr(tname, "Present") || strstr(tname, "Flip") || strstr(tname, "Display") || strstr(tname, "GX") || strstr(tname, "Gnm")));
+    int is_audio = (tname && (strstr(tname, "Audio") || strstr(tname, "audio") || strstr(tname, "Sound") || strstr(tname, "sound")));
+    if (is_render || is_audio) {
+        static HMODULE s_avrt = NULL;
+        static int s_avrt_tried = 0;
+        if (!s_avrt_tried) {
+            s_avrt_tried = 1;
+            s_avrt = LoadLibraryA("avrt.dll");
+        }
+        if (s_avrt) {
+            typedef HANDLE (WINAPI *pfnAvSetMmThreadCharacteristicsW)(LPCWSTR, LPDWORD);
+            pfnAvSetMmThreadCharacteristicsW set_mmcss =
+                (pfnAvSetMmThreadCharacteristicsW)GetProcAddress(s_avrt, "AvSetMmThreadCharacteristicsW");
+            if (set_mmcss) {
+                DWORD task_idx = 0;
+                set_mmcss(is_audio ? L"Pro Audio" : L"Games", &task_idx);
+            }
+        }
     }
 #endif
     if (!EXIT_SET(t->exit_jump)) t->result=t->entry(t->argument);

@@ -3,13 +3,16 @@
  * Mappings replace placeholders with views of the physical backing section (MapViewOfFile3).
  * Slices are tracked so partial unmap / overlay unmaps and remaps remnants. */
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "win32_memory.h"
+#include "runtime.h"
 
 typedef PVOID (WINAPI *VirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
 typedef PVOID (WINAPI *MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
@@ -86,6 +89,20 @@ int win_mem_space(uintptr_t start, uintptr_t end) {
 int win_mem_section(uint64_t size, void **backing) {
     section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
                                  (DWORD)(size >> 32), (DWORD)size, NULL);
+    if (!section && GetLastError() == ERROR_COMMITMENT_LIMIT) {
+        uint64_t fallback_size = (UINT64_C(5056) * 1024 * 1024) + (UINT64_C(1024) * 1024 * 1024);
+        if (size > fallback_size) {
+            fprintf(stderr, "[WARN] System commit limit reached for %llu MB pool; falling back to 5056 MB PS4 retail pool\n",
+                    (unsigned long long)(size / (1024 * 1024)));
+            fflush(stderr);
+            size = fallback_size;
+            section = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+                                         (DWORD)(size >> 32), (DWORD)size, NULL);
+            if (section) {
+                runtime_memory_set_pool_size(UINT64_C(5056) * 1024 * 1024);
+            }
+        }
+    }
     if (!section) { report("creating the memory pool section", 0, size); return -1; }
     section_backing = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size);
     if (!section_backing) { report("mapping the memory pool", 0, size); return -1; }

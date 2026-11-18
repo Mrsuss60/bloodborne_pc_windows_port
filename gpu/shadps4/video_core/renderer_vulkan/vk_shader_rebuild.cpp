@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -41,6 +42,8 @@
 #include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "common/serdes.h"
+#include "core/signals.h"
+#include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_shader_capture.h"
@@ -55,8 +58,91 @@ namespace BbShaderRebuild {
 
 namespace {
 constexpr u32 CacheMagic = 0x42425043u;
-thread_local jmp_buf g_recipe_jmp;
+constexpr const char* ImportFailedHeader = "# bbport-import-failed v2";
 thread_local bool g_recipe_jmp_active = false;
+thread_local std::unique_ptr<Shader::Pools> g_translate_pools;
+
+#if defined(_WIN32) && defined(__x86_64__)
+struct RecipeRecoverBuf {
+    u64 rbx, rbp, rdi, rsi, r12, r13, r14, r15, rsp, rip;
+    u8 xmm[10 * 16];
+    u32 mxcsr;
+    u16 fcw;
+    u16 pad;
+};
+thread_local RecipeRecoverBuf g_recipe_jmp{};
+
+extern "C" int bb_recipe_setjmp(RecipeRecoverBuf* buf) __attribute__((returns_twice));
+extern "C" void bb_recipe_longjmp(RecipeRecoverBuf* buf) __attribute__((noreturn));
+__asm__(".text\n"
+        ".globl bb_recipe_setjmp\n"
+        ".def bb_recipe_setjmp; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "bb_recipe_setjmp:\n"
+        "  movq %rbx, 0(%rcx)\n  movq %rbp, 8(%rcx)\n  movq %rdi, 16(%rcx)\n  movq %rsi, 24(%rcx)\n"
+        "  movq %r12, 32(%rcx)\n  movq %r13, 40(%rcx)\n  movq %r14, 48(%rcx)\n  movq %r15, 56(%rcx)\n"
+        "  leaq 8(%rsp), %rdx\n  movq %rdx, 64(%rcx)\n  movq (%rsp), %rdx\n  movq %rdx, 72(%rcx)\n"
+        "  movups %xmm6, 80(%rcx)\n  movups %xmm7, 96(%rcx)\n  movups %xmm8, 112(%rcx)\n"
+        "  movups %xmm9, 128(%rcx)\n  movups %xmm10, 144(%rcx)\n  movups %xmm11, 160(%rcx)\n"
+        "  movups %xmm12, 176(%rcx)\n  movups %xmm13, 192(%rcx)\n  movups %xmm14, 208(%rcx)\n"
+        "  movups %xmm15, 224(%rcx)\n  stmxcsr 240(%rcx)\n  fnstcw 244(%rcx)\n"
+        "  xorl %eax, %eax\n  ret\n"
+        ".globl bb_recipe_longjmp\n"
+        ".def bb_recipe_longjmp; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "bb_recipe_longjmp:\n"
+        "  movq 0(%rcx), %rbx\n  movq 8(%rcx), %rbp\n  movq 16(%rcx), %rdi\n  movq 24(%rcx), %rsi\n"
+        "  movq 32(%rcx), %r12\n  movq 40(%rcx), %r13\n  movq 48(%rcx), %r14\n  movq 56(%rcx), %r15\n"
+        "  movups 80(%rcx), %xmm6\n  movups 96(%rcx), %xmm7\n  movups 112(%rcx), %xmm8\n"
+        "  movups 128(%rcx), %xmm9\n  movups 144(%rcx), %xmm10\n  movups 160(%rcx), %xmm11\n"
+        "  movups 176(%rcx), %xmm12\n  movups 192(%rcx), %xmm13\n  movups 208(%rcx), %xmm14\n"
+        "  movups 224(%rcx), %xmm15\n  ldmxcsr 240(%rcx)\n  fldcw 244(%rcx)\n"
+        "  movq 64(%rcx), %rsp\n  movl $1, %eax\n  jmpq *72(%rcx)\n");
+
+#define BB_RECIPE_SETJMP() bb_recipe_setjmp(&g_recipe_jmp)
+
+static void RecipeSignalHandler(int) {
+    if (g_recipe_jmp_active) {
+        g_recipe_jmp_active = false;
+        bb_recipe_longjmp(&g_recipe_jmp);
+    }
+}
+
+static LONG WINAPI RecipeVectoredHandler(PEXCEPTION_POINTERS ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) {
+        void* fault_addr = ep->ExceptionRecord->NumberParameters >= 2
+                               ? reinterpret_cast<void*>(ep->ExceptionRecord->ExceptionInformation[1])
+                               : nullptr;
+        if (Core::Signals::Instance()->DispatchAccessViolation(ep, fault_addr)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (g_recipe_jmp_active) {
+            g_recipe_jmp_active = false;
+            // Restore the recovery frame directly into ContextRecord instead of calling CRT
+            // longjmp (RtlUnwindEx crashes inside Windows VEH / un-unwound JIT frames).
+            auto* ctx = ep->ContextRecord;
+            ctx->Rbx = g_recipe_jmp.rbx;
+            ctx->Rbp = g_recipe_jmp.rbp;
+            ctx->Rdi = g_recipe_jmp.rdi;
+            ctx->Rsi = g_recipe_jmp.rsi;
+            ctx->R12 = g_recipe_jmp.r12;
+            ctx->R13 = g_recipe_jmp.r13;
+            ctx->R14 = g_recipe_jmp.r14;
+            ctx->R15 = g_recipe_jmp.r15;
+            ctx->Rsp = g_recipe_jmp.rsp;
+            ctx->Rip = g_recipe_jmp.rip;
+            ctx->Rax = 1;
+            std::memcpy(&ctx->Xmm6, g_recipe_jmp.xmm, sizeof(g_recipe_jmp.xmm));
+            ctx->MxCsr = g_recipe_jmp.mxcsr;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#else
+thread_local jmp_buf g_recipe_jmp;
+#define BB_RECIPE_SETJMP() setjmp(g_recipe_jmp)
 static void RecipeSignalHandler(int) {
     if (g_recipe_jmp_active) {
         g_recipe_jmp_active = false;
@@ -74,6 +160,51 @@ static LONG WINAPI RecipeVectoredHandler(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
+#endif
+
+void AppendImportFailed(const fs::path& path, u64 hash, bool with_header) {
+    std::error_code ec;
+    const bool need_header = with_header && (!fs::exists(path, ec) || fs::file_size(path, ec) == 0);
+    std::ofstream out{path, std::ios::app};
+    if (!out) {
+        return;
+    }
+    if (need_header) {
+        out << ImportFailedHeader << '\n';
+    }
+    out << HexName(hash) << '\n' << std::flush;
+}
+
+bool LoadImportFailed(const fs::path& path, std::unordered_set<u64>& out_failed,
+                      bool require_header) {
+    std::ifstream list{path};
+    if (!list.is_open()) {
+        return true;
+    }
+    std::string line;
+    if (!std::getline(list, line)) {
+        return true;
+    }
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    if (require_header) {
+        if (line != ImportFailedHeader) {
+            return false; // legacy pre-fix blacklist; caller should clear and retry
+        }
+    } else if (!line.empty() && line[0] != '#') {
+        out_failed.insert(std::strtoull(line.c_str(), nullptr, 16));
+    }
+    while (std::getline(list, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (!line.empty() && line[0] != '#') {
+            out_failed.insert(std::strtoull(line.c_str(), nullptr, 16));
+        }
+    }
+    return true;
+}
 } // namespace
 
 std::vector<u8> ReadFile(const fs::path& path) {
@@ -126,33 +257,102 @@ struct Translated {
     std::vector<u8> info;
 };
 
-std::optional<Translated> Translate(BbShaderCapture::Input& in, const Shader::Profile& profile) {
+enum class RecipeFailReason {
+    None,
+    MissingCode,
+    ReadInput,
+    MissingRef,
+    MapMemory,
+    Translate,
+    RewriteMeta,
+    WriteFile,
+    Fault,
+};
+
+struct RecipeFailStats {
+    u32 missing_code = 0;
+    u32 read_input = 0;
+    u32 missing_ref = 0;
+    u32 map_memory = 0;
+    u32 translate = 0;
+    u32 rewrite_meta = 0;
+    u32 write_file = 0;
+    u32 fault = 0;
+    void Add(RecipeFailReason r) {
+        switch (r) {
+        case RecipeFailReason::MissingCode: ++missing_code; break;
+        case RecipeFailReason::ReadInput: ++read_input; break;
+        case RecipeFailReason::MissingRef: ++missing_ref; break;
+        case RecipeFailReason::MapMemory: ++map_memory; break;
+        case RecipeFailReason::Translate: ++translate; break;
+        case RecipeFailReason::RewriteMeta: ++rewrite_meta; break;
+        case RecipeFailReason::WriteFile: ++write_file; break;
+        case RecipeFailReason::Fault: ++fault; break;
+        case RecipeFailReason::None: break;
+        }
+    }
+    u32 Total() const {
+        return missing_code + read_input + missing_ref + map_memory + translate + rewrite_meta +
+               write_file + fault;
+    }
+};
+
+struct ReplayRegionView {
+    VAddr address;
+    const u8* data;
+    size_t size;
+};
+
+thread_local const std::vector<ReplayRegionView>* g_replay_regions = nullptr;
+
+const void* TranslateGuestReplayAddr(VAddr address, size_t size) {
+    if (!g_replay_regions) {
+        return nullptr;
+    }
+    for (const auto& r : *g_replay_regions) {
+        if (address >= r.address && address - r.address <= r.size &&
+            size <= r.size - (address - r.address)) {
+            return r.data + (address - r.address);
+        }
+    }
+    return nullptr;
+}
+
+std::optional<Translated> Translate(BbShaderCapture::Input& in, const Shader::Profile& profile,
+                                    RecipeFailReason* out_reason = nullptr) {
+    (void)out_reason;
     Shader::MotionVectors::params_address = in.params_address;
     Shader::MotionVectors::positions_address = in.positions_address;
-    auto regions = in.regions;
-    regions.push_back({in.pgm_base, std::vector<u8>(reinterpret_cast<const u8*>(in.code.data()),
-                                                    reinterpret_cast<const u8*>(in.code.data()) +
-                                                        in.code.size() * sizeof(u32))});
-    GuestMemory memory;
-    if (!memory.Map(regions)) {
-        return std::nullopt;
+    std::vector<ReplayRegionView> views;
+    views.reserve(in.regions.size() + 1);
+    for (const auto& region : in.regions) {
+        views.push_back({region.address, region.bytes.data(), region.bytes.size()});
     }
+    views.push_back({in.pgm_base, reinterpret_cast<const u8*>(in.code.data()),
+                     in.code.size() * sizeof(u32)});
     auto runtime_info = in.runtime_info;
     if (in.hw_stage == Shader::HwStage::Geometry) {
         runtime_info.hw.gs.vs_copy = in.vs_copy;
     }
-    const std::span<const u32> guest_code{reinterpret_cast<const u32*>(in.pgm_base),
-                                          in.code.size()};
+    const std::span<const u32> guest_code{in.code.data(), in.code.size()};
     Shader::Info info{in.hw_stage, in.sw_stage,
                       Shader::ShaderParams{std::span<const u32, 16>{in.user_data}, guest_code,
                                            in.pgm_hash}};
+    info.pgm_base = in.pgm_base;
+    g_replay_regions = &views;
+    Shader::guest_mem_translate = TranslateGuestReplayAddr;
     Shader::flat_buf_replay = &in.flat;
     SCOPE_EXIT {
         Shader::flat_buf_replay = nullptr;
+        Shader::guest_mem_translate = nullptr;
+        g_replay_regions = nullptr;
     };
-    thread_local Shader::Pools pools;
+    if (!g_translate_pools) {
+        g_translate_pools = std::make_unique<Shader::Pools>();
+    }
     auto bindings = in.bindings;
-    const auto program = Shader::TranslateProgram(guest_code, pools, info, runtime_info, profile);
+    const auto program =
+        Shader::TranslateProgram(guest_code, *g_translate_pools, info, runtime_info, profile);
     Translated out;
     out.spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings);
     Serialization::Archive archive;
@@ -161,29 +361,74 @@ std::optional<Translated> Translate(BbShaderCapture::Input& in, const Shader::Pr
     return out;
 }
 
-std::vector<u8> RewriteMeta(std::vector<u8>&& meta, const std::vector<u8>& info) {
-    Serialization::Archive ar{std::move(meta)};
-    Serialization::Reader reader{ar};
-    u32 meta_version{}, binary_version{};
+std::vector<u8> RewriteMeta(std::vector<u8>&& meta, const std::vector<u8>& info,
+                            std::optional<Shader::HwStage> expected_hw = std::nullopt,
+                            std::optional<Shader::SwStage> expected_sw = std::nullopt) {
+    /* bbport: on-disk metas written by current builds store (meta_version, binary_version,
+     * perm_hash, perm_idx, StageSpecialization, Info). Earlier pre-ce83b80 metas inside mixed
+     * shader_recipes.bin packs also included two u64 motion-buffer addresses (16 bytes) right
+     * after perm_idx under the same ShaderMetaVersion=8. Try the current layout first and fall
+     * back to skipping the 16-byte legacy header, validating bitset length (128) and stage enums
+     * so a shifted meta can never be silently accepted. Output is always normalized to current. */
+    auto try_parse = [&](bool skip_legacy_motion, u64& perm_hash, u64& perm_idx,
+                         Shader::StageSpecialization& spec) -> bool {
+        try {
+            Serialization::Archive ar{std::vector<u8>{meta}};
+            Serialization::Reader reader{ar};
+            u32 meta_version{}, binary_version{};
+            reader.Read(meta_version);
+            reader.Read(binary_version);
+            if (meta_version != Vulkan::PipelineStore::ShaderMetaVersion) {
+                return false;
+            }
+            (void)binary_version; // the pack may predate the current compiler; it is re-emitted below
+            reader.Read(perm_hash);
+            reader.Read(perm_idx);
+            if (skip_legacy_motion) {
+                u64 motion_params{}, motion_positions{};
+                reader.Read(motion_params);
+                reader.Read(motion_positions);
+            }
+            {
+                Serialization::Archive probe{std::vector<u8>{meta}};
+                Serialization::Reader pr{probe};
+                probe.Advance(sizeof(u32) * 2 + sizeof(u64) * 2 +
+                              (skip_legacy_motion ? sizeof(u64) * 2 : 0) +
+                              sizeof(Shader::Backend::Bindings) + sizeof(Shader::RuntimeInfo));
+                size_t bits_len{};
+                pr.Read(bits_len);
+                if (bits_len != Shader::StageSpecialization::MaxStageResources) {
+                    return false;
+                }
+            }
+            Shader::Info old_info{};
+            spec = {};
+            spec.info = &old_info;
+            spec.Deserialize(ar);
+            if (static_cast<u32>(spec.runtime_info.hw_stage) >
+                    static_cast<u32>(Shader::HwStage::Compute) ||
+                static_cast<u32>(spec.runtime_info.sw_stage) >=
+                    static_cast<u32>(Shader::SwStage::NumLogicalStages)) {
+                return false;
+            }
+            if (expected_hw && spec.runtime_info.hw_stage != *expected_hw) {
+                return false;
+            }
+            if (expected_sw && spec.runtime_info.sw_stage != *expected_sw) {
+                return false;
+            }
+            return !ar.IsEoS();
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+
     u64 perm_hash{}, perm_idx{};
-    reader.Read(meta_version);
-    reader.Read(binary_version);
-    if (meta_version != Vulkan::PipelineStore::ShaderMetaVersion) {
+    Shader::StageSpecialization spec{};
+    if (!try_parse(false, perm_hash, perm_idx, spec) &&
+        !try_parse(true, perm_hash, perm_idx, spec)) {
         return {};
     }
-    /* bbport: the on-disk meta layout is exactly the one RegisterShaderMeta() writes and
-     * LoadShaderMeta() reads: meta version, binary version, perm hash, perm index, then
-     * StageSpecialization and Info. This function used to read and write two extra u64s (the
-     * object-motion buffer addresses) here, which shifted the specialization by 16 bytes and made
-     * every imported recipe unreadable. The motion addresses are passed to the importer on the
-     * command line and are not part of the saved meta. */
-    (void)binary_version; // the pack may predate the current compiler; it is re-emitted below
-    reader.Read(perm_hash);
-    reader.Read(perm_idx);
-    Shader::Info old_info{};
-    Shader::StageSpecialization spec{};
-    spec.info = &old_info;
-    spec.Deserialize(ar);
     Serialization::Archive out;
     Serialization::Writer writer{out};
     writer.Write(Vulkan::PipelineStore::ShaderMetaVersion);
@@ -191,9 +436,10 @@ std::vector<u8> RewriteMeta(std::vector<u8>&& meta, const std::vector<u8>& info)
     writer.Write(perm_hash);
     writer.Write(perm_idx);
     spec.Serialize(out);
-    auto bytes = out.TakeOff();
-    bytes.insert(bytes.end(), info.begin(), info.end());
-    return bytes;
+    if (!info.empty()) {
+        writer.Write(info.data(), info.size());
+    }
+    return out.TakeOff();
 }
 
 bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& translated,
@@ -224,11 +470,10 @@ bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& 
         programs[hash].emplace(perm, std::move(record));
     }
     for (auto& [pgm_hash, perms] : programs) {
-        std::vector<u8> program_info;
         for (auto& [perm_idx, record] : perms) {
             std::optional<Translated> result;
 #ifdef _WIN32
-            if (setjmp(g_recipe_jmp) == 0) {
+            if (BB_RECIPE_SETJMP() == 0) {
                 g_recipe_jmp_active = true;
                 try {
                     result = Translate(record.input, profile);
@@ -240,6 +485,9 @@ bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& 
                 g_recipe_jmp_active = false;
                 GuestMemory::ReleaseActive();
                 Shader::flat_buf_replay = nullptr;
+                Shader::guest_mem_translate = nullptr;
+                g_replay_regions = nullptr;
+                g_translate_pools.reset();
                 result.reset();
             }
 #else
@@ -256,9 +504,6 @@ bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& 
                 ++failed;
                 continue;
             }
-            if (program_info.empty()) {
-                program_info = result->info;
-            }
             const auto* words = reinterpret_cast<const u8*>(result->spv.data());
             if (!WriteFile(dir / (name + ".spv"), {words, result->spv.size() * sizeof(u32)})) {
                 return false;
@@ -267,7 +512,8 @@ bool RebuildDirectory(const fs::path& dir, const Shader::Profile& profile, u32& 
             if (fs::exists(meta_path, ec)) {
                 std::vector<u8> meta;
                 try {
-                    meta = RewriteMeta(ReadFile(meta_path), program_info);
+                    meta = RewriteMeta(ReadFile(meta_path), result->info, record.input.hw_stage,
+                                       record.input.sw_stage);
                 } catch (const std::exception&) {
                     meta.clear();
                 }
@@ -331,7 +577,7 @@ struct Bytes {
     }
 };
 
-std::vector<u64> KeyStages(std::span<const u8> bytes) {
+std::vector<u64> KeyStages(std::span<const u8> bytes, bool skip_motion_vectors = false) {
     Serialization::Archive ar{std::vector<u8>(bytes.begin(), bytes.end())};
     Serialization::Reader reader{ar};
     u32 version{}, is_compute{};
@@ -347,6 +593,9 @@ std::vector<u64> KeyStages(std::span<const u8> bytes) {
     }
     Vulkan::GraphicsPipelineKey key{};
     key.Deserialize(ar);
+    if (skip_motion_vectors && key.motion_vectors) {
+        return {};
+    }
     std::vector<u64> stages;
     for (const u64 hash : key.stage_hashes) {
         if (hash) {
@@ -457,22 +706,41 @@ size_t WritePack(const std::vector<RecipeProgram>& programs, const std::vector<R
 
 namespace {
 std::unordered_set<u64> CachedPrograms(const fs::path& dir) {
-    std::unordered_set<u64> hashes;
+    std::unordered_set<u64> complete;
+    std::unordered_set<u64> incomplete;
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator{dir, ec}) {
-        const auto ext = entry.path().extension();
-        if (ext == ".spv") {
-            hashes.insert(std::strtoull(entry.path().stem().string().c_str(), nullptr, 16));
+        if (entry.path().extension() != ".spv") {
+            continue;
+        }
+        const std::string stem = entry.path().stem().string();
+        const size_t sep = stem.rfind('_');
+        if (sep == std::string::npos) {
+            continue;
+        }
+        const u64 pgm_hash = std::strtoull(stem.substr(0, sep).c_str(), nullptr, 16);
+        const u64 perm_idx = std::strtoull(stem.substr(sep + 1).c_str(), nullptr, 10);
+        const fs::path meta = dir / (HexName(HashCombine(pgm_hash, perm_idx)) + ".meta");
+        if (fs::exists(meta, ec)) {
+            complete.insert(pgm_hash);
+        } else {
+            incomplete.insert(pgm_hash);
         }
     }
-    return hashes;
+    for (const u64 hash : incomplete) {
+        complete.erase(hash);
+    }
+    return complete;
 }
 
 bool TranslateRecipe(const RecipeProgram& program, const GameShaders& game,
                       const Shader::Profile& profile, const std::pair<u64, u64>& motion,
-                      const fs::path& out) {
+                      const fs::path& out, RecipeFailReason* out_reason = nullptr) {
     std::vector<fs::path> written;
-    const auto fail = [&] {
+    const auto fail = [&](RecipeFailReason reason) {
+        if (out_reason) {
+            *out_reason = reason;
+        }
         std::error_code ec;
         for (const auto& path : written) {
             fs::remove(path, ec);
@@ -481,21 +749,20 @@ bool TranslateRecipe(const RecipeProgram& program, const GameShaders& game,
     };
     const auto* code = game.Code(program.hash);
     if (!code) {
-        return false;
+        return fail(RecipeFailReason::MissingCode);
     }
-    std::vector<u8> program_info;
     for (size_t perm_idx = 0; perm_idx < program.perms.size(); ++perm_idx) {
         const auto& perm = program.perms[perm_idx];
         BbShaderCapture::Input in;
         if (!BbShaderCapture::ReadInput(perm.input, in, true) || in.pgm_hash != program.hash ||
             in.perm_idx != perm_idx) {
-            return fail();
+            return fail(RecipeFailReason::ReadInput);
         }
         in.code = *code;
         for (const auto& ref : perm.refs) {
             const auto* ref_code = game.Code(ref.hash);
             if (!ref_code || ref.size > ref_code->size() * sizeof(u32)) {
-                return fail();
+                return fail(RecipeFailReason::MissingRef);
             }
             if (ref.address == ~u64{0}) {
                 in.vs_copy = *ref_code;
@@ -507,26 +774,24 @@ bool TranslateRecipe(const RecipeProgram& program, const GameShaders& game,
         in.params_address = motion.first;
         in.positions_address = motion.second;
         std::optional<Translated> result;
+        RecipeFailReason tr_reason = RecipeFailReason::Translate;
         try {
-            result = Translate(in, profile);
+            result = Translate(in, profile, &tr_reason);
         } catch (const std::exception&) {
             result.reset();
         }
         if (!result) {
-            return fail();
-        }
-        if (program_info.empty()) {
-            program_info = result->info;
+            return fail(tr_reason);
         }
         const std::string name = HexName(program.hash) + "_" + std::to_string(perm_idx);
         std::vector<u8> meta;
         try {
-            meta = RewriteMeta(std::vector<u8>(perm.meta), program_info);
+            meta = RewriteMeta(std::vector<u8>(perm.meta), result->info, in.hw_stage, in.sw_stage);
         } catch (const std::exception&) {
             meta.clear();
         }
         if (meta.empty()) {
-            return fail();
+            return fail(RecipeFailReason::RewriteMeta);
         }
         const auto* words = reinterpret_cast<const u8*>(result->spv.data());
         const fs::path spv_path = out / (name + ".spv");
@@ -536,7 +801,7 @@ bool TranslateRecipe(const RecipeProgram& program, const GameShaders& game,
         written.insert(written.end(), {spv_path, in_path, meta_path});
         if (!WriteFile(spv_path, {words, result->spv.size() * sizeof(u32)}) ||
             !WriteFile(in_path, BbShaderCapture::WriteInput(in)) || !WriteFile(meta_path, meta)) {
-            return fail();
+            return fail(RecipeFailReason::WriteFile);
         }
     }
     return true;
@@ -602,6 +867,9 @@ int RebuildCaches() {
             continue;
         }
         const fs::path dir = entry.path();
+        if (!Storage::IsCacheEpochCurrent(dir, Vulkan::PipelineStore::CacheEpoch)) {
+            continue;
+        }
         auto header = ReadFile(dir / "profile.bin");
         if (header.size() != HeaderWords * 4 + sizeof(Shader::Profile)) {
             continue;
@@ -810,6 +1078,68 @@ bool RecipeCodeAvailable(const RecipeProgram& program, const GameShaders& game) 
     return true;
 }
 
+/// True when every permutation of `program` has its complete .spv, .in, and .meta files in `staging`.
+bool ProgramStagedComplete(const RecipeProgram& program, const fs::path& staging) {
+    if (program.perms.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    const std::string hex = HexName(program.hash);
+    for (size_t perm_idx = 0; perm_idx < program.perms.size(); ++perm_idx) {
+        const std::string stem = hex + "_" + std::to_string(perm_idx);
+        const std::string meta = HexName(HashCombine(program.hash, u64(perm_idx))) + ".meta";
+        if (!fs::exists(staging / (stem + ".spv"), ec) ||
+            !fs::exists(staging / (stem + ".in"), ec) || !fs::exists(staging / meta, ec)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Validates an existing staging directory against `profile_header`. Preserves already-translated
+/// shaders across interrupted launches, removes only partial `.tmp` write artifacts, and wipes the
+/// directory only if the GPU/driver/build signature changed or staged metas have mismatched versions.
+void PrepareStagingDir(const fs::path& staging, const std::vector<u8>& profile_header) {
+    std::error_code ec;
+    const fs::path sig_path = staging / "profile.sig";
+    bool keep = false;
+    if (fs::exists(staging, ec)) {
+        if (fs::exists(sig_path, ec)) {
+            keep = (ReadFile(sig_path) == profile_header);
+        } else {
+            keep = true;
+            for (const auto& entry : fs::directory_iterator{staging, ec}) {
+                if (entry.is_regular_file(ec) && entry.path().extension() == ".meta") {
+                    const auto bytes = ReadFile(entry.path());
+                    if (bytes.size() < 8) {
+                        keep = false;
+                        break;
+                    }
+                    u32 meta_ver = 0, bin_ver = 0;
+                    std::memcpy(&meta_ver, bytes.data(), sizeof(meta_ver));
+                    std::memcpy(&bin_ver, bytes.data() + 4, sizeof(bin_ver));
+                    if (meta_ver != Vulkan::PipelineStore::ShaderMetaVersion ||
+                        bin_ver != Vulkan::PipelineStore::ShaderBinaryVersion) {
+                        keep = false;
+                    }
+                    break;
+                }
+            }
+        }
+        if (!keep) {
+            fs::remove_all(staging, ec);
+        } else {
+            for (const auto& entry : fs::directory_iterator{staging, ec}) {
+                if (entry.is_regular_file(ec) && entry.path().extension() == ".tmp") {
+                    fs::remove(entry.path(), ec);
+                }
+            }
+        }
+    }
+    fs::create_directories(staging, ec);
+    WriteFile(sig_path, profile_header);
+}
+
 int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
                   u64 motion_params, u64 motion_positions) {
     const auto start = std::chrono::steady_clock::now();
@@ -853,26 +1183,58 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         is_shard ? (dir / ("import.current." + std::to_string(shard_idx))) : (dir / "import.current");
     const fs::path fail_path =
         is_shard ? (dir / ("import.failed." + std::to_string(shard_idx))) : (dir / "import.failed");
-    if (const auto current = ReadFile(cur_path); current.size() == sizeof(u64)) {
-        u64 hash = 0;
-        std::memcpy(&hash, current.data(), sizeof(hash));
-        std::ofstream{fail_path, std::ios::app} << HexName(hash) << '\n';
-        fs::remove(cur_path, ec);
+    if (is_shard) {
+        if (const auto current = ReadFile(cur_path); current.size() == sizeof(u64)) {
+            u64 hash = 0;
+            std::memcpy(&hash, current.data(), sizeof(hash));
+            AppendImportFailed(fail_path, hash, false);
+            fs::remove(cur_path, ec);
+        }
     }
 #endif
     const auto cached = CachedPrograms(dir);
     std::unordered_set<u64> failed;
-    {
-        std::ifstream list{dir / "import.failed"};
-        for (std::string line; std::getline(list, line);) {
-            failed.insert(std::strtoull(line.c_str(), nullptr, 16));
+    const fs::path main_fail_path = dir / "import.failed";
+    if (!LoadImportFailed(main_fail_path, failed, true)) {
+        failed.clear();
+#ifdef _WIN32
+        if (!is_shard) {
+            fs::remove(main_fail_path, ec);
+            std::printf("Shader recipes: cleared legacy import.failed blacklist; retrying "
+                        "previously skipped programs\n");
+            std::fflush(stdout);
         }
+#else
+        fs::remove(main_fail_path, ec);
+        std::printf("Shader recipes: cleared legacy import.failed blacklist; retrying "
+                    "previously skipped programs\n");
+        std::fflush(stdout);
+#endif
     }
 #ifdef _WIN32
     if (is_shard) {
-        std::ifstream slist{fail_path};
-        for (std::string line; std::getline(slist, line);) {
-            failed.insert(std::strtoull(line.c_str(), nullptr, 16));
+        LoadImportFailed(fail_path, failed, false);
+    } else {
+        // Consolidate any per-shard failure logs left behind by interrupted prior runs so the
+        // same failing shaders are never retried on subsequent launches.
+        for (const auto& entry : fs::directory_iterator{dir, ec}) {
+            if (!entry.is_regular_file(ec)) {
+                continue;
+            }
+            const std::string fname = entry.path().filename().string();
+            if (fname.starts_with("import.failed.")) {
+                std::unordered_set<u64> shard_failed;
+                LoadImportFailed(entry.path(), shard_failed, false);
+                for (const u64 h : shard_failed) {
+                    if (failed.insert(h).second) {
+                        AppendImportFailed(main_fail_path, h, true);
+                    }
+                }
+                fs::remove(entry.path(), ec);
+            } else if (fname == "import.current" || fname.starts_with("import.current.")) {
+                // Remove stale in-progress markers from an interrupted exit without blacklisting.
+                fs::remove(entry.path(), ec);
+            }
         }
     }
 #endif
@@ -884,13 +1246,33 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         }
         todo.push_back(&program);
     }
+    const fs::path staging = dir / "import.tmp";
     if (todo.empty()) {
+#ifdef _WIN32
+        if (!is_shard) {
+            fs::remove_all(staging, ec);
+            std::printf("Shader recipes: all %zu pack programs up to date (%zu cached, %zu failed)\n",
+                        programs.size(), cached.size(), failed.size());
+            std::fflush(stdout);
+        }
+#else
+        fs::remove_all(staging, ec);
+        std::printf("Shader recipes: all %zu pack programs up to date (%zu cached, %zu failed)\n",
+                    programs.size(), cached.size(), failed.size());
+        std::fflush(stdout);
+#endif
         return 0;
     }
-    const fs::path staging = dir / "import.tmp";
     const std::pair<u64, u64> motion{motion_params, motion_positions};
 #ifdef _WIN32
-    SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    const u32 host_threads = std::thread::hardware_concurrency();
+    const char* fg_env = bb_env("BB_IMPORT_FOREGROUND");
+    const bool foreground = fg_env && fg_env[0] == '1';
+    const DWORD proc_prio =
+        foreground ? NORMAL_PRIORITY_CLASS
+                   : (host_threads <= 4 ? IDLE_PRIORITY_CLASS : BELOW_NORMAL_PRIORITY_CLASS);
+    SetPriorityClass(GetCurrentProcess(), proc_prio);
+    RecipeFailStats fail_stats{};
     auto run_win_recipes = [&](const std::vector<const RecipeProgram*>& list,
                                const fs::path& current_file, const fs::path& failed_file) {
         std::unordered_set<u64> local_wanted;
@@ -910,23 +1292,31 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         PVOID veh = AddVectoredExceptionHandler(1, RecipeVectoredHandler);
         for (const auto* program : list) {
             const u64 hash = program->hash;
-            if (fs::exists(staging / (HexName(hash) + "_0.spv"), ec)) {
+            if (ProgramStagedComplete(*program, staging)) {
                 continue;
             }
             WriteFile(current_file, {reinterpret_cast<const u8*>(&hash), sizeof(hash)});
-            if (setjmp(g_recipe_jmp) == 0) {
+            if (BB_RECIPE_SETJMP() == 0) {
                 g_recipe_jmp_active = true;
-                if (!TranslateRecipe(*program, game, profile, motion, staging) &&
-                    !RecipeCodeAvailable(*program, game)) {
-                    std::ofstream{failed_file, std::ios::app} << HexName(hash) << '\n';
+                RecipeFailReason reason = RecipeFailReason::None;
+                if (!TranslateRecipe(*program, game, profile, motion, staging, &reason)) {
+                    fail_stats.Add(reason);
+                    if (failed.insert(hash).second) {
+                        AppendImportFailed(failed_file, hash, !is_shard);
+                    }
                 }
                 g_recipe_jmp_active = false;
             } else {
                 g_recipe_jmp_active = false;
                 GuestMemory::ReleaseActive();
                 Shader::flat_buf_replay = nullptr;
-                std::ofstream{failed_file, std::ios::app} << HexName(hash) << '\n';
-                failed.insert(hash);
+                Shader::guest_mem_translate = nullptr;
+                g_replay_regions = nullptr;
+                g_translate_pools.reset();
+                fail_stats.Add(RecipeFailReason::Fault);
+                if (failed.insert(hash).second) {
+                    AppendImportFailed(failed_file, hash, !is_shard);
+                }
             }
         }
         std::signal(SIGABRT, old_abrt);
@@ -942,7 +1332,9 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         std::vector<const RecipeProgram*> shard_todo;
         shard_todo.reserve((todo.size() + shard_count - 1) / shard_count);
         for (size_t i = shard_idx; i < todo.size(); i += shard_count) {
-            shard_todo.push_back(todo[i]);
+            if (!ProgramStagedComplete(*todo[i], staging)) {
+                shard_todo.push_back(todo[i]);
+            }
         }
         if (!shard_todo.empty()) {
             run_win_recipes(shard_todo, cur_path, fail_path);
@@ -950,12 +1342,29 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         return 0;
     }
 
-    std::printf("Shader recipes: %zu programs in pack, %zu already cached, %zu to translate\n",
-                programs.size(), cached.size(), todo.size());
-    fs::remove_all(staging, ec);
-    fs::create_directories(staging, ec);
-    const u32 shards =
-        todo.size() >= 32 ? std::clamp(std::thread::hardware_concurrency() / 2, 2u, 4u) : 1u;
+    PrepareStagingDir(staging, header);
+    {
+        const std::string total_str = std::to_string(todo.size());
+        WriteFile(staging / "total.txt",
+                  {reinterpret_cast<const u8*>(total_str.data()), total_str.size()});
+    }
+    std::vector<const RecipeProgram*> pending_todo;
+    pending_todo.reserve(todo.size());
+    for (const auto* program : todo) {
+        if (!ProgramStagedComplete(*program, staging)) {
+            pending_todo.push_back(program);
+        }
+    }
+    const size_t already_staged = todo.size() - pending_todo.size();
+    const u32 shards = (pending_todo.size() >= 32 &&
+                        (foreground ? host_threads >= 4 : host_threads > 4))
+                           ? std::clamp(host_threads / 2, 2u, 4u)
+                           : 1u;
+    std::printf("Shader recipes: %zu programs in pack, %zu cached, %zu staged, %zu failed, %zu "
+                "left to translate (%s, %u %s)\n",
+                programs.size(), cached.size(), already_staged, failed.size(), pending_todo.size(),
+                foreground ? "boot" : "background", shards, shards == 1 ? "worker" : "shards");
+    std::fflush(stdout);
     if (shards > 1) {
         wchar_t exe[MAX_PATH];
         const bool have_exe = GetModuleFileNameW(nullptr, exe, MAX_PATH) != 0;
@@ -983,8 +1392,9 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
             std::wstring cmd = base_cmd;
             HANDLE proc = nullptr;
             if (have_exe && CreateProcessW(exe, cmd.data(), nullptr, nullptr, TRUE,
-                                           BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &startup,
-                                           &pi)) {
+                                           foreground ? NORMAL_PRIORITY_CLASS
+                                                      : BELOW_NORMAL_PRIORITY_CLASS,
+                                           nullptr, nullptr, &startup, &pi)) {
                 if (job) {
                     AssignProcessToJobObject(job, pi.hProcess);
                 }
@@ -994,10 +1404,6 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
             SetEnvironmentVariableA("BB_IMPORT_SHARD", nullptr);
             return proc;
         };
-        for (u32 s = 0; s < shards; ++s) {
-            fs::remove(dir / ("import.current." + std::to_string(s)), ec);
-            fs::remove(dir / ("import.failed." + std::to_string(s)), ec);
-        }
         std::vector<HANDLE> procs(shards, nullptr);
         std::vector<u32> restarts(shards, 0);
         for (u32 s = 0; s < shards; ++s) {
@@ -1020,28 +1426,28 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         if (job) {
             CloseHandle(job);
         }
-        std::ofstream fail_out{dir / "import.failed", std::ios::app};
         for (u32 s = 0; s < shards; ++s) {
             const fs::path sc = dir / ("import.current." + std::to_string(s));
             const fs::path sf = dir / ("import.failed." + std::to_string(s));
             if (const auto cur = ReadFile(sc); cur.size() == sizeof(u64)) {
                 u64 h = 0;
                 std::memcpy(&h, cur.data(), sizeof(h));
-                fail_out << HexName(h) << '\n';
-                failed.insert(h);
+                if (failed.insert(h).second) {
+                    AppendImportFailed(main_fail_path, h, true);
+                }
             }
-            std::ifstream sf_in{sf};
-            for (std::string line; std::getline(sf_in, line);) {
-                if (!line.empty()) {
-                    fail_out << line << '\n';
-                    failed.insert(std::strtoull(line.c_str(), nullptr, 16));
+            std::unordered_set<u64> shard_failed;
+            LoadImportFailed(sf, shard_failed, false);
+            for (const u64 h : shard_failed) {
+                if (failed.insert(h).second) {
+                    AppendImportFailed(main_fail_path, h, true);
                 }
             }
             fs::remove(sc, ec);
             fs::remove(sf, ec);
         }
-    } else {
-        run_win_recipes(todo, cur_path, fail_path);
+    } else if (!pending_todo.empty()) {
+        run_win_recipes(pending_todo, cur_path, fail_path);
     }
 #else
     std::printf("Shader recipes: %zu programs in pack, %zu already cached, %zu to translate\n",
@@ -1057,14 +1463,16 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
     if (setpriority(PRIO_PROCESS, 0, 10) != 0) {}
     GameShaders game;
     game.Load(game_dir, &wanted);
-    fs::remove_all(staging, ec);
-    fs::create_directories(staging, ec);
+    PrepareStagingDir(staging, header);
     size_t next = 0;
     for (u32 crashes = 0; next < todo.size() && crashes < 16; ++crashes) {
         std::fflush(stdout);
         const pid_t child = fork();
         if (child == 0) {
             for (size_t i = next; i < todo.size(); ++i) {
+                if (ProgramStagedComplete(*todo[i], staging)) {
+                    continue;
+                }
                 const u64 index = i;
                 WriteFile(staging / "progress", {reinterpret_cast<const u8*>(&index), sizeof(index)});
                 TranslateRecipe(*todo[i], game, profile, motion, staging);
@@ -1087,16 +1495,28 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         if (index >= todo.size()) {
             break;
         }
-        std::ofstream{dir / "import.failed", std::ios::app} << HexName(todo[index]->hash) << '\n';
+        AppendImportFailed(main_fail_path, todo[index]->hash, true);
         failed.insert(todo[index]->hash);
         next = index + 1;
     }
 #endif
     fs::remove(staging / "progress", ec);
+    fs::remove(staging / "profile.sig", ec);
+    fs::remove(staging / "total.txt", ec);
     std::unordered_set<u64> perm_hashes;
+    // Include permutations already present in the permanent cache so pipeline keys combining
+    // previously cached stages with newly imported stages are also emitted.
+    for (const auto& entry : fs::directory_iterator{dir, ec}) {
+        if (entry.is_regular_file(ec) && entry.path().extension() == ".meta") {
+            const std::string stem = entry.path().stem().string();
+            if (!stem.empty()) {
+                perm_hashes.insert(std::strtoull(stem.c_str(), nullptr, 16));
+            }
+        }
+    }
     u32 imported = 0, perms = 0;
     for (const auto* program : todo) {
-        if (fs::exists(staging / (HexName(program->hash) + "_0.spv"), ec)) {
+        if (ProgramStagedComplete(*program, staging)) {
             ++imported;
             perms += u32(program->perms.size());
             for (size_t perm_idx = 0; perm_idx < program->perms.size(); ++perm_idx) {
@@ -1105,20 +1525,24 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
         }
 #ifndef _WIN32
         else if (!failed.contains(program->hash) && !RecipeCodeAvailable(*program, game)) {
-            std::ofstream{dir / "import.failed", std::ios::app} << HexName(program->hash) << '\n';
+            AppendImportFailed(main_fail_path, program->hash, true);
         }
 #endif
     }
     u32 pipelines = 0;
     for (const auto& key : keys) {
-        const auto stages = KeyStages(key.bytes);
+        const fs::path perm_key_path = dir / (key.name + ".key");
+        if (fs::exists(perm_key_path, ec)) {
+            continue;
+        }
+        const auto stages = KeyStages(key.bytes, true);
         if (!stages.empty() && std::ranges::all_of(stages, [&](u64 stage) {
                 return perm_hashes.contains(stage);
             }) && WriteFile(staging / (key.name + ".key"), key.bytes)) {
             ++pipelines;
         }
     }
-    if (imported == 0) {
+    if (imported == 0 && pipelines == 0) {
         fs::remove_all(staging, ec);
         return 0;
     }
@@ -1128,6 +1552,17 @@ int ImportRecipes(const char* cache_dir, const char* pack, const char* game_dir,
                 imported, perms, pipelines,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
                 todo.size() - imported);
+#ifdef _WIN32
+    if (fail_stats.Total() > 0) {
+        std::printf("Shader recipes: failure breakdown: missing_code=%u read_input=%u "
+                    "missing_ref=%u map_mem=%u translate=%u rewrite_meta=%u write_file=%u "
+                    "fault=%u\n",
+                    fail_stats.missing_code, fail_stats.read_input, fail_stats.missing_ref,
+                    fail_stats.map_memory, fail_stats.translate, fail_stats.rewrite_meta,
+                    fail_stats.write_file, fail_stats.fault);
+    }
+#endif
+    std::fflush(stdout);
     return ec ? 1 : 0;
 }
 

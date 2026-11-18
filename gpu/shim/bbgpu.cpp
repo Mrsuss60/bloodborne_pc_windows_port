@@ -248,7 +248,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
             window->Hide();
         }
         std::thread([] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 #ifdef _WIN32
             TerminateProcess(GetCurrentProcess(), 0);
 #else

@@ -192,8 +192,10 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
             p->stat_last_ns=now; ++p->stat_buffers;
             if (p->stream) {
                 int queued=SDL_GetAudioStreamQueued(p->stream);
-                if (queued<p->stat_min_queued) p->stat_min_queued=queued;
-                if (queued==0) ++p->stat_starved;
+                if (queued>=0) {
+                    if (queued<p->stat_min_queued) p->stat_min_queued=queued;
+                    if (queued==0) ++p->stat_starved;
+                }
             }
             if (now-p->stat_start_ns>=5000000000u) {
                 printf("Audio stats port %d: %u buffers/5s (expected %u), max gap %.2f ms, min queued %d bytes, starved %u\n",
@@ -221,31 +223,44 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
         }
 
         if (p->stream) {
-            /* The device drains the queue in quanta (typically 10-21 ms), so the level
-               is a sawtooth: its minimum over ~32 buffers is what gets controlled. */
-#ifdef _WIN32
-            int low=4*(int)bytes; /* ~21 ms headroom for WASAPI's 10-20 ms hardware buffer */
-#else
-            int low=2*(int)bytes;
-#endif
             int queued=SDL_GetAudioStreamQueued(p->stream);
-            if (queued<(int)bytes) {
-                if (buffers_out>0) ++g_audio_underruns;
-                static const unsigned char silence[2048*8*4];
-                int fill=low-queued<(int)bytes ? low-queued : (int)bytes;
-                if (fill>0 && fill<=(int)sizeof(silence)) {
-                    SDL_PutAudioStreamData(p->stream,silence,fill);
+            if (queued<0) {
+                static int warned_disconnect = 0;
+                if (!warned_disconnect++) {
+                    fprintf(stderr, "[WARN] Audio stream invalidated or device disconnected; switching to timer cadence\n");
+                    fflush(stderr);
                 }
-                queued=low;
+                SDL_DestroyAudioStream(p->stream);
+                p->stream = NULL;
+            } else {
+                /* The device drains the queue in quanta (typically 10-21 ms), so the level
+                   is a sawtooth: its minimum over ~32 buffers is what gets controlled. */
+#ifdef _WIN32
+                int low=4*(int)bytes; /* ~21 ms headroom for WASAPI's 10-20 ms hardware buffer */
+#else
+                int low=2*(int)bytes;
+#endif
+                if (queued<(int)bytes) {
+                    if (buffers_out>0) ++g_audio_underruns;
+                    static const unsigned char silence[2048*8*4];
+                    int fill=low-queued<(int)bytes ? low-queued : (int)bytes;
+                    if (fill>0 && fill<=(int)sizeof(silence)) {
+                        SDL_PutAudioStreamData(p->stream,silence,fill);
+                    }
+                    queued=low;
+                }
+                if (!p->window_count || queued<p->window_min) p->window_min=queued;
+                if (++p->window_count==32) {
+                    p->adjust_ns=p->window_min>low+2*(int)bytes ? (int64_t)(period/32) :
+                                 p->window_min<low ? -(int64_t)(period/32) : 0;
+                    p->window_count=0;
+                }
+                p->next_deadline_ns+=(uint64_t)p->adjust_ns;
+                if (!SDL_PutAudioStreamData(p->stream,converted,(int)bytes)) {
+                    SDL_DestroyAudioStream(p->stream);
+                    p->stream = NULL;
+                }
             }
-            if (!p->window_count || queued<p->window_min) p->window_min=queued;
-            if (++p->window_count==32) {
-                p->adjust_ns=p->window_min>low+2*(int)bytes ? (int64_t)(period/32) :
-                             p->window_min<low ? -(int64_t)(period/32) : 0;
-                p->window_count=0;
-            }
-            p->next_deadline_ns+=(uint64_t)p->adjust_ns;
-            SDL_PutAudioStreamData(p->stream,converted,(int)bytes);
         }
         ++buffers_out;
     }

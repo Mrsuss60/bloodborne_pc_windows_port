@@ -42,7 +42,7 @@ public:
     /// Whether a mouse motion, button or wheel event arrived within `ms` (any capture mode).
     bool MouseActiveWithin(uint64_t ms) const;
     void CaptureMouse(bool capture);
-    bool IsMouseCaptured() const { return relative_mouse_active; }
+    bool IsMouseCaptured() const { return relative_mouse_active.load(std::memory_order_acquire); }
 
 private:
     std::atomic<s32> width, height;
@@ -50,7 +50,7 @@ private:
     std::mutex mouse_delta_mutex;
     float accumulated_mouse_dx = 0.0f;
     float accumulated_mouse_dy = 0.0f;
-    bool relative_mouse_active = false;
+    std::atomic<bool> relative_mouse_active{false};
     std::mutex text_mutex;
     bool text_requested{}, text_active{};
     int text_state{};

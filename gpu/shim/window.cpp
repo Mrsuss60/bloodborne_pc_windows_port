@@ -50,6 +50,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         is_fullscreen = true;
     }
 
+    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
@@ -397,10 +400,9 @@ void WindowSDL::UpdateClipCursor(bool clip) {
 }
 
 void WindowSDL::CaptureMouse(bool capture) {
-    if (capture == relative_mouse_active) {
+    if (capture == relative_mouse_active.load(std::memory_order_relaxed)) {
         return;
     }
-    relative_mouse_active = capture;
     SDL_SetWindowRelativeMouseMode(window, capture);
     UpdateClipCursor(capture);
     if (capture) {
@@ -413,6 +415,7 @@ void WindowSDL::CaptureMouse(bool capture) {
         SDL_ShowCursor();
         mouse_cursor_hidden = false;
     }
+    relative_mouse_active.store(capture, std::memory_order_release);
 }
 
 void WindowSDL::ConsumeMouseDelta(float* dx, float* dy) {

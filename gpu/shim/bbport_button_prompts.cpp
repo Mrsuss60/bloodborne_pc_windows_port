@@ -653,7 +653,9 @@ bool Update(u32 generation, u32 table_generation_seen, Set& out) {
     }
     static const char* const devices[] = {"the game's (PlayStation pad)", "the gamepad's", "the keyboard's and mouse's"};
     const int device = runtime_pad_prompt_device();
-    std::printf("Button prompts: %s\n", device >= 0 && device <= 2 ? devices[device] : "?");
+    if (device >= 0 && device <= 2) {
+        std::printf("Button prompts: %s\n", devices[device]);
+    }
     return true;
 }
 

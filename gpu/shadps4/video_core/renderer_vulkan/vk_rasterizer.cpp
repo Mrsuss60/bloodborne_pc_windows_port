@@ -59,13 +59,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
     // Object motion first: it fixes the buffer addresses the motion shader variants embed.
     object_motion = std::make_unique<ObjectMotion>(instance, scheduler);
-    pipeline_cache.StartShaderImport();
     camera_motion = std::make_unique<CameraMotion>(instance, scheduler, texture_cache, runtime);
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
     // bbport: the game's key guide icons drawn for the device in use (bbport_button_prompts.h).
     prompts = std::make_unique<ButtonPrompts>(instance, scheduler, buffer_cache);
+    // bbport: initialize the indirect dispatch guard eagerly at boot instead of compiling its
+    // compute pipeline lazily on the first indirect particle dispatch during gameplay.
+    if (!EmulatorSettings.IsNullGPU() && IndirectGuard::Enabled()) {
+        indirect_guard = std::make_unique<IndirectGuard>(instance, scheduler);
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }

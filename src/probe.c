@@ -13,6 +13,8 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
 #include <tlhelp32.h>
 #include <mmsystem.h>
 #include "win32_compat.h"
@@ -2246,11 +2248,8 @@ static int emulate_bmi1(CONTEXT *ctx) {
 
 static void log_redzone_guard_hit(uintptr_t off, uintptr_t rip, uintptr_t rsp, GuestThread *cur) {
     static volatile LONG s_hit_count = 0;
-    static ULONGLONG s_last_tick = 0;
     LONG hit = InterlockedIncrement(&s_hit_count);
-    ULONGLONG now = GetTickCount64();
-    if (hit <= 10 || (now - s_last_tick) >= 1000) {
-        s_last_tick = now;
+    if (hit <= 5) {
         char buf[2048];
         int pos = snprintf(buf, sizeof(buf),
             "\n[REDZONE GUARD HIT #%ld] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR " (RIP %p)\n"
@@ -2277,6 +2276,13 @@ static void log_redzone_guard_hit(uintptr_t off, uintptr_t rip, uintptr_t rsp, G
         } else {
             pos += snprintf(buf + pos, sizeof(buf) - pos, "    (RSP invalid or unreadable)\n");
         }
+        veh_write(buf);
+    } else if (hit == 10 || hit == 50 || (hit % 100) == 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "[REDZONE GUARD HIT #%ld] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR " (RSP %p)\n",
+            hit, cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(),
+            off, (void *)rsp);
         veh_write(buf);
     }
 }
@@ -2516,10 +2522,22 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
             // 0x21992fb (size edx=0x10) returned; r12 == 0 when that allocation failed
             // (log: "Guest fault (signal 11) at guest offset 0x2199310, address ...0008").
             // Same shape as the 0x21d5b45 guard above: supply a real block and replay the store.
+            // Additionally, if the preceding 32-byte payload allocation at 0x2199266 also failed
+            // (r13 == 0), provide a valid fallback payload object with the expected vtable
+            // (image + 0x535f830) so GXRenderThread doesn't crash on downstream virtual dispatch.
+            static uint64_t s_render_cmd_fallback_payload[4] = {0};
             if (off == 0x2199310 && ep->ContextRecord->R12 == 0 && is_cusa03173_v109() &&
                 (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) & BB_TOGGLE_DEFENSIVE_GUARDS) == 0) {
                 void *block = runtime_low_alloc_aligned(16, 16);
                 if (block) {
+                    if (ep->ContextRecord->R13 == 0) {
+                        if (!s_render_cmd_fallback_payload[0]) {
+                            s_render_cmd_fallback_payload[0] = (uint64_t)(uintptr_t)image + 0x535f830;
+                            float *f = (float *)&s_render_cmd_fallback_payload[1];
+                            for (int i = 0; i < 6; ++i) f[i] = 1.0f;
+                        }
+                        ep->ContextRecord->R13 = (DWORD64)(uintptr_t)s_render_cmd_fallback_payload;
+                    }
                     static volatile LONG warned;
                     if (InterlockedExchange(&warned, 1) == 0) {
                         const uintptr_t rsp = ep->ContextRecord->Rsp;
@@ -2548,6 +2566,33 @@ static LONG WINAPI win_veh_handler(EXCEPTION_POINTERS *ep) {
                     if (cur) cur->exception_count++;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
+            }
+
+            // 0x219d955: GXRenderThread dequeued a render command node with NULL payload pointer
+            // (mov rax, [rdi] with rdi == 0). Recover by binding fallback payload with valid vtable.
+            if (off == 0x219d955 && ep->ContextRecord->Rdi == 0 && is_cusa03173_v109() &&
+                (__atomic_load_n(&runtime_disabled_optimizations2, __ATOMIC_RELAXED) & BB_TOGGLE_DEFENSIVE_GUARDS) == 0) {
+                if (!s_render_cmd_fallback_payload[0]) {
+                    s_render_cmd_fallback_payload[0] = (uint64_t)(uintptr_t)image + 0x535f830;
+                    float *f = (float *)&s_render_cmd_fallback_payload[1];
+                    for (int i = 0; i < 6; ++i) f[i] = 1.0f;
+                }
+                static volatile LONG warned_render_cmd;
+                if (InterlockedExchange(&warned_render_cmd, 1) == 0) {
+                    char buf[512];
+                    snprintf(buf, sizeof(buf),
+                        "[RENDER QUEUE GUARD] Thread '%s' (TID %lu) at guest offset 0x%" PRIxPTR ": "
+                        "NULL command payload in queue node %p; restored with fallback payload %p.\n",
+                        cur ? cur->name : "unknown", (unsigned long)GetCurrentThreadId(), off,
+                        (void *)(uintptr_t)ep->ContextRecord->Rbx, s_render_cmd_fallback_payload);
+                    veh_write(buf);
+                    fprintf(stderr, "%s", buf);
+                    fflush(stderr);
+                }
+                ep->ContextRecord->Rdi = (DWORD64)(uintptr_t)s_render_cmd_fallback_payload;
+                ep->ContextRecord->Rip = (uintptr_t)image + 0x219d955;
+                if (cur) cur->exception_count++;
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
 
             // 0x4370b6 initialises the block [vtable+0x10](this, 0x28) returned;
@@ -3001,6 +3046,150 @@ ABI float bb_live_clock_tick(void *singleton) {
     return dt;
 }
 
+#ifdef _WIN32
+typedef struct {
+    HANDLE pipe_read;
+    HANDLE orig_out;
+} LogTimestamperCtx;
+
+static void write_all_handle(HANDLE h, const char *buf, DWORD len) {
+    DWORD off = 0;
+    while (off < len) {
+        DWORD written = 0;
+        if (!WriteFile(h, buf + off, len - off, &written, NULL) || written == 0) {
+            break;
+        }
+        off += written;
+    }
+}
+
+static DWORD WINAPI log_timestamper_thread(LPVOID param) {
+    LogTimestamperCtx ctx = *(LogTimestamperCtx *)param;
+    free(param);
+    char in_buf[4096];
+    char line_buf[4096];
+    size_t line_len = 0;
+    DWORD nread = 0;
+    while (ReadFile(ctx.pipe_read, in_buf, sizeof(in_buf), &nread, NULL) && nread > 0) {
+        for (DWORD i = 0; i < nread; ++i) {
+            char c = in_buf[i];
+            if (c == '\r') {
+                continue;
+            }
+            if (c == '\n' || line_len >= sizeof(line_buf) - 32) {
+                if (c != '\n') {
+                    line_buf[line_len++] = c;
+                }
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                char out_buf[4160];
+                int hdr = snprintf(out_buf, sizeof(out_buf), "[%02u:%02u:%02u] ",
+                                   st.wHour, st.wMinute, st.wSecond);
+                if (hdr < 0) hdr = 0;
+                memcpy(out_buf + hdr, line_buf, line_len);
+                size_t total = (size_t)hdr + line_len;
+                out_buf[total++] = '\n';
+                write_all_handle(ctx.orig_out, out_buf, (DWORD)total);
+                line_len = 0;
+            } else {
+                line_buf[line_len++] = c;
+            }
+        }
+    }
+    if (line_len > 0) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char out_buf[4160];
+        int hdr = snprintf(out_buf, sizeof(out_buf), "[%02u:%02u:%02u] ",
+                           st.wHour, st.wMinute, st.wSecond);
+        if (hdr < 0) hdr = 0;
+        memcpy(out_buf + hdr, line_buf, line_len);
+        size_t total = (size_t)hdr + line_len;
+        out_buf[total++] = '\n';
+        write_all_handle(ctx.orig_out, out_buf, (DWORD)total);
+    }
+    CloseHandle(ctx.pipe_read);
+    CloseHandle(ctx.orig_out);
+    return 0;
+}
+
+static HANDLE g_log_timestamper_thread = NULL;
+
+static void flush_log_timestamper(void) {
+    if (!g_log_timestamper_thread) {
+        return;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    _close(1);
+    _close(2);
+    WaitForSingleObject(g_log_timestamper_thread, 250);
+    CloseHandle(g_log_timestamper_thread);
+    g_log_timestamper_thread = NULL;
+}
+
+static void install_log_timestamper(void) {
+    const char *env = getenv("BB_LOG_TIMESTAMPS");
+    if (env && env[0] == '0') {
+        return;
+    }
+    HANDLE raw_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!raw_out || raw_out == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    HANDLE orig_out = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), raw_out, GetCurrentProcess(), &orig_out, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+        return;
+    }
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE pipe_rd = NULL, pipe_wr = NULL;
+    if (!CreatePipe(&pipe_rd, &pipe_wr, &sa, 65536)) {
+        CloseHandle(orig_out);
+        return;
+    }
+    SetHandleInformation(pipe_rd, HANDLE_FLAG_INHERIT, 0);
+    int wfd = _open_osfhandle((intptr_t)pipe_wr, _O_WRONLY | _O_BINARY);
+    if (wfd < 0) {
+        CloseHandle(pipe_rd);
+        CloseHandle(pipe_wr);
+        CloseHandle(orig_out);
+        return;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    _dup2(wfd, 1);
+    _dup2(wfd, 2);
+    _close(wfd);
+    SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(1));
+    SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(2));
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    LogTimestamperCtx *ctx = (LogTimestamperCtx *)malloc(sizeof(*ctx));
+    if (!ctx) {
+        CloseHandle(pipe_rd);
+        CloseHandle(orig_out);
+        return;
+    }
+    ctx->pipe_read = pipe_rd;
+    ctx->orig_out = orig_out;
+    HANDLE th = CreateThread(NULL, 65536, log_timestamper_thread, ctx, 0, NULL);
+    if (th) {
+        SetThreadPriority(th, THREAD_PRIORITY_ABOVE_NORMAL);
+        g_log_timestamper_thread = th;
+        atexit(flush_log_timestamper);
+    } else {
+        CloseHandle(pipe_rd);
+        CloseHandle(orig_out);
+        free(ctx);
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
@@ -3014,6 +3203,7 @@ int main(int argc, char **argv) {
         return bbgpu_rebuild_shader_cache(argv[2]);
 
 #ifdef _WIN32
+    install_log_timestamper();
     runtime_memory_reserve_space();
     int avx_status = runtime_win_check_avx();
     if (avx_status != 1) {
@@ -3663,9 +3853,77 @@ int main(int argc, char **argv) {
                (void *)t, live_target, live_max_dt, g_live_clock_deltatime);
     } while (0);
 
-    /* Particle, blood splatter, and cloth vertex stream null pointer recovery hooks
-     * (Issue #127 / Discord 231500: prevents ~180k VEH exception dispatches on GXWorker threads). */
+    /* Windows x64 has no System V 128-byte red zone: every exception dispatch (e.g. GPU
+     * write-tracking faults) writes its CONTEXT frame below RSP and destroys red-zone locals.
+     * Relocate the 4 red-zone particle/blood/cloth leaf generators into an executable slab with
+     * +0x80-byte real stack frames so every local lives above RSP permanently. */
+    int redzone_rewritten_all = 0;
+#ifdef _WIN32
     do {
+        const char *rw_env = getenv("BB_REDZONE_REWRITE");
+        if (rw_env && rw_env[0] == '0') break;
+        if (!is_cusa03173_v109() || size < 0x28d015e) break;
+
+        static const struct {
+            uint64_t start;
+            uint64_t end;
+        } rz_funcs[4] = {
+            { 0x28ce7b0, 0x28ceeb8 },
+            { 0x28ceec0, 0x28cf572 },
+            { 0x28cf580, 0x28cfb95 },
+            { 0x28cfba0, 0x28d015e },
+        };
+
+        const size_t slab_cap = round_page(16384);
+        unsigned char *slab = allocate(slab_cap);
+        size_t slab_used = 0;
+        size_t orig_total = 0;
+        size_t new_offsets[4] = {0, 0, 0, 0};
+        int rewritten = 0;
+
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t f_start = rz_funcs[i].start;
+            const size_t f_len = (size_t)(rz_funcs[i].end - f_start);
+            slab_used = (slab_used + 15) & ~(size_t)15;
+            size_t out_len = 0;
+            if (slab_used >= slab_cap ||
+                !bbgpu_rewrite_redzone_leaf(image + f_start, f_len, (uint64_t)(image + f_start),
+                                            slab + slab_used, slab_cap - slab_used,
+                                            (uint64_t)(slab + slab_used), &out_len)) {
+                break;
+            }
+            int64_t disp = (int64_t)(slab + slab_used) - (int64_t)(image + f_start + 5);
+            if (disp < INT32_MIN || disp > INT32_MAX) {
+                break;
+            }
+            new_offsets[i] = slab_used;
+            slab_used += out_len;
+            orig_total += f_len;
+            rewritten++;
+        }
+
+        if (rewritten == 4) {
+            protect(slab, slab_cap, 5);
+            for (int i = 0; i < 4; ++i) {
+                const uint64_t f_start = rz_funcs[i].start;
+                int32_t rel = (int32_t)((int64_t)(slab + new_offsets[i]) - (int64_t)(image + f_start + 5));
+                unsigned char jmp5[5] = { 0xe9, 0, 0, 0, 0 };
+                memcpy(jmp5 + 1, &rel, 4);
+                memcpy(image + f_start, jmp5, sizeof(jmp5));
+                FlushInstructionCache(GetCurrentProcess(), image + f_start, sizeof(jmp5));
+            }
+            FlushInstructionCache(GetCurrentProcess(), slab, slab_used);
+            redzone_rewritten_all = 1;
+            printf("[REDZONE REWRITE] Relocated 4/4 PS4 red-zone leaf generators with +0x80 Windows stack frames (%zu -> %zu bytes at %p)\n",
+                   orig_total, slab_used, (void *)slab);
+        }
+    } while (0);
+#endif
+
+    /* Particle, blood splatter, and cloth vertex stream null pointer recovery hooks
+     * (Fallback only if the full red-zone frame rewrite above was disabled or declined). */
+    do {
+        if (redzone_rewritten_all) break;
         const char *stream_env = getenv("BB_STREAM_GUARD");
         if (stream_env && stream_env[0] == '0') break;
         if (!is_cusa03173_v109() || size < 0x28d064e) break;

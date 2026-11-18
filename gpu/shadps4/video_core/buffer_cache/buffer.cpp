@@ -129,6 +129,30 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result != VK_SUCCESS) {
+            const VmaAllocationCreateInfo fallback_alloc_ci = {
+                .flags = bda_flag | MemoryUsageVmaFlags(mem_type),
+                .usage = MemoryUsageVma(mem_type),
+                .requiredFlags = 0,
+                .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type),
+                .pool = VK_NULL_HANDLE,
+                .pUserData = nullptr,
+            };
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &fallback_alloc_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
+        if (result != VK_SUCCESS) {
+            const VmaAllocationCreateInfo sys_alloc_ci = {
+                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | bda_flag,
+                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                .requiredFlags = 0,
+                .preferredFlags = 0,
+                .pool = VK_NULL_HANDLE,
+                .pUserData = nullptr,
+            };
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &sys_alloc_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};

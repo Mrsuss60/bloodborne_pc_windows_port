@@ -25,6 +25,10 @@ int bbgpu_handle_fault(void *ucontext, void *address);
 /* Set while a fault from the PS4 red-zone vertex generators is being handled: their pages must
  * stay writable, because the Windows exception frame destroys the red-zone locals. */
 void bbgpu_set_redzone_fault(int active);
+/* Rewrites a PS4 System V red-zone leaf function with a +0x80-byte Windows-safe stack frame.
+ * Returns 1 on verified success (writing *out_len bytes to dst), 0 on failure. */
+int bbgpu_rewrite_redzone_leaf(const uint8_t *src, size_t src_len, uint64_t src_addr,
+                               uint8_t *dst, size_t dst_cap, uint64_t dst_addr, size_t *out_len);
 /* BB_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
 void bbgpu_dump_guest_writes(void *ucontext);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when

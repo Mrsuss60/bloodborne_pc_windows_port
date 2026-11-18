@@ -170,8 +170,13 @@ static Listing *list_directory(const char *path) {
         unsigned char type=0;
         char full[2048];
         snprintf(full,sizeof(full),"%s/%s",path,e->d_name);
+        wchar_t wfull[2048];
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, full, -1, wfull, 2048);
         struct _stat64 entry;
-        if (!_stat64(full,&entry)) {
+        int sres = -1;
+        if (wlen > 0) sres = _wstat64(wfull, &entry);
+        if (sres != 0) sres = _stat64(full, &entry);
+        if (sres == 0) {
             type=S_ISDIR(entry.st_mode) ? 4 : S_ISREG(entry.st_mode) ? 8 : 0;
         }
         l->types[l->count]=type;
@@ -233,15 +238,30 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     int host=-1;
     Listing *dir=NULL;
 #ifdef _WIN32
+    wchar_t wpath[1024];
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024);
     struct _stat64 s;
-    if (!_stat64(path,&s) && S_ISDIR(s.st_mode)) {
-        HANDLE h = CreateFileA(path, FILE_LIST_DIRECTORY, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                               NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    int is_dir = 0;
+    if (wlen > 0) {
+        if (!_wstat64(wpath, &s) && S_ISDIR(s.st_mode)) is_dir = 1;
+    } else {
+        if (!_stat64(path, &s) && S_ISDIR(s.st_mode)) is_dir = 1;
+    }
+    if (is_dir) {
+        HANDLE h = INVALID_HANDLE_VALUE;
+        if (wlen > 0) {
+            h = CreateFileW(wpath, FILE_LIST_DIRECTORY, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        }
+        if (h == INVALID_HANDLE_VALUE) {
+            h = CreateFileA(path, FILE_LIST_DIRECTORY, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        }
         if (h != INVALID_HANDLE_VALUE) {
             host = _open_osfhandle((intptr_t)h, _O_RDONLY);
         } else {
             DWORD err = GetLastError();
-            fprintf(stderr, "Runtime WARNING: CreateFileA(dir '%s') failed: Win32 error %lu\n", path, (unsigned long)err);
+            fprintf(stderr, "Runtime WARNING: CreateFile(dir '%s') failed: Win32 error %lu\n", path, (unsigned long)err);
         }
         if (host >= 0) dir = list_directory(path);
     }
@@ -249,7 +269,16 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     struct stat s;
 #endif
     if (host < 0) {
+#ifdef _WIN32
+        if (wlen > 0) {
+            host = _wopen(wpath, host_flags(flags), mode ? mode : 0644);
+        }
+        if (host < 0) {
+            host = open(path, host_flags(flags), mode ? mode : 0644);
+        }
+#else
         host=open(path,host_flags(flags),mode ? mode : 0644);
+#endif
         if (host<0) {
             e=errno;
             if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
@@ -437,8 +466,13 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     if (e) return -e;
     if (!out) return -EFAULT;
 #ifdef _WIN32
+    wchar_t wpath[1024];
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024);
     struct _stat64 s;
-    if (_stat64(path,&s)) return -errno;
+    int stat_res = -1;
+    if (wlen > 0) stat_res = _wstat64(wpath, &s);
+    if (stat_res != 0) stat_res = _stat64(path, &s);
+    if (stat_res != 0) return -errno;
     convert_stat(&s,out); return 0;
 #else
     struct stat s;
@@ -483,7 +517,18 @@ static int64_t path_op(const char *guest,int op,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
+#ifdef _WIN32
+    wchar_t wpath[1024];
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024);
+    int r;
+    if (wlen > 0) {
+        r = op==0 ? _wmkdir(wpath) : op==1 ? _wrmdir(wpath) : _wunlink(wpath);
+    } else {
+        r = op==0 ? mkdir(path,mode ? mode : 0755) : op==1 ? rmdir(path) : unlink(path);
+    }
+#else
     int r= op==0 ? mkdir(path,mode ? mode : 0755) : op==1 ? rmdir(path) : unlink(path);
+#endif
     return r ? -errno : 0;
 }
 static int64_t do_rename(const char *from,const char *to) {
@@ -492,6 +537,14 @@ static int64_t do_rename(const char *from,const char *to) {
     int e=translate(from,a,sizeof(a));
     if (!e) e=translate(to,b,sizeof(b));
     if (e) return -e;
+#ifdef _WIN32
+    wchar_t wa[1024], wb[1024];
+    int wla = MultiByteToWideChar(CP_UTF8, 0, a, -1, wa, 1024);
+    int wlb = MultiByteToWideChar(CP_UTF8, 0, b, -1, wb, 1024);
+    if (wla > 0 && wlb > 0) {
+        return _wrename(wa, wb) ? -errno : 0;
+    }
+#endif
     return rename(a,b) ? -errno : 0;
 }
 static int64_t do_ftruncate(int fd,int64_t length) {

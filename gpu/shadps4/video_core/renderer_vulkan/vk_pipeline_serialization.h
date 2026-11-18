@@ -17,6 +17,12 @@ namespace PipelineStore {
 static constexpr u32 ShaderBinaryVersion = 25u;
 static constexpr u32 ShaderMetaVersion = 8u;
 static constexpr u32 PipelineKeyVersion = 5u;
+/* bbport: monotonic one-time cache reset epoch stored in <exe_dir>/cache_epoch.bin (out/).
+ * Bump this when an update must clear pre-existing user caches once without breaking
+ * shader_recipes.bin format compatibility (ShaderMetaVersion / PipelineKeyVersion).
+ *   Epoch 1: post-0.9.0 (clears pre-fix caches that may hold patched SRT walkers / bad serdes)
+ *   Epoch 2: clears caches that imported shifted legacy 16-byte recipe metas / stale import.failed */
+static constexpr u32 CacheEpoch = 2u;
 }
 
 void RegisterShaderInput(std::vector<u8>&& input, u64 pgm_hash, size_t perm_idx);

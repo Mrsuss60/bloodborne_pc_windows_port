@@ -26,6 +26,8 @@ constexpr NvStatus Ok = 0, SettingNotFound = -160, ProfileNotFound = -163,
                    ExecutableNotFound = -166;
 constexpr std::uint32_t PreferredPstateId = 0x1057EB71;
 constexpr std::uint32_t PreferMax = 1;
+constexpr std::uint32_t FrlFpsBackgroundId = 0x10835002;
+constexpr std::uint32_t FrlFpsId = 0x10835001;
 constexpr int StringMax = 2048;
 using UnicodeString = std::uint16_t[StringMax];
 
@@ -188,6 +190,9 @@ void Apply() {
         return done("could not look up the executable's profile", status);
     }
 
+    bool needs_save = false;
+
+    // 1. Power management mode (prefer maximum performance)
     auto setting = std::make_unique<Setting>();
     std::memset(setting.get(), 0, sizeof(Setting));
     setting->version = Version<Setting>(1);
@@ -195,32 +200,62 @@ void Apply() {
     const bool user_set = status == Ok && setting->location == 0 && !setting->is_current_predefined;
     if (status == Ok && setting->current.u32 == PreferMax) {
         std::printf("NVIDIA profile: power management already prefers maximum performance\n");
-        return done(nullptr, 0);
-    }
-    if (user_set) {
+    } else if (user_set) {
         std::printf("NVIDIA profile: power management mode %u chosen by the user for %ls, kept\n",
                     setting->current.u32, exe);
-        return done(nullptr, 0);
+    } else {
+        const std::uint32_t was = status == Ok ? setting->current.u32 : 5;
+        std::memset(setting.get(), 0, sizeof(Setting));
+        setting->version = Version<Setting>(1);
+        setting->id = PreferredPstateId;
+        setting->type = 0;
+        setting->current.u32 = PreferMax;
+        if (api.set_setting(session, profile, setting.get()) == Ok) {
+            needs_save = true;
+            std::printf("NVIDIA profile: power management for %ls: mode %u -> prefer maximum performance\n",
+                        exe, was);
+        }
     }
-    if (status != Ok && status != SettingNotFound) {
-        return done("could not read the power management mode", status);
-    }
-    const std::uint32_t was = status == Ok ? setting->current.u32 : 5;
+
+    // 2. Disable Background Application Max Frame Rate (prevents severe performance collapse when window unfocuses)
     std::memset(setting.get(), 0, sizeof(Setting));
     setting->version = Version<Setting>(1);
-    setting->id = PreferredPstateId;
-    setting->type = 0;
-    setting->current.u32 = PreferMax;
-    status = api.set_setting(session, profile, setting.get());
-    if (status == Ok) {
+    status = api.get_setting(session, profile, FrlFpsBackgroundId, setting.get());
+    if (status == Ok && setting->current.u32 != 0) {
+        std::memset(setting.get(), 0, sizeof(Setting));
+        setting->version = Version<Setting>(1);
+        setting->id = FrlFpsBackgroundId;
+        setting->type = 0;
+        setting->current.u32 = 0;
+        if (api.set_setting(session, profile, setting.get()) == Ok) {
+            needs_save = true;
+            std::printf("NVIDIA profile: background application max FPS throttling disabled\n");
+        }
+    }
+
+    // 3. Disable Driver-level Global Frame Limiter
+    std::memset(setting.get(), 0, sizeof(Setting));
+    setting->version = Version<Setting>(1);
+    status = api.get_setting(session, profile, FrlFpsId, setting.get());
+    if (status == Ok && setting->current.u32 != 0) {
+        std::memset(setting.get(), 0, sizeof(Setting));
+        setting->version = Version<Setting>(1);
+        setting->id = FrlFpsId;
+        setting->type = 0;
+        setting->current.u32 = 0;
+        if (api.set_setting(session, profile, setting.get()) == Ok) {
+            needs_save = true;
+            std::printf("NVIDIA profile: driver-level foreground max FPS limit disabled\n");
+        }
+    }
+
+    if (needs_save) {
         status = api.save_settings(session);
+        if (status != Ok) {
+            return done("could not save updated driver settings", status);
+        }
+        std::printf("NVIDIA profile: updated driver settings successfully saved\n");
     }
-    if (status != Ok) {
-        return done("could not set prefer maximum performance", status);
-    }
-    std::printf("NVIDIA profile: power management for %ls: mode %u -> prefer maximum performance "
-                "(BB_NV_POWER=0: leave it)\n",
-                exe, was);
     done(nullptr, 0);
 }
 

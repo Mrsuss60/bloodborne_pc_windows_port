@@ -32,6 +32,7 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Vulkan {
 extern std::atomic<u64> g_bb_compile_ns;
 extern std::atomic<u32> g_bb_compiles;
+extern std::atomic<u32> g_bb_compiles_total;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
@@ -357,7 +358,9 @@ void VideoOutDriver::Flip(const Request& req) {
         intervals.push_back(frame_ms);
         last = now;
         // Stall diagnostics: what happened during a long frame.
+        static bool have_prev_frame = false;
         static u64 last_gpu_ns, last_images, last_image_bytes, last_buffer_bytes;
+        static u32 last_compiles_total;
         static u64 last_t[6], last_minflt, last_sigf, last_pc, last_pp, last_rc, last_rp;
         const u64 pc = BbStats::protect_calls.load(), pp = BbStats::protect_pages.load(),
                   rc = BbStats::protect_revoke_calls.load(), rp = BbStats::protect_revoke_pages.load();
@@ -368,7 +371,7 @@ void VideoOutDriver::Flip(const Request& req) {
         static u64 last_proc_flt, last_copy_ns, last_copy_bytes, last_rf, last_trf, last_twf;
         const u64 rf = BbStats::read_faults.load(), trf = BbStats::t_read_faults.load(),
                   twf = BbStats::t_write_faults.load();
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
+        if (frame_ms > 40.0 && have_prev_frame) {
             std::printf("       fault handlers: %llu read faults %.1f ms, write faults %.1f ms\n",
                         static_cast<unsigned long long>(rf - last_rf), (trf - last_trf) / 1e6,
                         (twf - last_twf) / 1e6);
@@ -391,6 +394,7 @@ void VideoOutDriver::Flip(const Request& req) {
                   subs = BbStats::submissions.load(), sys_us = BbStats::gpu_sys_us.load(),
                   user_us = BbStats::gpu_user_us.load(), invol = BbStats::gpu_invol_switches.load(),
                   vol = BbStats::gpu_vol_switches.load();
+        const u32 compiles_total = Vulkan::g_bb_compiles_total.load(std::memory_order_relaxed);
         u64 gpu_ns = 0;
 #ifndef _WIN32
         if (const int clock = BbStats::gpu_thread_clock.load(); clock != -1) {
@@ -398,14 +402,17 @@ void VideoOutDriver::Flip(const Request& req) {
             clock_gettime(static_cast<clockid_t>(clock), &ts);
             gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
         }
+#else
+        gpu_ns = (user_us + sys_us) * 1000ull;
 #endif
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
-            std::printf("Stall: %.1f ms frame; GPU thread on CPU %.1f ms; %llu images registered, "
-                        "%.1f MB image uploads, %.1f MB buffer uploads\n",
+        if (frame_ms > 40.0 && have_prev_frame) {
+            std::printf("Stall: %.1f ms frame; GPU thread on CPU %.1f ms; %u compiles; "
+                        "%llu images registered, %.1f MB image uploads, %.1f MB buffer uploads\n",
                         frame_ms, (gpu_ns - last_gpu_ns) / 1e6,
+                        compiles_total - last_compiles_total,
                         static_cast<unsigned long long>(images - last_images),
                         (image_bytes - last_image_bytes) / 1e6,
                         (buffer_bytes - last_buffer_bytes) / 1e6);
@@ -417,7 +424,7 @@ void VideoOutDriver::Flip(const Request& req) {
                         (sys_us - last_sys) / 1e3, static_cast<unsigned long long>(invol - last_invol),
                         static_cast<unsigned long long>(vol - last_vol));
         }
-        if (frame_ms > 40.0 && last_gpu_ns != 0) {
+        if (frame_ms > 40.0 && have_prev_frame) {
             std::printf("       ms in: resident %.1f, protect %.1f, image create %.1f, "
                         "image refresh %.1f, staging %.1f, waiting for host copies %.1f\n",
                         (t_now[0] - last_t[0]) / 1e6, (t_now[1] - last_t[1]) / 1e6,
@@ -438,7 +445,7 @@ void VideoOutDriver::Flip(const Request& req) {
         last_rc = rc;
         last_rp = rp;
         last_minflt = minflt;
-        if (frame_ms > 40.0 && last_gpu_ns != 0 && copy_ns > last_copy_ns) {
+        if (frame_ms > 40.0 && have_prev_frame && copy_ns > last_copy_ns) {
             std::printf("       guest copies %.1f MB in %.1f thread-ms, %.1f ms on CPU (kernel %.1f ms, "
                         "%llu page faults in large copies) (%.2f GB/s per thread)\n",
                         (copy_bytes - last_copy_bytes) / 1e6, (copy_ns - last_copy_ns) / 1e6,
@@ -462,9 +469,11 @@ void VideoOutDriver::Flip(const Request& req) {
         last_invol = invol;
         last_vol = vol;
         last_gpu_ns = gpu_ns;
+        last_compiles_total = compiles_total;
         last_images = images;
         last_image_bytes = image_bytes;
         last_buffer_bytes = buffer_bytes;
+        have_prev_frame = true;
         ++frames;
         const double window = std::chrono::duration<double>(now - window_start).count();
         if (window >= 5.0) {
@@ -635,6 +644,18 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
+#ifdef _WIN32
+    HMODULE avrt = LoadLibraryA("avrt.dll");
+    if (avrt) {
+        using AvSetMmThreadCharacteristicsW_t = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
+        auto set_mmcss = reinterpret_cast<AvSetMmThreadCharacteristicsW_t>(
+            GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW"));
+        if (set_mmcss) {
+            DWORD task_index = 0;
+            set_mmcss(L"Games", &task_index);
+        }
+    }
+#endif
 
     Common::AccurateTimer timer{vblank_period};
 

@@ -64,8 +64,20 @@ bool PipelineCache::LaunchShaderImport(ShaderImport& state) {
     startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION created{};
     std::wstring command = state.command;
-    if (!CreateProcessW(state.exe.c_str(), command.data(), nullptr, nullptr, TRUE,
-                        BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &startup, &created)) {
+    const bool foreground = !bb_env_off("BB_BOOT_PRECOMPILE");
+    const DWORD prio = foreground ? NORMAL_PRIORITY_CLASS
+                                  : (std::thread::hardware_concurrency() <= 4
+                                         ? IDLE_PRIORITY_CLASS
+                                         : BELOW_NORMAL_PRIORITY_CLASS);
+    if (foreground) {
+        SetEnvironmentVariableA("BB_IMPORT_FOREGROUND", "1");
+    }
+    const BOOL ok = CreateProcessW(state.exe.c_str(), command.data(), nullptr, nullptr, TRUE, prio,
+                                   nullptr, nullptr, &startup, &created);
+    if (foreground) {
+        SetEnvironmentVariableA("BB_IMPORT_FOREGROUND", nullptr);
+    }
+    if (!ok) {
         return false;
     }
     CloseHandle(created.hThread);
@@ -81,8 +93,10 @@ void PipelineCache::StartShaderImport() {
     }
     std::error_code ec;
     if (std::filesystem::exists(store.Directory() / "import", ec)) {
-        MergeShaderImport(true);
-        import_ready.store(true, std::memory_order_relaxed);
+        if (bb_env_off("BB_BOOT_PRECOMPILE")) {
+            MergeShaderImport(true);
+        }
+        import_ready.store(true, std::memory_order_release);
     }
     SaveProfile();
     // bbport: the import child validates <cache>/profile.bin before it imports any recipe, so the
@@ -123,6 +137,8 @@ void PipelineCache::StartShaderImport() {
         }
     }
     if (!pack || !*pack || !game || !*game || !std::filesystem::exists(pack, ec) || !std::filesystem::exists(game, ec)) {
+        std::printf("Shader recipes: skipped (pack=%s, game=%s)\n",
+                    pack && *pack ? pack : "<none>", game && *game ? game : "<none>");
         return;
     }
     const std::string dir = store.Directory().string();
@@ -197,13 +213,13 @@ void PipelineCache::StartShaderImport() {
         while (waitpid(state->pid, &status, 0) < 0 && errno == EINTR) {
         }
 #endif
-        state->running = false;
         std::error_code ec;
         if (std::filesystem::exists(Storage::DataBase::Instance().Directory() / "import", ec)) {
-            import_ready.store(true, std::memory_order_relaxed);
+            import_ready.store(true, std::memory_order_release);
         } else {
             g_bb_shader_import_active.store(false, std::memory_order_relaxed);
         }
+        state->running.store(false, std::memory_order_release);
     });
 }
 
@@ -363,6 +379,7 @@ void PipelineCache::MergeShaderImport(bool at_start) {
     }
     const fs::path dir = store.Directory(), from = dir / "import";
     std::error_code ec;
+    const bool boot_mode = g_bb_boot_precompile_active.load(std::memory_order_relaxed);
     if (!state.listed) {
         state.listed = true;
         state.start = std::chrono::steady_clock::now();
@@ -377,10 +394,14 @@ void PipelineCache::MergeShaderImport(bool at_start) {
             }
         }
         state.programs.assign(by_program.begin(), by_program.end());
+        if (boot_mode && !state.keys.empty()) {
+            g_bb_boot_compile_done.store(0, std::memory_order_relaxed);
+            g_bb_boot_compile_total.store(u32(state.keys.size()), std::memory_order_release);
+        }
         StartImportPrecompile(state);
     }
     if (state.precompiled && state.precompiled->pending.load(std::memory_order_acquire) > 0) {
-        if (!at_start) {
+        if (!at_start || boot_mode) {
             return;
         }
         std::unique_lock lk{state.precompiled->mutex};
@@ -388,11 +409,12 @@ void PipelineCache::MergeShaderImport(bool at_start) {
             lk, [&] { return state.precompiled->pending.load(std::memory_order_acquire) == 0; });
     }
     const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
-    if (!at_start && frame == state.frame) {
+    if (!at_start && !boot_mode && frame == state.frame) {
         return;
     }
     state.frame = frame;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(at_start ? 5 : 2);
+    const auto slice_ms = boot_mode ? 40 : (at_start ? 5 : 2);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(slice_ms);
     const auto in_budget = [&] {
         return std::chrono::steady_clock::now() < deadline;
     };
@@ -415,6 +437,9 @@ void PipelineCache::MergeShaderImport(bool at_start) {
         {
             const Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read};
             if (!file.IsOpen()) {
+                if (boot_mode) {
+                    g_bb_boot_compile_done.fetch_add(1, std::memory_order_relaxed);
+                }
                 continue;
             }
             bytes.resize(file.GetSize());
@@ -422,10 +447,22 @@ void PipelineCache::MergeShaderImport(bool at_start) {
         }
         if (!RemapImportedKey(state.remap, bytes, path)) {
             fs::remove(path, ec);
+            if (boot_mode) {
+                g_bb_boot_compile_done.fetch_add(1, std::memory_order_relaxed);
+            }
             continue;
         }
         fs::rename(path, dir / path.filename(), ec);
+        const u32 jobs_before = state.queued + state.compute;
         MergeImportedKey(state, std::move(bytes));
+        if (boot_mode) {
+            const u32 jobs_added = (state.queued + state.compute) - jobs_before;
+            if (jobs_added == 0) {
+                g_bb_boot_compile_done.fetch_add(1, std::memory_order_relaxed);
+            } else if (jobs_added > 1) {
+                g_bb_boot_compile_total.fetch_add(jobs_added - 1, std::memory_order_relaxed);
+            }
+        }
     }
     if (state.next_program == state.programs.size() && state.next_key == state.keys.size()) {
         state.precompiled.reset();
@@ -496,6 +533,10 @@ bool PipelineCache::MergeImportedProgram(ShaderImport& state, size_t index,
             Serialization::Archive ar{std::move(meta)};
             std::unique_lock lk{programs_mutex};
             LoadPipelineStage(ar, 0, precompiled);
+        } catch (const Serialization::CorruptData& e) {
+            LOG_WARNING(Render_Vulkan, "Imported shader meta {} is corrupt ({}); removing it",
+                        meta_name, e.what());
+            fs::remove(meta_dst, ec);
         } catch (const std::exception&) {
         }
     }
@@ -573,7 +614,13 @@ void PipelineCache::QueueImportedCompute(ShaderImport& state, Serialization::Arc
     const vk::ShaderModule module = sel.modules[0];
     ++state.compute;
     state.compute_queued.fetch_add(1, std::memory_order_relaxed);
-    GetCompiler().SubmitLow([this, &state, key, info, module, sdata]() mutable {
+    const bool track_boot = g_bb_boot_precompile_active.load(std::memory_order_relaxed);
+    GetCompiler().SubmitLow([this, &state, key, info, module, sdata, track_boot]() mutable {
+        SCOPE_EXIT {
+            if (track_boot) {
+                g_bb_boot_compile_done.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
         std::unique_ptr<ComputePipeline> pipeline;
         try {
             pipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -603,13 +650,18 @@ void PipelineCache::QueueImportedGraphics(ShaderImport& state, Serialization::Ar
         }
         auto job = std::make_shared<PendingPipeline>();
         job->saved = true;
+        job->from_cache = true;
         job->make = std::move(make);
         pending_graphics.emplace(key, job);
         ++state.queued;
         g_bb_background_pipelines_total.fetch_add(1, std::memory_order_relaxed);
-        GetCompiler().SubmitLow([job, key] {
+        const bool track_boot = g_bb_boot_precompile_active.load(std::memory_order_relaxed);
+        GetCompiler().SubmitLow([job, key, track_boot] {
             SCOPE_EXIT {
                 g_bb_background_pipelines_done.fetch_add(1, std::memory_order_relaxed);
+                if (track_boot) {
+                    g_bb_boot_compile_done.fetch_add(1, std::memory_order_relaxed);
+                }
             };
             if (job->started.exchange(true)) {
                 return;
@@ -623,6 +675,7 @@ void PipelineCache::QueueImportedGraphics(ShaderImport& state, Serialization::Ar
             }
             std::scoped_lock lk{job->mutex};
             job->pipeline = std::move(pipeline);
+            job->make = {};
             job->done = true;
             job->ready.store(true, std::memory_order_release);
             job->cv.notify_all();
@@ -673,7 +726,10 @@ std::optional<size_t> PipelineCache::AdoptImportedPermutation(std::vector<u8>&& 
     if (!module) {
         return std::nullopt;
     }
-    const size_t idx = modules.size();
+    size_t idx = modules.size();
+    if (import_idx < modules.size() && !modules[import_idx].spec.Valid()) {
+        idx = import_idx;
+    }
     RegisterShaderMeta(info, spec, HashCombine(info.pgm_hash, idx), idx);
     RegisterShaderBinary(std::move(spv), info.pgm_hash, idx);
     if (!input.empty()) {
@@ -687,6 +743,147 @@ std::optional<size_t> PipelineCache::AdoptImportedPermutation(std::vector<u8>&& 
     spec.info = &program.info;
     program.InsertPermut(module, std::move(spec), idx, flat_hash);
     return idx;
+}
+
+void PipelineCache::FinishBootPrecompile(const std::function<void()>& tick_ui) {
+    auto& store = Storage::DataBase::Instance();
+    if (!store.IsOpened()) {
+        return;
+    }
+    const auto has_compute_pending = [&] {
+        return import && import->compute_queued.load(std::memory_order_relaxed) > 0;
+    };
+    const auto drain_compute = [&] {
+        if (!import || import->compute_queued.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        std::scoped_lock lk{import->compute_mutex};
+        for (auto& [key, pipeline] : import->compute_made) {
+            compute_pipelines.try_emplace(key, std::move(pipeline));
+            import->compute_queued.fetch_sub(1, std::memory_order_relaxed);
+        }
+        import->compute_made.clear();
+    };
+
+    std::error_code ec;
+    const bool has_import =
+        (import && import->running.load(std::memory_order_acquire)) ||
+        import_ready.load(std::memory_order_acquire) ||
+        fs::exists(store.Directory() / "import", ec);
+    const bool has_pending = !pending_graphics.empty() || has_compute_pending();
+    if (!has_import && !has_pending) {
+        return;
+    }
+
+    const auto boot_start = std::chrono::steady_clock::now();
+    const size_t initial_graphics = graphics_pipelines.size();
+    const size_t initial_compute = compute_pipelines.size();
+    g_bb_recipe_import_done.store(0, std::memory_order_relaxed);
+    g_bb_recipe_import_total.store(0, std::memory_order_relaxed);
+    g_bb_boot_compile_done.store(0, std::memory_order_relaxed);
+    g_bb_boot_compile_total.store(0, std::memory_order_relaxed);
+    g_bb_boot_precompile_active.store(true, std::memory_order_release);
+    SCOPE_EXIT {
+        g_bb_boot_precompile_active.store(false, std::memory_order_release);
+        g_bb_recipe_import_done.store(0, std::memory_order_relaxed);
+        g_bb_recipe_import_total.store(0, std::memory_order_relaxed);
+        g_bb_boot_compile_done.store(0, std::memory_order_relaxed);
+        g_bb_boot_compile_total.store(0, std::memory_order_relaxed);
+    };
+
+    auto last_ui = boot_start;
+    bool ui_shown = !pending_graphics.empty();
+    const auto maybe_tick_ui = [&](bool force = false) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!ui_shown) {
+            if (now - boot_start < std::chrono::milliseconds(150)) {
+                return;
+            }
+            ui_shown = true;
+            force = true;
+        }
+        if (tick_ui && (force || now - last_ui >= std::chrono::milliseconds(33))) {
+            tick_ui();
+            last_ui = std::chrono::steady_clock::now();
+        }
+    };
+
+    // Phase 1: wait for --import-shaders child (running at NORMAL priority across shards).
+    if (import && import->running.load(std::memory_order_acquire)) {
+        const fs::path staging = store.Directory() / "import.tmp";
+        auto last_scan = boot_start - std::chrono::seconds(1);
+        while (import->running.load(std::memory_order_acquire)) {
+            RetirePendingGraphics(true);
+            drain_compute();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_scan >= std::chrono::milliseconds(250)) {
+                last_scan = now;
+                if (g_bb_recipe_import_total.load(std::memory_order_relaxed) == 0) {
+                    std::ifstream tf{staging / "total.txt"};
+                    u32 tot = 0;
+                    if (tf >> tot && tot > 0) {
+                        g_bb_recipe_import_total.store(tot, std::memory_order_relaxed);
+                    }
+                }
+                if (fs::exists(staging, ec)) {
+                    u32 done = 0;
+                    for (const auto& entry : fs::directory_iterator{staging, ec}) {
+                        const std::string fname = entry.path().filename().string();
+                        if (fname.ends_with("_0.spv")) {
+                            ++done;
+                        }
+                    }
+                    g_bb_recipe_import_done.store(done, std::memory_order_relaxed);
+                }
+            }
+            maybe_tick_ui();
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+    }
+
+    // Phase 2: merge all translated shader recipes and queue their Vulkan pipelines.
+    g_bb_recipe_import_done.store(0, std::memory_order_relaxed);
+    g_bb_recipe_import_total.store(0, std::memory_order_relaxed);
+    if (import_ready.load(std::memory_order_acquire) ||
+        fs::exists(store.Directory() / "import", ec)) {
+        import_ready.store(true, std::memory_order_release);
+        if (import) {
+            import->done = false;
+        }
+        while (import_ready.load(std::memory_order_acquire) && (!import || !import->done)) {
+            MergeShaderImport(true);
+            RetirePendingGraphics(true);
+            drain_compute();
+            maybe_tick_ui();
+            if (import && import->precompiled &&
+                import->precompiled->pending.load(std::memory_order_acquire) > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    }
+
+    // Phase 3: drain all queued graphics & compute Vulkan pipelines before gameplay starts.
+    while (!pending_graphics.empty() || has_compute_pending()) {
+        RetirePendingGraphics(true);
+        drain_compute();
+        maybe_tick_ui();
+        if (!pending_graphics.empty() || has_compute_pending()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    const bool did_work = graphics_pipelines.size() > initial_graphics ||
+                          compute_pipelines.size() > initial_compute;
+    if (did_work) {
+        SaveDriverPipelineCache();
+        store.Flush();
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_start).count();
+        std::printf("Shader cache: boot precompile complete in %.1f s (%zu graphics, %zu compute "
+                    "pipelines ready)\n",
+                    secs, graphics_pipelines.size(), compute_pipelines.size());
+        std::fflush(stdout);
+    }
 }
 
 } // namespace Vulkan

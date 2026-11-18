@@ -162,5 +162,24 @@ int main(void) {
     for (int i = 0; i < 10; ++i) { t += 16000; if (!key_stick(&ks, t, 0, 0, 0, 0, &sx, &sy)) { sx = 128; sy = 128; } }
     assert(sx == 128 && sy == 128);
 
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, key_stick SOCD");
+    /* Test MouseCaptureLatch: click-to-capture button must be ignored until released */
+    MouseCaptureLatch latch = {0};
+    /* Uncaptured: no suppression latched */
+    assert(filter_capture_mouse_buttons(&latch, 0, 0) == 0);
+    /* Focus/capture click (0 -> 1 with LMB held): LMB is suppressed */
+    assert(filter_capture_mouse_buttons(&latch, 1, SDL_BUTTON_LMASK) == 0);
+    /* Still held on subsequent frames: LMB remains suppressed, other new buttons work */
+    assert(filter_capture_mouse_buttons(&latch, 1, SDL_BUTTON_LMASK) == 0);
+    assert(filter_capture_mouse_buttons(&latch, 1, SDL_BUTTON_LMASK | SDL_BUTTON_RMASK) == SDL_BUTTON_RMASK);
+    /* LMB released -> latch clears */
+    assert(filter_capture_mouse_buttons(&latch, 1, 0) == 0);
+    /* Subsequent genuine LMB click registers immediately */
+    assert(filter_capture_mouse_buttons(&latch, 1, SDL_BUTTON_LMASK) == SDL_BUTTON_LMASK);
+    /* Release capture and re-capture with RMB held: RMB suppressed until released */
+    assert(filter_capture_mouse_buttons(&latch, 0, 0) == 0);
+    assert(filter_capture_mouse_buttons(&latch, 1, SDL_BUTTON_RMASK) == 0);
+    assert(filter_capture_mouse_buttons(&latch, 1, 0) == 0);
+    assert(filter_capture_mouse_buttons(&latch, 1, SDL_BUTTON_RMASK) == SDL_BUTTON_RMASK);
+
+    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, key_stick SOCD, mouse capture latch");
 }

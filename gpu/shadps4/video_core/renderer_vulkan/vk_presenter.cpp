@@ -13,6 +13,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_overlay.h"
+#include "shim/bb_env.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -154,6 +155,20 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
 
+    auto& pipeline_cache = rasterizer->GetPipelineCache();
+    const bool boot_ui = !EmulatorSettings.IsNullGPU() && EmulatorSettings.IsPipelineCacheEnabled();
+    const auto tick_ui = [this] {
+        Frame* frame = PrepareBlankFrame(true);
+        Present(frame, false, false);
+    };
+    pipeline_cache.WarmUp(boot_ui ? std::function<void()>(tick_ui) : std::function<void()>{});
+    pipeline_cache.StartShaderImport();
+    if (boot_ui && !bb_env_off("BB_BOOT_PRECOMPILE")) {
+        pipeline_cache.FinishBootPrecompile(tick_ui);
+    }
+    if (boot_ui) {
+        present_scheduler.Finish();
+    }
 }
 
 Presenter::~Presenter() {
@@ -587,6 +602,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
             free_frame();
             return;
         }
@@ -736,7 +752,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
         if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            const s32 cur_w = window.GetWidth();
+            const s32 cur_h = window.GetHeight();
+            if (cur_w > 0 && cur_h > 0) {
+                swapchain.Recreate(cur_w, cur_h);
+            }
         }
     }
 

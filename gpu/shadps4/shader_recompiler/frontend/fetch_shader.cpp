@@ -58,6 +58,12 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (guest_read_hook) {
         guest_read_hook(code, 0);
     }
+    const bool replaying = (guest_mem_translate != nullptr);
+    if (replaying) [[unlikely]] {
+        if (const void* mapped = guest_mem_translate(reinterpret_cast<VAddr>(code), sizeof(u32))) {
+            code = reinterpret_cast<const u32*>(mapped);
+        }
+    }
 
     // bbport: the pipeline cache parses the fetch shader on every draw. Results are cached
     // per thread by code address and revalidated against a copy of the code, which is
@@ -68,7 +74,7 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     };
     thread_local std::unordered_map<const u32*, CachedParse> cache;
     if (const auto it = cache.find(code);
-        !BbToggle::Disabled(BbToggle::FetchShaderCache) && it != cache.end() &&
+        !replaying && !BbToggle::Disabled(BbToggle::FetchShaderCache) && it != cache.end() &&
         std::memcmp(code, it->second.code.data(), it->second.code.size() * sizeof(u32)) == 0) {
         return it->second.data;
     }
@@ -130,10 +136,12 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         }
     }
 
-    if (cache.size() >= 4096) {
-        cache.clear();
+    if (!replaying) {
+        if (cache.size() >= 4096) {
+            cache.clear();
+        }
+        cache[code] = CachedParse{std::vector<u32>(code, code_slice.position()), data};
     }
-    cache[code] = CachedParse{std::vector<u32>(code, code_slice.position()), data};
     return data;
 }
 

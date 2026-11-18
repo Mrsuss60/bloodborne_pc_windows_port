@@ -33,8 +33,12 @@ Swapchain::~Swapchain() {
 }
 
 void Swapchain::Create(u32 width_, u32 height_) {
-    width = width_;
-    height = height_;
+    if (width_ > 0) {
+        width = width_;
+    }
+    if (height_ > 0) {
+        height = height_;
+    }
     needs_recreation = false;
 
     Destroy();
@@ -66,7 +70,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .preTransform = transform,
         .compositeAlpha = composite_alpha,
         .presentMode = present_mode,
-        .clipped = true,
+        .clipped = false,
         .oldSwapchain = nullptr,
     };
 
@@ -223,15 +227,24 @@ void Swapchain::SetSurfaceProperties() {
                "Failed to query surface capabilities: {}", vk::to_string(capabilities_result));
 
     extent = capabilities.currentExtent;
-    if (capabilities.currentExtent.width == std::numeric_limits<u32>::max()) {
+    if (capabilities.currentExtent.width == std::numeric_limits<u32>::max() ||
+        capabilities.currentExtent.width == 0 || capabilities.currentExtent.height == 0) {
+        const u32 fallback_w = std::max(1u, width);
+        const u32 fallback_h = std::max(1u, height);
         extent.width = std::max(capabilities.minImageExtent.width,
-                                std::min(capabilities.maxImageExtent.width, width));
+                                std::min(capabilities.maxImageExtent.width, fallback_w));
         extent.height = std::max(capabilities.minImageExtent.height,
-                                 std::min(capabilities.maxImageExtent.height, height));
+                                 std::min(capabilities.maxImageExtent.height, fallback_h));
+        if (extent.width == 0) {
+            extent.width = fallback_w;
+        }
+        if (extent.height == 0) {
+            extent.height = fallback_h;
+        }
     }
 
-    // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
+    // Select number of images in swap chain; ensure at least triple-buffering to absorb DWM background compositing
+    image_count = std::max(3u, capabilities.minImageCount + 1);
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

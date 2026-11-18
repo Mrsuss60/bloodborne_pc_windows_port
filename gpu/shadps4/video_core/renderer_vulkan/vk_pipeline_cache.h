@@ -26,6 +26,11 @@ extern std::atomic<u32> g_bb_compiles;
 extern std::atomic<u32> g_bb_background_pipelines_total;
 extern std::atomic<u32> g_bb_background_pipelines_done;
 extern std::atomic<bool> g_bb_shader_import_active;
+extern std::atomic<u32> g_bb_recipe_import_done;
+extern std::atomic<u32> g_bb_recipe_import_total;
+extern std::atomic<u32> g_bb_boot_compile_done;
+extern std::atomic<u32> g_bb_boot_compile_total;
+extern std::atomic<bool> g_bb_boot_precompile_active;
 } // namespace Vulkan
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -223,8 +228,9 @@ public:
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
-    void WarmUp();
+    void WarmUp(const std::function<void()>& tick_ui = {});
     void StartShaderImport();
+    void FinishBootPrecompile(const std::function<void()>& tick_ui);
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
@@ -359,15 +365,25 @@ private:
         GraphicsPipeline::SerializationSupport sdata{};
         std::array<vk::ShaderModule, MaxShaderStages> modules{};
         bool saved = false;
+        bool from_cache = false;
         std::function<std::unique_ptr<GraphicsPipeline>()> make;
         std::atomic<bool> started{false};
         std::atomic<bool> ready{false};
     };
     bool AsyncSkippable(const PipelineSelection& sel, bool indirect);
-    void RetirePendingGraphics();
+    void RetirePendingGraphics(bool force = false);
     const GraphicsPipeline* FinishPipeline(const GraphicsPipelineKey& key, PendingPipeline& job);
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>> pending_graphics;
     u64 async_started = 0, async_skipped = 0, async_waited = 0; ///< statistics
+
+    struct PendingProgram {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        std::atomic<bool> ready{false};
+    };
+    tsl::robin_map<u64, std::shared_ptr<PendingProgram>> pending_programs;
+    tsl::robin_map<u64, std::shared_ptr<PendingProgram>> pending_permutations;
     /// bbport: pipelines the driver refused to create. A key is attempted a bounded number of
     /// times and afterwards its draws are skipped: one bad shader/permutation must not exit the
     /// process and must not be retried every frame either. GPU thread only.
