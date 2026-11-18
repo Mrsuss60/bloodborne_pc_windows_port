@@ -14,13 +14,13 @@ echo.
 
 rem ---------- 1. Source files ----------
 echo [1/4] Checking source files...
-for %%F in (bblauncher_app.py bblauncher_UI.py bblauncher_Utils.py) do (
+for %%F in (bblauncher_app.py bblauncher_qml.py bblauncher_qmlview.py bblauncher_qmltabs.py bblauncher_dialogs.py bblauncher_Utils.py) do (
     if not exist "%%F" (
         echo   [FAIL]    Missing %%F next to this script
         goto :fail
     )
 )
-echo   [OK]      bblauncher_app.py, bblauncher_UI.py, bblauncher_Utils.py
+echo   [OK]      bblauncher_app.py, bblauncher_qml.py, bblauncher_qmlview.py, bblauncher_qmltabs.py, bblauncher_dialogs.py, bblauncher_Utils.py
 
 set "ICON_ARGS="
 if exist "icon.ico" (
@@ -36,7 +36,16 @@ if exist "resources" (
     set "DATA_ARGS=--add-data "resources;resources""
 )
 
-if not exist "..\scripts\bb_guard.py" echo   [WARN]    ..\scripts\bb_guard.py not found - the exe will build without it
+set "QML_ARGS="
+if exist "qml" (
+    echo   [OK]      qml folder found - will embed the Qt Quick interface
+    set "QML_ARGS=--add-data "qml;qml""
+) else (
+    echo   [FAIL]    qml folder not found - the launcher interface cannot be embedded
+    goto :fail
+)
+
+if not exist "..\scripts\bb_guard.py" echo   [WARN]    ..\scripts\bb_guard.py not found - the exe will build without it"
 if not exist "..\scripts\game_check.py" echo   [WARN]    ..\scripts\game_check.py not found - the exe will build without it
 echo.
 
@@ -95,48 +104,71 @@ if not errorlevel 1 (
 )
 echo.
 
-%PY% -m PyInstaller --noconfirm --onefile --windowed ^
-    --name "BloodborneLauncher" ^
-    %ICON_ARGS% ^
-    %DATA_ARGS% ^
-    --distpath ".." ^
-    --paths "." ^
-    --paths "..\scripts" ^
-    --hidden-import "bb_guard" ^
-    --hidden-import "game_check" ^
-    --exclude-module "PySide6.QtWebEngineCore" ^
-    --exclude-module "PySide6.QtWebEngineWidgets" ^
-    --exclude-module "PySide6.QtQml" ^
-    --exclude-module "PySide6.QtQuick" ^
-    --exclude-module "PySide6.Qt3DCore" ^
-    --exclude-module "PySide6.QtNetwork" ^
-    --exclude-module "PySide6.QtMultimedia" ^
-    --exclude-module "PySide6.QtVirtualKeyboard" ^
-    --exclude-module "PySide6.QtPdf" ^
-    --exclude-module "PySide6.QtPdfWidgets" ^
-    --exclude-module "PySide6.QtSvg" ^
-    --exclude-module "PySide6.QtOpenGL" ^
-    --exclude-module "PySide6.QtOpenGLWidgets" ^
-    --exclude-module "PySide6.QtSql" ^
-    --exclude-module "PySide6.QtTest" ^
-    --exclude-module "PySide6.QtXml" ^
-    --exclude-module "PySide6.QtPrintSupport" ^
-    --exclude-module "PySide6.QtDesigner" ^
-    --exclude-module "PySide6.QtHelp" ^
-    --exclude-module "PySide6.QtUiTools" ^
-    --exclude-module "tkinter" ^
-    --exclude-module "unittest" ^
-    --exclude-module "pydoc" ^
-    --exclude-module "doctest" ^
-    --exclude-module "email" ^
-    --exclude-module "http" ^
-    bblauncher_app.py
+if exist BloodborneLauncher.spec (
+    %PY% -m PyInstaller --noconfirm --distpath ".." BloodborneLauncher.spec
+) else (
+    %PY% -m PyInstaller --noconfirm --onedir --windowed ^
+        --optimize 2 ^
+        --contents-directory "_BBLauncherFiles" ^
+        --name "BloodborneLauncher" ^
+        %ICON_ARGS% ^
+        %DATA_ARGS% ^
+        %QML_ARGS% ^
+        --distpath ".." ^
+        --paths "." ^
+        --paths "..\scripts" ^
+        --hidden-import "bb_guard" ^
+        --hidden-import "game_check" ^
+        --hidden-import "prepare" ^
+        --hidden-import "PySide6.QtQml" ^
+        --hidden-import "PySide6.QtQuick" ^
+        --hidden-import "PySide6.QtQuickControls2" ^
+        --exclude-module "PySide6.QtWebEngineCore" ^
+        --exclude-module "PySide6.QtWebEngineWidgets" ^
+        --exclude-module "PySide6.Qt3DCore" ^
+        --exclude-module "PySide6.QtMultimedia" ^
+        --exclude-module "PySide6.QtVirtualKeyboard" ^
+        --exclude-module "PySide6.QtPdf" ^
+        --exclude-module "PySide6.QtPdfWidgets" ^
+        --exclude-module "PySide6.QtSvg" ^
+        --exclude-module "PySide6.QtOpenGLWidgets" ^
+        --exclude-module "PySide6.QtSql" ^
+        --exclude-module "PySide6.QtTest" ^
+        --exclude-module "PySide6.QtXml" ^
+        --exclude-module "PySide6.QtPrintSupport" ^
+        --exclude-module "PySide6.QtDesigner" ^
+        --exclude-module "PySide6.QtHelp" ^
+        --exclude-module "PySide6.QtUiTools" ^
+        --exclude-module "PySide6.QtQuick3D" ^
+        --exclude-module "PySide6.QtQuickDialogs2" ^
+        --exclude-module "PySide6.QtQuickParticles" ^
+        --exclude-module "tkinter" ^
+        --exclude-module "unittest" ^
+        --exclude-module "pydoc" ^
+        --exclude-module "doctest" ^
+        --exclude-module "email" ^
+        --exclude-module "http" ^
+        bblauncher_app.py
+)
 if errorlevel 1 (
     echo.
     echo   [FAIL]    PyInstaller reported an error. See the output above.
     goto :fail
 )
 
+rem ---------- Move the onedir output to the requested layout ----------
+rem PyInstaller puts the exe and its support folder under <dist>\BloodborneLauncher\.
+rem We want the exe next to this script's parent and the support files in
+rem _BBLauncherFiles, so relocate them and drop the staging folder.
+if exist "..\BloodborneLauncher.exe" del /q "..\BloodborneLauncher.exe"
+if exist "..\_BBLauncherFiles" rmdir /s /q "..\_BBLauncherFiles"
+if exist "..\BloodborneLauncher\BloodborneLauncher.exe" (
+    move /y "..\BloodborneLauncher\BloodborneLauncher.exe" "..\BloodborneLauncher.exe" >nul
+)
+if exist "..\BloodborneLauncher\_BBLauncherFiles" (
+    move /y "..\BloodborneLauncher\_BBLauncherFiles" "..\_BBLauncherFiles" >nul
+)
+if exist "..\BloodborneLauncher" rmdir /s /q "..\BloodborneLauncher"
 for %%I in ("%~dp0..") do set "OUT=%%~fI"
 echo.
 echo ============================================

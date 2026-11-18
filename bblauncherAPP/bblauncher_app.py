@@ -14,15 +14,34 @@ if len(sys.argv) > 1 and any(arg.lower().endswith(".py") for arg in sys.argv[1:]
     sys.path.insert(0, str(Path(target_script).parent))
     runpy.run_path(target_script, run_name="__main__")
     sys.exit(0)
+import collections
 import ctypes
 import json
 import os
 import platform
+import shlex
+import shutil
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
-from PySide6.QtCore import QEvent, QTimer, Qt
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> bool:
+    temp_path = path.with_suffix(f"{path.suffix}.tmp_{os.getpid()}")
+    try:
+        temp_path.write_text(content, encoding=encoding)
+        os.replace(temp_path, path)
+        return True
+    except Exception:
+        try:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+from PySide6.QtCore import QEvent, QTimer, Qt, QUrl
 from PySide6.QtGui import QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,17 +49,25 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
-from bblauncher_UI import STYLE_SHEET, LauncherUI, WheelGuard, apply_dwm_styling, install_dialog_styling
+# Native QMessageBox/QInputDialog ignore the Qt Quick palette and open bright
+# white on Windows, so the dark subclasses are imported under the stock names
+# and every call site below stays unchanged.
+from bblauncher_dialogs import DarkInputDialog as QInputDialog
+from bblauncher_dialogs import DarkMessageBox as QMessageBox
+from bblauncher_dialogs import style_dialog
+
+from bblauncher_qmltabs import (
+    LauncherView,
+    WheelGuard,
+)
 from bblauncher_Utils import (
     ANISO_CHOICES,
     APP_DIR,
@@ -60,8 +87,10 @@ from bblauncher_Utils import (
     UPSCALER_CHOICES,
     VK_NOISE,
     ProcessWorker,
+    SetupVerifyWorker,
     acquire_single_instance,
     build_stamp,
+    clear_verify_cache,
     connected_gpus,
     create_save_backup,
     delete_save_backup,
@@ -74,9 +103,11 @@ from bblauncher_Utils import (
     get_active_save_summary,
     get_bb_guard,
     get_game_save_title_id,
+    get_no_window_kwargs,
     get_save_backups_root,
     get_save_data_root,
     import_save_from_zip_or_dir,
+    is_prelaunch_cached,
     kill_tree,
     list_save_backups,
     load_xml_patches,
@@ -122,12 +153,11 @@ def get_launcher_icon() -> QIcon:
     return QIcon()
 
 
-class BloodborneLauncher(LauncherUI, QMainWindow):
+class BloodborneLauncher(LauncherView):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bloodborne PC Launcher")
         self.setFixedSize(1200, 720)
-        self.setStyleSheet(STYLE_SHEET)
 
         app = QApplication.instance()
         if app is not None:
@@ -141,7 +171,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.worker = None
         self.log_fh = None
         self.hidden_count = 0
-        self._log_history = []
+        self._log_history = collections.deque(maxlen=5000)
         self._log_filter = "hide_vk"
         self._run_started = None
         self._path_valid = False
@@ -179,6 +209,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self._setup_timer.setInterval(450)
         self._setup_timer.timeout.connect(self.refresh_setup_status)
 
+        self._verify_worker = None
+        self._verify_generation = 0
+
         self.update_path_state()
         self.update_last_run()
         self.update_home_summary()
@@ -204,12 +237,6 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         QTimer.singleShot(700, self._build_advanced_tab_now)
         QTimer.singleShot(900, self._build_saves_tab_now)
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not getattr(self, "_dwm_applied", False):
-            self._dwm_applied = True
-            apply_dwm_styling(int(self.winId()))
-
     def changeEvent(self, event):
         if event.type() == QEvent.ActivationChange and self.isActiveWindow():
             self.sync_bbport_ini_to_ui()
@@ -225,11 +252,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self.all_xml_patches = load_xml_patches()
             self._update_enabled_patches_from_ini()
             patches_widget = self.create_patches_tab()
-            if hasattr(self, "patches_placeholder"):
+            if hasattr(self, "patches_placeholder") and self.patches_placeholder is not None:
                 idx = self.stack.indexOf(self.patches_placeholder)
                 if idx >= 0:
                     self.stack.removeWidget(self.patches_placeholder)
                     self.patches_placeholder.deleteLater()
+                    self.patches_placeholder = None
                     self.stack.insertWidget(idx, patches_widget)
             self.update_patch_count_label()
         finally:
@@ -244,6 +272,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             if idx >= 0:
                 self.stack.removeWidget(placeholder)
                 placeholder.deleteLater()
+                setattr(self, placeholder_name, None)
                 self.stack.insertWidget(idx, widget)
                 return
         self.stack.addWidget(widget)
@@ -371,12 +400,11 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                         if not pixmap.isNull():
                             lbl_portrait.setPixmap(
                                 pixmap.scaled(
-                                    69, 69,
-                                    Qt.KeepAspectRatioByExpanding,
+                                    68, 68,
+                                    Qt.KeepAspectRatio,
                                     Qt.SmoothTransformation,
                                 )
                             )
-                            lbl_portrait.setScaledContents(True)
 
                     h_layout.addWidget(lbl_portrait)
 
@@ -583,9 +611,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
             chars = b.get("characters", [])
             if chars:
-                char_flow = QHBoxLayout()
-                char_flow.setSpacing(8)
-                for c in chars:
+                row_layout = None
+                for idx, c in enumerate(chars):
+                    if idx % 3 == 0:
+                        row_layout = QHBoxLayout()
+                        row_layout.setSpacing(8)
+                        v_box.addLayout(row_layout)
                     p_clock = c.get("playtime_clock", c.get("playtime_str", ""))
                     loc = c.get("location", "")
                     chip_text = f"<b>{c['name']}</b> (Lv {c['level']} &middot; {p_clock}" + (f" &middot; {loc})" if loc else ")")
@@ -595,13 +626,21 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                         "color: #cfc7b4; background-color: #171922; border: 1px solid #292c3a; "
                         "border-radius: 4px; padding: 3px 8px; font-size: 11px;"
                     )
-                    char_flow.addWidget(lbl_c)
-                char_flow.addStretch()
-                v_box.addLayout(char_flow)
+                    row_layout.addWidget(lbl_c)
+                if row_layout:
+                    row_layout.addStretch()
 
             self.layout_backups_list.addWidget(card)
 
     def handle_create_backup(self):
+        if (self.worker and self.worker.isRunning()) or bool(running_instances()):
+            QMessageBox.warning(
+                self,
+                "Backup Save",
+                "Cannot create save backup while Bloodborne is currently running. Please stop the game first.",
+            )
+            return
+
         eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
         active_save, _ = find_active_save_dir(APP_DIR, eboot_path=eboot)
         if not active_save:
@@ -626,7 +665,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             QMessageBox.critical(self, "Backup Failed", "Failed to create save backup. Check launcher logs.")
 
     def handle_restore_backup(self, folder_path, confirm: bool = True):
-        if self.worker and self.worker.isRunning():
+        if (self.worker and self.worker.isRunning()) or bool(running_instances()):
             QMessageBox.warning(
                 self,
                 "Restore Save",
@@ -696,6 +735,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 self.log(f"[SAVE MANAGER ERROR] Could not open save folder: {e}")
 
     def handle_export_active_save(self):
+        if (self.worker and self.worker.isRunning()) or bool(running_instances()):
+            QMessageBox.warning(
+                self,
+                "Export Save",
+                "Cannot export save data while Bloodborne is currently running. Please stop the game first.",
+            )
+            return
+
         eboot = self.txt_eboot.text().strip() if hasattr(self, "txt_eboot") else ""
         active_save, sce_sys = find_active_save_dir(APP_DIR, eboot_path=eboot)
         if not active_save:
@@ -859,14 +906,11 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             return
         data = self.current_config()
         self.settings = data
-        try:
-            SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        if _atomic_write_text(SETTINGS_FILE, json.dumps(data, indent=2)):
             try:
                 self._last_settings_mtime = SETTINGS_FILE.stat().st_mtime
             except OSError:
                 pass
-        except OSError:
-            pass
         if hasattr(self, "home_chips"):
             self.update_home_summary()
 
@@ -896,6 +940,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
     def on_eboot_path_dropped(self, path: str):
         value = str(path or "").strip().strip('"')
+        if value.lower().startswith("file:"):
+            local = QUrl(value).toLocalFile()
+            if local:
+                value = local
         if not value:
             return
         self.txt_eboot.setText(os.path.normpath(value))
@@ -956,6 +1004,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             "warn": "#f0b429",
             "error": "#e65555",
             "checking": "#f0b429",
+            "waiting": "#f0b429",
             "running": "#4ade80",
             "idle": "#6a6a78",
             "empty": "#6a6a78",
@@ -971,6 +1020,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             "ready": "#4ade80",
             "warn": "#f0b429",
             "checking": "#f0b429",
+            "waiting": "#f0b429",
             "error": "#e65555",
             "empty": "#6a6a78",
         }
@@ -988,6 +1038,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "ready": "\u25cf Ready",
                 "warn": "\u25cf Ready (warnings)",
                 "checking": "\u25cf Checking setup...",
+                "waiting": "\u25cf Checking setup...",
                 "error": "\u25cf Setup needs attention",
                 "empty": "\u25cf Select a game path",
             }
@@ -1015,7 +1066,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 f"color: {colors.get(state, '#5a5a66')}; font-size: 11px; background: transparent;"
             )
 
-    def refresh_setup_status(self):
+    def refresh_setup_status(self, force_refresh: bool = False):
         if hasattr(self, "_setup_timer"):
             self._setup_timer.stop()
         target = self.txt_eboot.text().strip()
@@ -1035,11 +1086,39 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             self._set_setup_checks("fail", "unknown", "unknown")
             return
 
-        try:
-            ready, err, details = verify_prelaunch(game_dir)
-        except Exception as ex:
-            ready, err, details = False, str(ex), []
+        if not force_refresh and is_prelaunch_cached(game_dir):
+            try:
+                ready, err, details = verify_prelaunch(game_dir)
+            except Exception as ex:
+                ready, err, details = False, str(ex), []
+            self._apply_setup_result(ready, err, details)
+            return
 
+        self._verify_generation += 1
+        gen = self._verify_generation
+        self._set_setup_display(
+            "waiting",
+            "Verifying game files and setup...",
+            f"Checking executable integrity and hardware capabilities for:\n{game_dir}",
+        )
+        self._set_setup_checks("unknown", "unknown", "unknown", "unknown")
+
+        if self._verify_worker and self._verify_worker.isRunning():
+            try:
+                self._verify_worker.finished_check.disconnect()
+            except Exception:
+                pass
+
+        self._verify_worker = SetupVerifyWorker(game_dir, gen, force_refresh=force_refresh, parent=self)
+        self._verify_worker.finished_check.connect(self._on_setup_verify_finished)
+        self._verify_worker.start()
+
+    def _on_setup_verify_finished(self, ready: bool, err: str, details: list, generation: int):
+        if generation != self._verify_generation:
+            return
+        self._apply_setup_result(ready, err, details)
+
+    def _apply_setup_result(self, ready: bool, err: str, details: list):
         detail_lines = [str(line) for line in (details or [])]
         if err:
             detail_lines.extend(["", str(err)])
@@ -1096,7 +1175,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             details = self.lbl_setup_summary.text()
         dialog = QDialog(self)
         dialog.setWindowTitle("Setup Details")
-        dialog.setStyleSheet(STYLE_SHEET)
+        style_dialog(dialog)
         dialog.setMinimumSize(620, 360)
         dialog.resize(680, 400)
 
@@ -1195,14 +1274,16 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
     def update_run_clock(self):
         if self._run_started is None:
+            if hasattr(self, "lbl_run_clock"):
+                self.lbl_run_clock.setVisible(False)
             return
         elapsed = max(0, int(time.monotonic() - self._run_started))
         hours, rem = divmod(elapsed, 3600)
         minutes, seconds = divmod(rem, 60)
-        if hours:
-            clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        else:
-            clock = f"{minutes:02d}:{seconds:02d}"
+        clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        if hasattr(self, "lbl_run_clock"):
+            self.lbl_run_clock.setText(clock)
+            self.lbl_run_clock.setVisible(True)
         self._set_run_info("running", f"\u25cf Game Running \u2014 {clock}")
 
     @staticmethod
@@ -1246,8 +1327,12 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         except (TypeError, ValueError):
             rc = None
 
+        stopped = bool(self.settings.get("last_run_stopped", False))
+
         if rc is None:
             result = "result unknown"
+        elif stopped and rc != 0:
+            result = "stopped"
         elif rc == 0:
             result = "exited normally"
         elif rc < 0:
@@ -1263,7 +1348,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.lbl_last_run.setText(text)
         if rc == 0:
             color = "#7fb08a"
-        elif rc is None:
+        elif rc is None or stopped:
             color = "#7c7c88"
         else:
             color = "#e0a33c"
@@ -1460,27 +1545,40 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if not hasattr(self, "lbl_cache_info"):
             return
         cache_dir = self._user_dir() / "cache"
-        files = []
-        if cache_dir.is_dir():
-            try:
-                files = [path for path in cache_dir.rglob("*") if path.is_file()]
-            except OSError:
-                files = []
-        total = 0
-        for path in files:
-            try:
-                total += path.stat().st_size
-            except OSError:
-                pass
-        if files:
-            text = f"Shader cache: {self._format_size(total)} \u00b7 {len(files)} files"
-        else:
-            text = "Shader cache: empty"
-        self.lbl_cache_info.setText(text)
-        self.lbl_cache_info.setToolTip(str(cache_dir))
-        if hasattr(self, "btn_cache"):
-            self.btn_cache.setEnabled(bool(files))
-            self.btn_cache.setToolTip(f"Delete compiled shaders from:\n{cache_dir}")
+
+        def _calc():
+            total = 0
+            count = 0
+            if cache_dir.is_dir():
+                try:
+                    for root, _, files in os.walk(cache_dir):
+                        for f in files:
+                            try:
+                                total += os.path.getsize(os.path.join(root, f))
+                                count += 1
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+
+            def _apply():
+                if not hasattr(self, "lbl_cache_info"):
+                    return
+                if count > 0:
+                    text = f"Shader cache: {self._format_size(total)} \u00b7 {count} files"
+                else:
+                    text = "Shader cache: empty"
+                self.lbl_cache_info.setText(text)
+                self.lbl_cache_info.setToolTip(str(cache_dir))
+                if hasattr(self, "btn_cache"):
+                    self.btn_cache.setEnabled(count > 0)
+                    self.btn_cache.setToolTip(f"Delete compiled shaders from:\n{cache_dir}")
+
+            # Hop back to the GUI thread before touching the label; the worker
+            # thread has no event loop of its own.
+            QTimer.singleShot(0, self, _apply)
+
+        threading.Thread(target=_calc, name="cache-info-worker", daemon=True).start()
 
     @staticmethod
     def _format_size(size: float) -> str:
@@ -1496,12 +1594,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         values = {}
         if ini_path.is_file():
             try:
-                for line in ini_path.read_text(encoding="utf-8").splitlines():
+                content = ini_path.read_text(encoding="utf-8", errors="replace")
+                for line in content.splitlines():
                     trimmed = line.strip()
-                    if trimmed and not trimmed.startswith("#") and "=" in trimmed:
+                    if trimmed and not trimmed.startswith(("#", ";")) and "=" in trimmed:
                         k, v = trimmed.split("=", 1)
-                        values[k.strip()] = v.strip()
-            except OSError:
+                        val = v.split("#")[0].split(";")[0].strip()
+                        values[k.strip()] = val
+            except (OSError, ValueError):
                 pass
         return values
 
@@ -1544,6 +1644,13 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                     prep_workers_val = val
                     break
 
+            aniso_val = "2x"
+            aniso_text = self.cmb_aniso.currentText()
+            for label, val, _ in ANISO_CHOICES:
+                if label == aniso_text:
+                    aniso_val = val
+                    break
+
             keys_to_update.update({
                 "upscaler": upscaler_val,
                 "preset": self.cmb_preset.currentData() or "0",
@@ -1560,6 +1667,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "fsr3_accumulation": f"{self.sl_fsr3_accumulation.value() / 1000:.3f}",
                 "fsr3_min_disocclusion": f"{self.sl_fsr3_min_disocclusion.value() / 1000:.3f}",
                 "output_res": output_res_val,
+                "aniso": aniso_val,
                 "effect_game_aa": effect_game_aa,
                 "prep_workers": prep_workers_val,
                 "async_pipelines": self.cmb_async_pipelines.currentData() or "auto",
@@ -1586,6 +1694,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 "live_fps": "1" if (self.chk_fps_patch.isChecked()
                                     and (self.cmb_fps.currentData() or "60") != "30") else "0",
                 "target_fps": self.cmb_fps.currentData() or "60",
+                "game_language": self.cmb_lang.currentData() or "1",
             })
             for effect_key, chk in self.effect_checks.items():
                 keys_to_update[effect_key] = "1" if chk.isChecked() else "0"
@@ -1606,7 +1715,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 keys_to_update[k] = btn.current_binding
 
         if self._advanced_built:
-            keys_to_update["language"] = self.cmb_menu_lang.currentData() or "en"
+            keys_to_update["menu_language"] = self.cmb_menu_lang.currentData() or "en"
 
         if getattr(self, "_saves_built", False) and hasattr(self, "chk_engine_safepoint"):
             keys_to_update["save_auto_backup"] = "1" if self.chk_engine_safepoint.isChecked() else "0"
@@ -1627,32 +1736,44 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         ini_path = APP_DIR / "bbport.ini"
         lines = []
         written = set()
+        update_map = {k.lower(): (k, str(v)) for k, v in keys_to_update.items()}
         if ini_path.is_file():
             try:
-                for line in ini_path.read_text(encoding="utf-8").splitlines():
+                content = ini_path.read_text(encoding="utf-8", errors="replace")
+                for line in content.splitlines():
                     trimmed = line.strip()
-                    if trimmed and not trimmed.startswith("#") and "=" in trimmed:
-                        key, _ = trimmed.split("=", 1)
-                        key = key.strip()
-                        if key in keys_to_update:
-                            lines.append(f"{key}={keys_to_update[key]}")
-                            written.add(key)
+                    if trimmed and not trimmed.startswith(("#", ";")) and "=" in trimmed:
+                        raw_key, raw_val = trimmed.split("=", 1)
+                        clean_key = raw_key.strip()
+                        key_lower = clean_key.lower()
+                        if key_lower in update_map:
+                            orig_key, new_val = update_map[key_lower]
+                            comment_part = ""
+                            if "#" in raw_val:
+                                comment_part = "  #" + raw_val.split("#", 1)[1]
+                            elif ";" in raw_val:
+                                comment_part = "  ;" + raw_val.split(";", 1)[1]
+                            lines.append(f"{clean_key}={new_val}{comment_part}")
+                            written.add(orig_key)
                             continue
                     lines.append(line)
-            except OSError:
+            except (OSError, ValueError):
                 pass
 
-        for key, value in keys_to_update.items():
-            if key not in written:
-                lines.append(f"{key}={value}")
+        for orig_key, new_val in keys_to_update.items():
+            if orig_key not in written:
+                lines.append(f"{orig_key}={new_val}")
 
-        try:
-            ini_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            self._last_ini_mtime = ini_path.stat().st_mtime
+        output = "\n".join(lines) + "\n"
+        if _atomic_write_text(ini_path, output):
+            try:
+                self._last_ini_mtime = ini_path.stat().st_mtime
+            except OSError:
+                pass
             self.log("[Settings] bbport.ini updated.")
             return True
-        except OSError as ex:
-            self.log(f"[ERROR] Could not write to {ini_path}: {ex}")
+        else:
+            self.log(f"[ERROR] Could not write to {ini_path}")
             return False
 
     def _assign_keybind(self, action_key: str, new_val: str, old_val=None):
@@ -1931,6 +2052,26 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self._set_combo_data(self.cmb_debug_view, ini_opts.get("debug_view", "0"))
         self._set_combo_data(self.cmb_model_lod, ini_opts.get("model_lod", "0"))
 
+        ini_fps = ini_opts.get("target_fps", "").strip()
+        if ini_fps and hasattr(self, "cmb_fps"):
+            self._set_combo_data(self.cmb_fps, ini_fps)
+        if "live_fps" in ini_opts and hasattr(self, "chk_fps_patch"):
+            self._set_check(self.chk_fps_patch, self._ini_bool(ini_opts, "live_fps", True))
+
+        ini_aniso = ini_opts.get("aniso", "").strip().lower()
+        if ini_aniso and hasattr(self, "cmb_aniso"):
+            for idx_a in range(self.cmb_aniso.count()):
+                for label, val, _ in ANISO_CHOICES:
+                    if val.lower() == ini_aniso and self.cmb_aniso.itemText(idx_a) == label:
+                        self.cmb_aniso.blockSignals(True)
+                        self.cmb_aniso.setCurrentIndex(idx_a)
+                        self.cmb_aniso.blockSignals(False)
+                        break
+
+        ini_gpu = ini_opts.get("gpu", "").strip()
+        if ini_gpu and hasattr(self, "cmb_gpu"):
+            self._set_combo_data(self.cmb_gpu, ini_gpu)
+
         ini_pw = ini_opts.get("prep_workers", "auto").strip().lower()
         for label, val in PREP_WORKER_CHOICES:
             if val == ini_pw or (ini_pw == "auto" and val == "auto"):
@@ -2058,7 +2199,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 if self._mk_built:
                     self._sync_mk_from_ini(ini_opts)
                 if self._advanced_built:
-                    self._set_combo_data(self.cmb_menu_lang, ini_opts.get("language", "en").strip().lower())
+                    self._set_combo_data(self.cmb_menu_lang, ini_opts.get("menu_language", ini_opts.get("language", "en")).strip().lower())
                 if self._patches_built:
                     self._sync_patches_from_ini(ini_opts, persist=True)
                 if getattr(self, "_saves_built", False) and hasattr(self, "chk_engine_safepoint"):
@@ -2114,11 +2255,20 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if is_live is None:
             is_live = hasattr(self, "chk_fps_patch") and self.chk_fps_patch.isChecked()
         changed = False
+        if not hasattr(self, "_masked_live_fps_patches"):
+            self._masked_live_fps_patches = set()
         if is_live:
             for p in list(self.enabled_patches):
                 if p in LIVE_FPS_CONFLICTING_PATCHES:
+                    self._masked_live_fps_patches.add(p)
                     self.enabled_patches.discard(p)
                     changed = True
+        else:
+            if self._masked_live_fps_patches:
+                for p in self._masked_live_fps_patches:
+                    self.enabled_patches.add(p)
+                    changed = True
+                self._masked_live_fps_patches.clear()
         if getattr(self, "_patches_built", False) and hasattr(self, "patch_checkboxes"):
             for name, cb in self.patch_checkboxes.items():
                 if name in LIVE_FPS_CONFLICTING_PATCHES:
@@ -2163,22 +2313,19 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             cb.blockSignals(False)
         self.update_patch_count_label()
 
-    def filter_patches(self):
+    def filter_patches(self, immediate: bool = False):
         if not self._patches_built:
+            return
+        if not immediate:
+            if not hasattr(self, "_patch_filter_timer"):
+                self._patch_filter_timer = QTimer(self)
+                self._patch_filter_timer.setSingleShot(True)
+                self._patch_filter_timer.timeout.connect(lambda: self.filter_patches(immediate=True))
+            self._patch_filter_timer.start(120)
             return
         q = self.txt_patch_search.text().strip().lower()
         selected_cat = self.cmb_patch_cat.currentText()
-
-        self.patch_list_widget.setUpdatesEnabled(False)
-        for i in range(self.patch_list_layout.count() - 1):
-            widget = self.patch_list_layout.itemAt(i).widget()
-            if not widget:
-                continue
-            w_cat = widget.property("patch_category")
-            cat_match = (selected_cat == "All Categories") or (w_cat == selected_cat)
-            query_match = not q or (q in widget.property("patch_search_blob"))
-            widget.setVisible(cat_match and query_match)
-        self.patch_list_widget.setUpdatesEnabled(True)
+        self.patch_model.setFilter(q, selected_cat)
 
     def apply_recommended_patches(self):
         self.enabled_patches = {"Skip Intro"}
@@ -2242,8 +2389,9 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             return
 
         self.log("--- Running Pre-Launch Verification Check ---")
-        ready, err, details = verify_prelaunch(game_dir)
+        ready, err, details = verify_prelaunch(game_dir, force_refresh=True)
         self.log_batch([f"  {line}" for line in details])
+        self.refresh_setup_status(force_refresh=True)
 
         if ready:
             self.log("[PRE-LAUNCH] All checks passed.")
@@ -2293,7 +2441,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if not found:
             return False
         guard = get_bb_guard()
-        lines = "\n".join(guard.describe(i) for i in found)
+        if guard:
+            lines = "\n".join(guard.describe(i) for i in found)
+        else:
+            lines = "\n".join(f"PID {getattr(i, 'pid', i)}" for i in found)
         self.log(f"[PRE-LAUNCH] bbport.exe is already running ({lines.replace(chr(10), '; ')})")
         reply = QMessageBox.warning(
             self,
@@ -2304,7 +2455,17 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if reply != QMessageBox.Yes:
             self.log("[PRE-LAUNCH] Launch cancelled: close the running bbport.exe first.")
             return True
-        survivors = [i.pid for i in found if not guard.terminate(i.pid)]
+        if guard:
+            survivors = [i.pid for i in found if not guard.terminate(i.pid)]
+        else:
+            survivors = []
+            for i in found:
+                pid = getattr(i, "pid", i)
+                try:
+                    kwargs = get_no_window_kwargs()
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, **kwargs)
+                except Exception:
+                    survivors.append(pid)
         if survivors:
             self.log(f"[PRE-LAUNCH ERROR] Could not terminate PID {', '.join(map(str, survivors))}")
             QMessageBox.critical(
@@ -2337,6 +2498,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         if self.blocked_by_running_instance():
             return
 
+        # Ensure all secondary tabs are fully initialized before saving and reading launch config
+        if not self._display_built:
+            self._build_display_tab_now()
+        if not self._mk_built:
+            self._build_mk_tab_now()
+        if not self._advanced_built:
+            self._build_advanced_tab_now()
+
         self.save_settings()
         self.save_bbport_ini()
 
@@ -2353,6 +2522,24 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         env = os.environ.copy()
         if not getattr(sys, "frozen", False):
             env["PYTHON"] = sys.executable
+        else:
+            py_candidates = [
+                APP_DIR / "python-embed" / "pythonw.exe",
+                APP_DIR / "python-embed" / "python.exe",
+                APP_DIR / "python" / "pythonw.exe",
+                APP_DIR / "python" / "python.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python" / "Python313" / "python.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python" / "Python314" / "python.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python" / "Python312" / "python.exe",
+                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python" / "Python311" / "python.exe",
+                Path("C:/Program Files/Python313/python.exe"),
+                Path("C:/Program Files/Python314/python.exe"),
+                Path("C:/Program Files/Python312/python.exe"),
+                Path("C:/Program Files/Python311/python.exe"),
+            ]
+            py_bin = next((str(p) for p in py_candidates if p.is_file()), shutil.which("python") or "python")
+            env["PYTHON"] = py_bin
+        env["BB_LIVE_RES"] = "0"
         env["BB_GAME_DIR"] = str(game_dir)
         fps_rate = cfg["fps"]
         # 30 is the native PS4 path in both modes: no FPS patch and no live clock hook.
@@ -2469,8 +2656,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         # is the only switch. Keep the documented default (on for Intel) and let an explicit
         # environment value win.
         if "BB_INTEL_TONEMAP_FIX" not in os.environ:
-            intel = "Intel" in os.environ.get("PROCESSOR_IDENTIFIER", "")
-            wanted = "Intel Black Tonemap Fix" in active_patches or intel
+            wanted = "Intel Black Tonemap Fix" in active_patches
             env["BB_INTEL_TONEMAP_FIX"] = "1" if wanted else "0"
             if wanted and "Intel Black Tonemap Fix" not in active_patches:
                 active_patches.append("Intel Black Tonemap Fix")
@@ -2522,10 +2708,10 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
 
         extra_args = str(cfg.get("extra_args", "")).strip()
         if os.name == "nt":
-            bat_cmd = RUN_BAT.name + (f" {extra_args}" if extra_args else "")
-            cmd = ["cmd.exe", "/d", "/c", bat_cmd]
+            args_list = shlex.split(extra_args, posix=False) if extra_args else []
+            cmd = ["cmd.exe", "/d", "/c", RUN_BAT.name] + args_list
         else:
-            cmd = [str(RUN_BAT)]
+            cmd = [str(RUN_BAT)] + (shlex.split(extra_args) if extra_args else [])
 
         self.save_settings()
         self.save_bbport_ini()
@@ -2574,10 +2760,14 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
             duration = max(0, int(time.monotonic() - self._run_started))
         self._run_started = None
         self.run_timer.stop()
+        if hasattr(self, "lbl_run_clock"):
+            self.lbl_run_clock.setVisible(False)
 
+        stopped = bool(self._stop_requested)
         self.settings["last_run_time"] = datetime.now().isoformat(timespec="seconds")
         self.settings["last_run_rc"] = rc
         self.settings["last_run_duration"] = duration
+        self.settings["last_run_stopped"] = stopped
 
         if self.hidden_count:
             self.log(f"({self.hidden_count} console lines hidden by the active filter)")
@@ -2607,7 +2797,7 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
         self.btn_launch.setEnabled(self._path_valid)
         self.btn_stop.setEnabled(False)
         self.lbl_status.setText("\u25cf Engine Idle")
-        self.lbl_status.setStyleSheet("color: #6a6a78; font-size: 11px; padding: 0 20px; background: transparent;")
+        self.lbl_status.setStyleSheet("color: #9da0b0; font-size: 11px; padding: 0 20px; background: transparent;")
         if self._path_valid and self._setup_kind in ("warn", "error"):
             label = "\u25cf Ready (warnings)" if self._setup_kind == "warn" else "\u25cf Setup needs attention"
             self._set_run_info(self._setup_kind, label)
@@ -2634,32 +2824,18 @@ class BloodborneLauncher(LauncherUI, QMainWindow):
                 return
             self._stop_requested = True
             self.worker.terminate_proc()
-            # Give the reader thread time to observe EOF before the QThread is destroyed.
-            self.worker.wait(5000)
-        elif self.worker is not None:
-            # The wrapper exited but the game may still be alive.
-            self.worker.terminate_proc()
+            self.worker.wait(1500)
+        if self._verify_worker and self._verify_worker.isRunning():
+            try:
+                self._verify_worker.finished_check.disconnect()
+            except Exception:
+                pass
+            self._verify_worker.wait(1000)
         self.save_settings()
         event.accept()
 
 
 if __name__ == "__main__":
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Bloodborne.PC.Launcher")
-        except Exception:
-            pass
+    from bblauncher_qml import run
 
-    app = QApplication(sys.argv)
-    launcher_icon = get_launcher_icon()
-    if not launcher_icon.isNull():
-        app.setWindowIcon(launcher_icon)
-    install_dialog_styling(app)
-
-    if not acquire_single_instance():
-        QMessageBox.information(None, "Bloodborne PC Launcher", "The launcher is already open.")
-        sys.exit(0)
-
-    window = BloodborneLauncher()
-    window.show()
-    sys.exit(app.exec())
+    sys.exit(run())

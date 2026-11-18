@@ -1,0 +1,15 @@
+module Launcher
+singleton Theme 1.0 Theme.qml
+Card 1.0 Card.qml
+AppButton 1.0 AppButton.qml
+AppField 1.0 AppField.qml
+AppCombo 1.0 AppCombo.qml
+AppCheck 1.0 AppCheck.qml
+AppSlider 1.0 AppSlider.qml
+NavItem 1.0 NavItem.qml
+ScrollPage 1.0 ScrollPage.qml
+SectionTitle 1.0 SectionTitle.qml
+Pill 1.0 Pill.qml
+AnimatedStack 1.0 AnimatedStack.qml
+LogConsole 1.0 LogConsole.qml
+KeybindRow 1.0 KeybindRow.qml

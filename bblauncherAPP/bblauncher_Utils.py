@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +34,7 @@ LOG_KEEP = 20
 SETTINGS_FILE = APP_DIR / "bblauncher_settings.json"
 PATCHES_XML = APP_DIR / "patches" / "Bloodborne.xml"
 DEFAULT_GAME = Path(os.environ.get("BB_GAME_DIR", "../CUSA03173"))
-LAUNCHER_VERSION = "0.9.0"
+LAUNCHER_VERSION = "1.0.0"
 
 
 def build_stamp() -> str:
@@ -174,6 +175,19 @@ PREP_WORKER_CHOICES = [
 VK_NOISE = "<Warning> vk_instance.cpp"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+
+def get_no_window_kwargs() -> dict:
+    """Return creation flags and hidden startup info to suppress console window flashing on Windows."""
+    if os.name != "nt":
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        "startupinfo": si,
+    }
+
 # All 21 text languages supported by Bloodborne (PS4 system language code)
 LANGUAGE_CHOICES = [
     ("English (United States)", "1"),
@@ -199,8 +213,168 @@ LANGUAGE_CHOICES = [
     ("Norwegian", "15"),
 ]
 
-def connected_gpus(app_dir: Path = APP_DIR) -> list:
-    """(index, vendor_id, type, name, is_best) of GPUs in Vulkan order via bb-gpu-capabilities.exe --gpus"""
+_CACHED_GPUS = None
+
+
+def _query_vulkan_gpus_direct() -> list:
+    """Enumerate Vulkan physical devices directly in-process via ctypes (zero subprocesses, zero windows)."""
+    try:
+        vk = ctypes.CDLL("vulkan-1.dll")
+    except Exception:
+        return []
+
+    from ctypes import c_uint32, c_uint64, c_char, c_void_p, Structure, POINTER, byref, c_int
+
+    class VkAppInfo(Structure):
+        _fields_ = [
+            ("sType", c_uint32),
+            ("pNext", c_void_p),
+            ("pAppName", ctypes.c_char_p),
+            ("appVersion", c_uint32),
+            ("pEngineName", ctypes.c_char_p),
+            ("engineVersion", c_uint32),
+            ("apiVersion", c_uint32),
+        ]
+
+    class VkInstanceCreateInfo(Structure):
+        _fields_ = [
+            ("sType", c_uint32),
+            ("pNext", c_void_p),
+            ("flags", c_uint32),
+            ("pAppInfo", POINTER(VkAppInfo)),
+            ("layerCount", c_uint32),
+            ("ppLayers", c_void_p),
+            ("extCount", c_uint32),
+            ("ppExts", c_void_p),
+        ]
+
+    class VkLimits(Structure):
+        _fields_ = [("dummy", ctypes.c_uint8 * 504)]
+
+    class VkSparseProperties(Structure):
+        _fields_ = [
+            ("residencyStandard2DBlockShape", c_uint32),
+            ("residencyStandard2DMultisampleBlockShape", c_uint32),
+            ("residencyStandard3DBlockShape", c_uint32),
+            ("residencyAlignedMipSize", c_uint32),
+            ("residencyNonResidentStrict", c_uint32),
+        ]
+
+    class VkPhysicalDeviceProperties(Structure):
+        _fields_ = [
+            ("apiVersion", c_uint32),
+            ("driverVersion", c_uint32),
+            ("vendorID", c_uint32),
+            ("deviceID", c_uint32),
+            ("deviceType", c_uint32),
+            ("deviceName", c_char * 256),
+            ("pipelineCacheUUID", ctypes.c_uint8 * 16),
+            ("limits", VkLimits),
+            ("sparseProperties", VkSparseProperties),
+        ]
+
+    class VkMemoryType(Structure):
+        _fields_ = [("propertyFlags", c_uint32), ("heapIndex", c_uint32)]
+
+    class VkMemoryHeap(Structure):
+        _fields_ = [("size", c_uint64), ("flags", c_uint32)]
+
+    class VkPhysicalDeviceMemoryProperties(Structure):
+        _fields_ = [
+            ("memoryTypeCount", c_uint32),
+            ("memoryTypes", VkMemoryType * 32),
+            ("memoryHeapCount", c_uint32),
+            ("memoryHeaps", VkMemoryHeap * 16),
+        ]
+
+    try:
+        vk.vkCreateInstance.restype = c_int
+        vk.vkCreateInstance.argtypes = [POINTER(VkInstanceCreateInfo), c_void_p, POINTER(c_void_p)]
+        vk.vkEnumeratePhysicalDevices.restype = c_int
+        vk.vkEnumeratePhysicalDevices.argtypes = [c_void_p, POINTER(c_uint32), POINTER(c_void_p)]
+        vk.vkGetPhysicalDeviceProperties.restype = None
+        vk.vkGetPhysicalDeviceProperties.argtypes = [c_void_p, POINTER(VkPhysicalDeviceProperties)]
+        vk.vkGetPhysicalDeviceMemoryProperties.restype = None
+        vk.vkGetPhysicalDeviceMemoryProperties.argtypes = [c_void_p, POINTER(VkPhysicalDeviceMemoryProperties)]
+        vk.vkDestroyInstance.restype = None
+        vk.vkDestroyInstance.argtypes = [c_void_p, c_void_p]
+
+        app = VkAppInfo(1, None, b"bbport", 0, None, 0, (1 << 22) | (3 << 12))
+        create = VkInstanceCreateInfo(2, None, 0, POINTER(VkAppInfo)(app), 0, None, 0, None)
+        inst = c_void_p()
+        if vk.vkCreateInstance(byref(create), None, byref(inst)) != 0:
+            return []
+
+        count = c_uint32(0)
+        if vk.vkEnumeratePhysicalDevices(inst, byref(count), None) != 0 or count.value == 0:
+            vk.vkDestroyInstance(inst, None)
+            return []
+
+        devs = (c_void_p * count.value)()
+        if vk.vkEnumeratePhysicalDevices(inst, byref(count), devs) != 0:
+            vk.vkDestroyInstance(inst, None)
+            return []
+
+        def get_largest_heap(dev):
+            mem = VkPhysicalDeviceMemoryProperties()
+            vk.vkGetPhysicalDeviceMemoryProperties(dev, byref(mem))
+            largest = 0
+            for h in range(mem.memoryHeapCount):
+                if (mem.memoryHeaps[h].flags & 1) and mem.memoryHeaps[h].size > largest:
+                    largest = mem.memoryHeaps[h].size
+            return largest
+
+        def is_better(cand_dev, cand_prop, best_dev, best_prop):
+            c_api = 1 if cand_prop.apiVersion >= (1 << 22) | (3 << 12) else 0
+            b_api = 1 if best_prop.apiVersion >= (1 << 22) | (3 << 12) else 0
+            if c_api != b_api:
+                return c_api > b_api
+            c_disc = 1 if cand_prop.deviceType == 2 else 0
+            b_disc = 1 if best_prop.deviceType == 2 else 0
+            if c_disc != b_disc:
+                return c_disc > b_disc
+            c_cpu = 1 if cand_prop.deviceType == 4 else 0
+            b_cpu = 1 if best_prop.deviceType == 4 else 0
+            if c_cpu != b_cpu:
+                return c_cpu < b_cpu
+            return get_largest_heap(cand_dev) > get_largest_heap(best_dev)
+
+        props_list = []
+        best_idx = 0
+        for i in range(count.value):
+            p = VkPhysicalDeviceProperties()
+            vk.vkGetPhysicalDeviceProperties(devs[i], byref(p))
+            props_list.append(p)
+            if i > 0 and is_better(devs[i], p, devs[best_idx], props_list[best_idx]):
+                best_idx = i
+
+        types_map = {1: "integrated", 2: "discrete", 3: "virtual", 4: "cpu"}
+        results = []
+        for i in range(count.value):
+            p = props_list[i]
+            name = p.deviceName.decode("utf-8", "replace").rstrip("\x00")
+            k = types_map.get(p.deviceType, "other")
+            results.append((i, f"0x{p.vendorID:04x}", k, name, i == best_idx))
+
+        vk.vkDestroyInstance(inst, None)
+        return results
+    except Exception:
+        return []
+
+
+def connected_gpus(app_dir: Path = APP_DIR, refresh: bool = False) -> list:
+    """(index, vendor_id, type, name, is_best) of GPUs in Vulkan order."""
+    global _CACHED_GPUS
+    if _CACHED_GPUS is not None and not refresh:
+        return _CACHED_GPUS
+
+    # Pure in-process query via ctypes: zero subprocesses, zero windows
+    gpus = _query_vulkan_gpus_direct()
+    if gpus:
+        _CACHED_GPUS = gpus
+        return gpus
+
+    # Fallback to external executable only if in-process query returned nothing
     candidates = [
         app_dir / "out" / "bb-gpu-capabilities.exe",
         app_dir / "bb-gpu-capabilities.exe",
@@ -208,14 +382,29 @@ def connected_gpus(app_dir: Path = APP_DIR) -> list:
     ]
     tool = next((c for c in candidates if c.is_file()), None)
     if not tool:
+        # Do not cache an empty result: the probe may simply be unavailable yet
+        # (driver initialising, tool copied in later).  Retry on the next call.
         return []
     env = {k: v for k, v in os.environ.items() if k != "BB_GPU_ID"}
     try:
-        res = subprocess.run([str(tool), "--gpus"], capture_output=True, text=True, timeout=8, env=env, creationflags=NO_WINDOW)
-    except (OSError, subprocess.SubprocessError):
+        kwargs = get_no_window_kwargs()
+        res = subprocess.run(
+            [str(tool), "--gpus"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            env=env,
+            **kwargs,
+        )
+        rows = [ln.split("\t") for ln in res.stdout.splitlines() if ln.count("\t") == 4]
+        parsed = [(int(idx), vendor, kind, name, best == "1") for idx, vendor, kind, name, best in rows if idx.isdigit()]
+        if parsed:
+            _CACHED_GPUS = parsed
+        return parsed
+    except Exception:
         return []
-    rows = [ln.split("\t") for ln in res.stdout.splitlines() if ln.count("\t") == 4]
-    return [(int(idx), vendor, kind, name, best == "1") for idx, vendor, kind, name, best in rows if idx.isdigit()]
 
 DEFAULT_SETTINGS = {
     "eboot": "",
@@ -435,12 +624,18 @@ def acquire_single_instance() -> bool:
     if os.name != "nt":
         return True
     try:
+        from ctypes import wintypes
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         name = "Local\\BloodborneLauncher_" + hashlib.md5(str(APP_DIR).lower().encode()).hexdigest()[:12]
         handle = kernel32.CreateMutexW(None, False, name)
         if handle and ctypes.get_last_error() == 183:
+            kernel32.CloseHandle(handle)
             return False
-        _instance_mutex.append(handle)
+        if handle:
+            _instance_mutex.append(handle)
     except Exception:
         pass
     return True
@@ -493,13 +688,14 @@ def _taskkill_tree(pid: int) -> bool:
     if os.name != "nt":
         return False
     try:
+        kwargs = get_no_window_kwargs()
         result = subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(pid)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=8,
-            creationflags=NO_WINDOW,
+            **kwargs,
         )
         return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -622,7 +818,11 @@ LIVE_CLOCK_SIGNATURES = (
 )
 
 
-def check_live_clock_signature(game_dir: Path) -> tuple[bool, str]:
+def check_live_clock_signature(
+    game_dir: Path,
+    data: bytes | None = None,
+    parsed_elf: tuple | None = None,
+) -> tuple[bool, str]:
     """Verify the CUSA03173 v1.09 eboot bytes used by the live FPS clock hook.
 
     The loader maps guest vaddr 0 to image offset 0. Parse the PS4 SELF with the same
@@ -632,18 +832,26 @@ def check_live_clock_signature(game_dir: Path) -> tuple[bool, str]:
     eboot_path = find_eboot_file(game_dir)
     if not eboot_path:
         return False, "could not find eboot.bin or eboot.elf"
-    try:
-        data = eboot_path.read_bytes()
-    except OSError as ex:
-        return False, f"could not read eboot.bin ({ex})"
-    try:
-        scripts_dir = str(APP_DIR / "scripts")
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        from prepare import parse_self
-        elf, _header, ph, _segments, _missing = parse_self(data, eboot_path.name)
-    except Exception as ex:
-        return False, f"eboot.bin could not be parsed ({ex})"
+
+    elf = None
+    ph = None
+    if parsed_elf is not None:
+        elf, ph = parsed_elf
+    else:
+        if data is None:
+            try:
+                data = eboot_path.read_bytes()
+            except OSError as ex:
+                return False, f"could not read eboot.bin ({ex})"
+        try:
+            scripts_dir = str(APP_DIR / "scripts")
+            if scripts_dir not in sys.path:
+                sys.path.insert(0, scripts_dir)
+            from prepare import parse_self
+            elf, _header, ph, _segments, _missing = parse_self(data, eboot_path.name)
+        except Exception as ex:
+            return False, f"eboot.bin could not be parsed ({ex})"
+
     loads = [p for p in ph if p["type"] in (1, 0x61000010)]
     if not loads:
         return False, "eboot.bin has no loadable segments"
@@ -664,32 +872,106 @@ def check_live_clock_signature(game_dir: Path) -> tuple[bool, str]:
     return True, "live clock signature verified"
 
 
-def verify_prelaunch(game_dir: Path) -> tuple[bool, str, list[str]]:
+_VERIFY_CACHE: dict[str, tuple[float, int, bool, str, list[str]]] = {}
+
+
+def _engine_ready_artifacts() -> bool:
+    """True when the engine files that prelaunch verification checks exist.
+
+    The cache key is only the eboot's mtime/size, so a result recorded while
+    run.bat or out/bbport.exe was missing would be served unchanged after the
+    user builds them (and the reverse), with no eboot change to invalidate it.
+    """
+    return RUN_BAT.is_file() and (APP_DIR / "out" / "bbport.exe").is_file()
+
+
+def _store_verify_cache(cache_key: str, mtime: float, size: int, res) -> None:
+    """Record a verification result, but only while the engine files exist."""
+    if not _engine_ready_artifacts():
+        _VERIFY_CACHE.pop(cache_key, None)
+        return
+    _VERIFY_CACHE[cache_key] = (mtime, size, res[0], res[1], res[2])
+
+
+def clear_verify_cache(game_dir: Path | None = None) -> None:
+    """Invalidate prelaunch verification cache for a path or all paths."""
+    global _VERIFY_CACHE
+    if game_dir is None:
+        _VERIFY_CACHE.clear()
+    else:
+        _VERIFY_CACHE.pop(str(game_dir.resolve()), None)
+
+
+def is_prelaunch_cached(game_dir: Path) -> bool:
+    """Check whether a valid prelaunch check result is already cached in memory."""
+    eboot_path = find_eboot_file(game_dir)
+    if not eboot_path:
+        return False
+    try:
+        st = eboot_path.stat()
+    except OSError:
+        return False
+    cache_key = str(game_dir.resolve())
+    if cache_key in _VERIFY_CACHE and _engine_ready_artifacts():
+        cached_mtime, cached_size, _ready, _err, _details = _VERIFY_CACHE[cache_key]
+        return cached_mtime == st.st_mtime and cached_size == st.st_size
+    return False
+
+
+def verify_prelaunch(game_dir: Path, force_refresh: bool = False) -> tuple[bool, str, list[str]]:
     details = []
 
     eboot_path = find_eboot_file(game_dir)
     if not eboot_path:
         return False, f"Missing eboot.bin or eboot.elf in game directory:\n{game_dir}", details
-    eboot_size = eboot_path.stat().st_size
+    try:
+        st = eboot_path.stat()
+        eboot_size = st.st_size
+        eboot_mtime = st.st_mtime
+    except OSError as ex:
+        return False, f"Could not access {eboot_path.name}: {ex}", details
+
     if eboot_size == 0:
         return False, f"{eboot_path.name} is empty in:\n{eboot_path}", details
+
+    cache_key = str(game_dir.resolve())
+    if not force_refresh and _engine_ready_artifacts() and cache_key in _VERIFY_CACHE:
+        cached_mtime, cached_size, cached_ready, cached_err, cached_details = _VERIFY_CACHE[cache_key]
+        if cached_mtime == eboot_mtime and cached_size == eboot_size:
+            return cached_ready, cached_err, list(cached_details)
+
     details.append(f"[OK] Game executable: {eboot_path.name} ({eboot_size / (1024*1024):.1f} MiB)")
 
+    parsed_elf = None
+    data = None
     try:
         scripts_dir = str(APP_DIR / "scripts")
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
         import game_check
-        chk = game_check.problem(str(game_dir))
+        from prepare import parse_self, span
+
+        data = eboot_path.read_bytes()
+        elf, header, ph, _segments, _missing = parse_self(data, name=eboot_path.name)
+        loads = [p for p in ph if p["type"] in (1, 0x61000010)]
+        image = bytearray(max(p["vaddr"] + p["memsz"] for p in loads))
+        for p in loads:
+            image[p["vaddr"]:p["vaddr"] + p["filesz"]] = span(elf, p["offset"], p["filesz"])
+        img_hash = hashlib.sha256(image).hexdigest()
+
+        chk = game_check.problem(str(game_dir), image_hash=img_hash)
         if chk:
             kind, title, version = chk
             explanation = game_check.explain(kind, title, version)
-            return False, f"Game File Verification Failed ({kind}):\n\n{explanation}", details
+            res = (False, f"Game File Verification Failed ({kind}):\n\n{explanation}", details)
+            _store_verify_cache(cache_key, eboot_mtime, eboot_size, res)
+            return res
         details.append("[OK] Game Title & Version: Bloodborne CUSA03173 v1.09 verified")
+        parsed_elf = (elf, ph)
     except Exception:
         details.append("[NOTE] Version check bypassed (standalone)")
 
-    live_ok, live_msg = check_live_clock_signature(game_dir)
+    live_ok, live_msg = check_live_clock_signature(game_dir, data=data, parsed_elf=parsed_elf)
     if live_ok:
         details.append(f"[OK] FPS patch: {live_msg}")
     else:
@@ -700,87 +982,50 @@ def verify_prelaunch(game_dir: Path) -> tuple[bool, str, list[str]]:
         details.append("[OK] Asset directory: dvdroot_ps4 detected")
 
     if not RUN_BAT.exists():
-        return False, f"Launcher script run.bat not found in:\n{APP_DIR}", details
+        res = (False, f"Launcher script run.bat not found in:\n{APP_DIR}", details)
+        _store_verify_cache(cache_key, eboot_mtime, eboot_size, res)
+        return res
     details.append("[OK] Launcher script: run.bat ready")
 
     bbport_exe = APP_DIR / "out" / "bbport.exe"
     if not bbport_exe.is_file():
-        return False, f"Compiled binary bbport.exe missing at:\n{bbport_exe}\nRun build.bat first.", details
+        res = (False, f"Compiled binary bbport.exe missing at:\n{bbport_exe}\nRun build.bat first.", details)
+        _store_verify_cache(cache_key, eboot_mtime, eboot_size, res)
+        return res
     details.append(f"[OK] Compiled binary: bbport.exe ({bbport_exe.stat().st_size / (1024*1024):.1f} MiB)")
 
     try:
         vk = ctypes.CDLL("vulkan-1.dll")
         details.append("[OK] Vulkan runtime: vulkan-1.dll loaded")
-        if os.name == "nt" and hasattr(vk, "_handle") and vk._handle:
-            ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(vk._handle))
     except OSError:
         details.append("[WARN] vulkan-1.dll not detected in system path")
 
     # CPU instruction check: AVX 1.0 support
     avx_ok, avx_msg = check_cpu_avx_support()
     if not avx_ok:
-        return False, f"Hardware Incompatibility (Unsupported CPU):\n\n{avx_msg}", details
+        res = (False, f"Hardware Incompatibility (Unsupported CPU):\n\n{avx_msg}", details)
+        _store_verify_cache(cache_key, eboot_mtime, eboot_size, res)
+        return res
     details.append("[OK] CPU Architecture: AVX 1.0+ vector extensions verified")
 
-    return True, "", details
+    res = (True, "", details)
+    _store_verify_cache(cache_key, eboot_mtime, eboot_size, res)
+    return res
 
 
 def check_cpu_avx_support() -> tuple[bool, str]:
     if os.name != "nt":
         return True, ""
     try:
-        kernel32 = ctypes.windll.kernel32
-        kernel32.VirtualAlloc.restype = ctypes.c_void_p
-        kernel32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
-        kernel32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
-
-        shellcode = bytes([
-            0x53,                               # push rbx
-            0xB8, 0x01, 0x00, 0x00, 0x00,       # mov eax, 1
-            0x31, 0xC9,                         # xor ecx, ecx
-            0x0F, 0xA2,                         # cpuid
-            0xF7, 0xC1, 0x00, 0x00, 0x00, 0x10, # test ecx, 10000000h (bit 28 - AVX)
-            0x74, 0x1A,                         # jz no_avx
-            0xF7, 0xC1, 0x00, 0x00, 0x00, 0x08, # test ecx, 08000000h (bit 27 - OSXSAVE)
-            0x74, 0x18,                         # jz no_osxsave
-            0x31, 0xC9,                         # xor ecx, ecx
-            0x0F, 0x01, 0xD0,                   # xgetbv (eax:edx = XCR0)
-            0x83, 0xE0, 0x06,                   # and eax, 6 (bit 1=XMM, bit 2=YMM)
-            0x83, 0xF8, 0x06,                   # cmp eax, 6
-            0x75, 0x0B,                         # jne no_osxsave
-            0xB8, 0x01, 0x00, 0x00, 0x00,       # mov eax, 1 (AVX OK)
-            0x5B,                               # pop rbx
-            0xC3,                               # ret
-            # no_osxsave:
-            0xB8, 0xFF, 0xFF, 0xFF, 0xFF,       # mov eax, -1
-            0x5B,                               # pop rbx
-            0xC3,                               # ret
-            # no_avx:
-            0x31, 0xC0,                         # xor eax, eax
-            0x5B,                               # pop rbx
-            0xC3                                # ret
-        ])
-        ptr = kernel32.VirtualAlloc(None, len(shellcode), 0x3000, 0x40)
-        if not ptr:
-            return True, ""
-        ctypes.memmove(ptr, shellcode, len(shellcode))
-        fn = ctypes.CFUNCTYPE(ctypes.c_int32)(ptr)
-        status = fn()
-        kernel32.VirtualFree(ptr, 0, 0x8000)
-
-        if status == 0:
+        # PF_AVX_INSTRUCTIONS_AVAILABLE = 28
+        has_avx = ctypes.windll.kernel32.IsProcessorFeaturePresent(28)
+        if not has_avx:
             return False, (
                 "Your CPU lacks support for AVX (Advanced Vector Extensions 1.0).\n\n"
                 "Bloodborne and native PS4 system libraries are built with -mavx and "
                 "require AVX hardware instructions to run.\n\n"
                 "Older processors without AVX (such as Intel Core 2 Quad, Nehalem/Westmere "
                 "Xeon X56xx, or first-gen Core i7) cannot execute these binaries."
-            )
-        elif status == -1:
-            return False, (
-                "Your CPU supports AVX, but AVX state saving (OSXSAVE / XCR0 YMM) is disabled "
-                "or masked by the operating system / hypervisor.\n\n"
-                "If running inside a virtual machine or hypervisor, please enable AVX/XSAVE passthrough."
             )
         return True, ""
     except Exception:
@@ -806,6 +1051,7 @@ class ProcessWorker(QThread):
             self.process_finished.emit(-1)
             return
         try:
+            kwargs = get_no_window_kwargs()
             self.proc = subprocess.Popen(
                 self.cmd,
                 cwd=str(self.cwd),
@@ -813,11 +1059,13 @@ class ProcessWorker(QThread):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                creationflags=NO_WINDOW,
+                **kwargs,
             )
             # Close the race between the check above and Popen returning.
             if self._stop_requested:
                 kill_tree(self.proc)
+                self.process_finished.emit(-1)
+                return
         except Exception as ex:
             self.batch_emitted.emit([f"Launch Error: {ex}"])
             self.process_finished.emit(-1)
@@ -830,7 +1078,7 @@ class ProcessWorker(QThread):
             for raw in iter(self.proc.stdout.readline, b""):
                 batch.append(decode_line(raw).rstrip())
                 now = time.monotonic()
-                if len(batch) >= 60 or (now - last_flush) >= 0.035:
+                if len(batch) >= 100 or (now - last_flush) >= 0.080:
                     self.batch_emitted.emit(batch)
                     batch = []
                     last_flush = now
@@ -840,15 +1088,44 @@ class ProcessWorker(QThread):
             self.batch_emitted.emit([f"Read error: {ex}"])
         finally:
             try:
-                self.proc.stdout.close()
-            except OSError:
+                if self.proc and self.proc.stdout:
+                    self.proc.stdout.close()
+            except (OSError, Exception):
                 pass
-            rc = self.proc.wait()
+            rc = -1
+            if self.proc:
+                try:
+                    rc = self.proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    kill_tree(self.proc)
+                    try:
+                        rc = self.proc.wait(timeout=2.0)
+                    except Exception:
+                        rc = -1
+                except (OSError, Exception):
+                    rc = -1
             self.process_finished.emit(rc)
 
     def terminate_proc(self):
         self._stop_requested = True
         kill_tree(self.proc)
+
+
+class SetupVerifyWorker(QThread):
+    finished_check = Signal(bool, str, list, int)
+
+    def __init__(self, game_dir: Path, generation: int, force_refresh: bool = False, parent=None):
+        super().__init__(parent)
+        self.game_dir = game_dir
+        self.generation = generation
+        self.force_refresh = force_refresh
+
+    def run(self):
+        try:
+            ready, err, details = verify_prelaunch(self.game_dir, force_refresh=self.force_refresh)
+        except Exception as ex:
+            ready, err, details = False, str(ex), []
+        self.finished_check.emit(ready, err, details, self.generation)
 
 
 # ==============================================================================
@@ -982,7 +1259,7 @@ def parse_userdata0010(file_path: Path) -> list[dict]:
             name_clean = "".join(ch for ch in name_raw if ch.isprintable()).strip()
             level, playtime_secs, echoes = struct.unpack_from("<III", data, base + 0x38)
             area_id = struct.unpack_from("<I", data, base + 0x48)[0] if base + 0x4C <= len(data) else 0
-            if name_clean and (level > 0 or playtime_secs > 0):
+            if name_clean and (1 <= level <= 544) and (0 <= playtime_secs < 3600 * 2000):
                 h = int(playtime_secs) // 3600
                 m = (int(playtime_secs) % 3600) // 60
                 s = int(playtime_secs) % 60
@@ -1160,8 +1437,6 @@ def find_active_save_dir(base_dir: Path = None, eboot_path: Path | str = None) -
                 if old_sce and old_sce.is_dir():
                     new_sce = new_sprj.parent / f"{new_sprj.name}.sce_sys"
                     shutil.copytree(old_sce, new_sce, dirs_exist_ok=True)
-                    shutil.rmtree(old_sce, ignore_errors=True)
-                shutil.rmtree(old_sprj.parent, ignore_errors=True)
                 return new_sprj, _find_sce_sys(new_sprj)
             except OSError:
                 return old_sprj, _find_sce_sys(old_sprj)
@@ -1386,21 +1661,28 @@ def restore_save_backup(backup_folder: Path | str, base_dir: Path = None, eboot_
         # Ensure destination is the canonical target_title directory
         if sprj_dir.parent.name != target_title:
             user_id = sprj_dir.parent.parent.name if sprj_dir.parent.parent != save_root else "1"
-            old_parent = sprj_dir.parent
             sprj_dir = save_root / user_id / target_title / "SPRJ0005"
             sprj_dir.mkdir(parents=True, exist_ok=True)
-            shutil.rmtree(old_parent, ignore_errors=True)
 
-    # Clear active save files and copy backup in
+    # Clear active save files safely by staging into a temp directory first
     try:
-        for f in sprj_dir.iterdir():
-            if f.is_file():
-                f.unlink(missing_ok=True)
-            elif f.is_dir():
-                shutil.rmtree(f, ignore_errors=True)
-        for f in src_sprj.iterdir():
-            if f.is_file():
+        temp_stage = sprj_dir.parent / f"_stage_{uuid.uuid4().hex[:8]}"
+        temp_stage.mkdir(parents=True, exist_ok=True)
+        try:
+            for f in src_sprj.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, temp_stage / f.name)
+            if not (temp_stage / "userdata0010").is_file():
+                return False
+            for f in sprj_dir.iterdir():
+                if f.is_file():
+                    f.unlink(missing_ok=True)
+                elif f.is_dir():
+                    shutil.rmtree(f, ignore_errors=True)
+            for f in temp_stage.iterdir():
                 shutil.copy2(f, sprj_dir / f.name)
+        finally:
+            shutil.rmtree(temp_stage, ignore_errors=True)
 
         src_sce = bpath / "SPRJ0005.sce_sys"
         if not src_sce.is_dir() and (src_sprj / "sce_sys").is_dir():
@@ -1411,14 +1693,21 @@ def restore_save_backup(backup_folder: Path | str, base_dir: Path = None, eboot_
         if src_sce.is_dir():
             dst_sce = sprj_dir.parent / f"{sprj_dir.name}.sce_sys"
             dst_sce.mkdir(parents=True, exist_ok=True)
-            for f in dst_sce.iterdir():
-                if f.is_file():
-                    f.unlink(missing_ok=True)
-                elif f.is_dir():
-                    shutil.rmtree(f, ignore_errors=True)
-            for f in src_sce.iterdir():
-                if f.is_file():
+            temp_sce = sprj_dir.parent / f"_stagesce_{uuid.uuid4().hex[:8]}"
+            temp_sce.mkdir(parents=True, exist_ok=True)
+            try:
+                for f in src_sce.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, temp_sce / f.name)
+                for f in dst_sce.iterdir():
+                    if f.is_file():
+                        f.unlink(missing_ok=True)
+                    elif f.is_dir():
+                        shutil.rmtree(f, ignore_errors=True)
+                for f in temp_sce.iterdir():
                     shutil.copy2(f, dst_sce / f.name)
+            finally:
+                shutil.rmtree(temp_sce, ignore_errors=True)
         return True
     except (OSError, shutil.Error):
         return False
@@ -1447,20 +1736,20 @@ def export_backup_to_zip(source_dir: Path | str, zip_dest: Path | str, companion
                 for root, _, files in os.walk(src):
                     for file in files:
                         full_path = Path(root) / file
-                        arcname = Path("SPRJ0005") / full_path.relative_to(src)
+                        arcname = (Path("SPRJ0005") / full_path.relative_to(src)).as_posix()
                         zf.write(full_path, arcname)
                 sce = Path(companion_sce) if companion_sce else _find_sce_sys(src)
                 if sce and sce.is_dir():
                     for root, _, files in os.walk(sce):
                         for file in files:
                             full_path = Path(root) / file
-                            arcname = Path("SPRJ0005.sce_sys") / full_path.relative_to(sce)
+                            arcname = (Path("SPRJ0005.sce_sys") / full_path.relative_to(sce)).as_posix()
                             zf.write(full_path, arcname)
             else:
                 for root, _, files in os.walk(src):
                     for file in files:
                         full_path = Path(root) / file
-                        arcname = full_path.relative_to(src)
+                        arcname = full_path.relative_to(src).as_posix()
                         zf.write(full_path, arcname)
         return True
     except (OSError, zipfile.BadZipFile):
@@ -1486,7 +1775,12 @@ def import_save_from_zip_or_dir(import_path: Path | str, base_dir: Path = None, 
             temp_extract.mkdir(parents=True, exist_ok=True)
             try:
                 with zipfile.ZipFile(src, "r") as zf:
-                    zf.extractall(temp_extract)
+                    resolved_temp = temp_extract.resolve()
+                    for member in zf.infolist():
+                        target_path = (temp_extract / member.filename).resolve()
+                        if resolved_temp not in target_path.parents and target_path != resolved_temp:
+                            raise ValueError(f"Unsafe ZIP member path detected: {member.filename}")
+                        zf.extract(member, temp_extract)
 
                 # Find SPRJ0005 or userdata0010 inside extracted archive
                 found_sprj = None
