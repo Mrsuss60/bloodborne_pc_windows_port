@@ -54,6 +54,11 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     pressure_gc_samplers = max_samplers * 7 / 8;
     critical_gc_samplers = max_samplers * 15 / 16;
 
+    // bbport: image creation asks this cache to release idle images when the device runs out of
+    // memory. Registered before the early return below so it also covers devices that do not
+    // report memory usage.
+    SetImageOomHandler(&TextureCache::ReclaimImageMemoryThunk, this);
+
     // Set up garbage collection parameters.
     if (!instance.CanReportMemoryUsage()) {
         trigger_gc_memory = 0;
@@ -100,7 +105,9 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     std::fflush(stdout);
 }
 
-TextureCache::~TextureCache() = default;
+TextureCache::~TextureCache() {
+    SetImageOomHandler(nullptr, nullptr);
+}
 
 void TextureCache::AdjustView(const Image& image, ImageViewInfo& view) {
     const u32 skip = image.info.skip_levels;
@@ -579,6 +586,14 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
     auto& cache_image = slot_images[cache_image_id];
+    // bbport: both images can be copied from after a new image is created below; keep the
+    // out-of-memory reclaim in image creation from evicting them.
+    PinImage(cache_image_id);
+    PinImage(merged_image_id);
+    SCOPE_EXIT {
+        UnpinImage(merged_image_id);
+        UnpinImage(cache_image_id);
+    };
     const bool safe_to_delete =
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
 
@@ -1137,6 +1152,11 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0 && desc.info.stencil_addr != desc.info.guest_address) {
+        // bbport: `image` is used after the stencil image is created below.
+        PinImage(image_id);
+        SCOPE_EXIT {
+            UnpinImage(image_id);
+        };
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
@@ -1815,6 +1835,90 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectSamplers();
 }
 
+bool TextureCache::ReclaimImageMemoryThunk(void* userdata, vk::DeviceSize needed_bytes) {
+    return static_cast<TextureCache*>(userdata)->ReclaimImageMemory(needed_bytes);
+}
+
+bool TextureCache::ReclaimImageMemory(vk::DeviceSize needed_bytes) {
+    // Called from UniqueImage::Create, in the middle of FindImage's image construction, so `mutex`
+    // is already held on this thread (it is a recursive_mutex). Only clean images can go: issuing
+    // a download or draining the GPU queue from here is not allowed. GPU-written images are left
+    // to the collector at the next submission boundary.
+    std::scoped_lock lock{mutex};
+    const u64 cur_tick = gc_tick.load(std::memory_order_relaxed);
+    const vk::DeviceSize target_bytes = needed_bytes ? needed_bytes : 1;
+
+    boost::container::small_vector<ImageId, 16> candidates;
+    u64 reclaimed_bytes = 0;
+    const auto gather_below = [&](u64 below_tick) {
+        lru_cache.ForEachItemBelow(below_tick, [&](ImageId image_id) {
+            if (reclaimed_bytes >= target_bytes) {
+                return true;
+            }
+            if (!slot_images.is_allocated(image_id)) {
+                return false;
+            }
+            if (std::find(pinned_images.begin(), pinned_images.end(), image_id) !=
+                    pinned_images.end() ||
+                std::find(candidates.begin(), candidates.end(), image_id) !=
+                    candidates.end()) {
+                return false;
+            }
+            Image& image = slot_images[image_id];
+            // Actively bound resources or the presentation surface must not be evicted.
+            if (image.binding.is_bound || image.binding.is_target || image.usage.vo_surface) {
+                return false;
+            }
+            // A GPU-written color image would need a download to keep its contents.
+            if (!image.info.props.is_depth && image.HasGpuValidData()) {
+                return false;
+            }
+            reclaimed_bytes += image.GetHostImageSize()
+                                   ? image.GetHostImageSize()
+                                   : Common::AlignUp(image.info.guest_size, 1024);
+            candidates.push_back(image_id);
+            return reclaimed_bytes >= target_bytes;
+        });
+    };
+
+    // Images untouched for ~2.7 s (160 GC ticks) go first; if that is not enough, everything
+    // unused for ~4 frames, so a large allocation can still complete in the middle of a frame.
+    if (cur_tick > 160) {
+        gather_below(cur_tick - 160);
+    }
+    if (reclaimed_bytes < target_bytes && cur_tick > 16) {
+        gather_below(cur_tick - 16);
+    }
+    if (candidates.empty()) {
+        return false;
+    }
+
+    // The images are long unused, but work the GPU has not finished yet may still reference them.
+    // Wait for the submitted submissions, then release them (and the deletions the collector
+    // queued in earlier passes) right away, so that the retried allocation can use the memory.
+    scheduler.WaitSubmittedWork();
+    scheduler.PopPendingOperations();
+    u32 evicted = 0;
+    for (const ImageId image_id : candidates) {
+        if (!slot_images.is_allocated(image_id)) {
+            continue;
+        }
+        ++evicted;
+        ++gc_evictions;
+        BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
+        FreeImage(image_id, false);
+    }
+
+    if (evicted != 0) {
+        std::printf("Texture cache: out of memory, released %u idle images (%llu MiB) for a "
+                    "%llu MiB image\n",
+                    evicted, static_cast<unsigned long long>(reclaimed_bytes >> 20),
+                    static_cast<unsigned long long>(needed_bytes >> 20));
+        std::fflush(stdout);
+    }
+    return reclaimed_bytes != 0;
+}
+
 void TextureCache::TouchImage(Image& image) {
     const u64 cur_tick = gc_tick.load(std::memory_order_relaxed);
     if (image.lru_touched_tick == cur_tick && False(image.flags & ImageFlagBits::MaybeGpuDirty)) {
@@ -1829,7 +1933,7 @@ void TextureCache::TouchImage(Image& image) {
     image.gpu_hash = 0;
 }
 
-void TextureCache::DeleteImage(ImageId image_id) {
+void TextureCache::DeleteImage(ImageId image_id, bool defer) {
     if (!slot_images.is_allocated(image_id)) {
         return;
     }
@@ -1861,7 +1965,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
     }
 
     // Reclaim image and any image views it references.
-    scheduler.DeferOperation([this, image_id] {
+    auto reclaim = [this, image_id] {
         // clear find_image_cache entries before erasing image slot
         {
             std::scoped_lock lock{mutex};
@@ -1884,7 +1988,12 @@ void TextureCache::DeleteImage(ImageId image_id) {
             }
         }
         slot_images.erase(image_id);
-    });
+    };
+    if (defer) {
+        scheduler.DeferOperation(std::move(reclaim));
+    } else {
+        reclaim();
+    }
 }
 
 } // namespace VideoCore

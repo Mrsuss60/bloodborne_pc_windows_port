@@ -100,6 +100,11 @@ constexpr int FrametimeHistorySize = 120;
 float frametime_history[FrametimeHistorySize] = {};
 int frametime_history_idx = 0;
 
+// Widest text line of the performance HUD in unscaled units (see HudOverlay). The frametime
+// graph spans this width instead of the window's remaining width: a full-width item would feed
+// its own size back into ImGui's auto-fit, and the auto-resizing HUD could then only grow.
+float hud_text_width = 0.0f;
+
 using ::Vulkan::g_bb_compiles_total;
 using ::Vulkan::g_bb_background_pipelines_total;
 using ::Vulkan::g_bb_background_pipelines_done;
@@ -1566,6 +1571,13 @@ void HudOverlay() {
         // Update host telemetry (CPU, RAM)
         UpdateSystemTelemetry();
 
+        // Measure the HUD's text lines (window-relative) so the frametime graph can span them.
+        const float content_left = ImGui::GetCursorScreenPos().x;
+        float widest_text = 0.0f;
+        const auto TrackTextWidth = [&] {
+            widest_text = std::max(widest_text, ImGui::GetItemRectMax().x - content_left);
+        };
+
         // 1. Performance: Dual-Rate Telemetry (Render FPS vs. Simulation Tick Rate)
         const float render_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
         const bool live_active = s.live_clock_supported.load() && s.live_fps.load();
@@ -1584,6 +1596,7 @@ void HudOverlay() {
         ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "FPS: %.1f", render_fps);
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "(%.2f ms)%s", frame_ms_avg, upscaler_label);
+        TrackTextWidth();
 
         if (live_active && sim_hz > 0.0f) {
             const float diff = std::abs(render_fps - sim_hz);
@@ -1596,14 +1609,21 @@ void HudOverlay() {
                                 s.target_fps.load() > 0
                                     ? (std::to_string(s.target_fps.load()) + " FPS").c_str()
                                     : "Uncapped");
+            TrackTextWidth();
         }
 
-        // Frametime variance graph
+        // Frametime variance graph: span the HUD's text width so it fills the panel end to end at
+        // every HUD scale. This frame's lines above the graph, plus the width measured last frame
+        // (which includes the lines below it), approximate the widest line. The floor keeps the
+        // graph's designed width at large HUD scales, where the text lines are narrower.
         char overlay_text[32];
         std::snprintf(overlay_text, sizeof(overlay_text), "%.1f ms", frame_ms_avg);
+        const float plot_width = std::max(std::max(widest_text, hud_text_width * base_scale),
+                                          190.0f * base_scale * hud_scale_val);
+        const float plot_height = 36.0f * base_scale * hud_scale_val;
         ImGui::PlotLines("##frametime_plot", frametime_history, FrametimeHistorySize,
                          frametime_history_idx, overlay_text, 0.0f, 50.0f,
-                         ImVec2(190.0f * base_scale * hud_scale_val, 36.0f * base_scale * hud_scale_val));
+                         ImVec2(plot_width, plot_height));
 
         ImGui::Separator();
 
@@ -1638,6 +1658,7 @@ void HudOverlay() {
             } else {
                 ImGui::Text("VRAM: %.0f MB", alloc_mb);
             }
+            TrackTextWidth();
         }
 
         ImGui::Separator();
@@ -1645,10 +1666,18 @@ void HudOverlay() {
         // 3. System metrics: GPU, CPU, and RAM
         if (cached_gpu_usage >= 0.0f) {
             ImGui::Text("GPU: %.0f%%", cached_gpu_usage);
+            TrackTextWidth();
         }
         ImGui::Text("CPU: %.1f%%", cached_cpu_usage);
+        TrackTextWidth();
         if (cached_ram_total_gb > 0.0f) {
             ImGui::Text("RAM: %.2f / %.2f GB", cached_ram_used_gb, cached_ram_total_gb);
+            TrackTextWidth();
+        }
+
+        // Remember this frame's widest text line (unscaled) for the next frame's graph width.
+        if (widest_text > 0.0f) {
+            hud_text_width = widest_text / base_scale;
         }
 
         ImGui::End();

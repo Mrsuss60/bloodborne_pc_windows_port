@@ -297,6 +297,25 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// bbport: releases idle images when an image allocation runs out of device memory. Called
+    /// from UniqueImage::Create, which may already hold `mutex`, so it must be reentrant.
+    /// Returns true if any image was freed.
+    bool ReclaimImageMemory(vk::DeviceSize needed_bytes);
+    static bool ReclaimImageMemoryThunk(void* userdata, vk::DeviceSize needed_bytes);
+
+    /// bbport: images a caller is using across image creation must not be evicted by the out-of-
+    /// memory reclaim. Pins are only held on the thread that constructs images.
+    void PinImage(ImageId image_id) {
+        if (image_id) {
+            pinned_images.push_back(image_id);
+        }
+    }
+    void UnpinImage(ImageId image_id) {
+        if (image_id && !pinned_images.empty()) {
+            pinned_images.pop_back();
+        }
+    }
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -400,18 +419,20 @@ private:
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     /// Removes the image and any views/surface metas that reference it.
-    void DeleteImage(ImageId image_id);
+    /// `defer`: destroy after the GPU reaches the current submission (the default); false destroys
+    /// it now, for callers that have already waited for the submitted work.
+    void DeleteImage(ImageId image_id, bool defer = true);
 
     /// Touch the image in the LRU cache.
     void TouchImage(Image& image);
 
-    void FreeImage(ImageId image_id) {
+    void FreeImage(ImageId image_id, bool defer = true) {
         if (!slot_images.is_allocated(image_id)) {
             return;
         }
         UntrackImage(image_id);
         UnregisterImage(image_id);
-        DeleteImage(image_id);
+        DeleteImage(image_id, defer);
     }
 
     void GarbageCollectImages();
@@ -428,6 +449,8 @@ private:
     TileManager tile_manager;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
+    /// bbport: images used by a caller across image creation (see ReclaimImageMemory).
+    ImageIds pinned_images;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     std::unordered_set<VAddr> whole_textures;
@@ -450,7 +473,9 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
-    std::mutex mutex;
+    // bbport: recursive because image construction (FindImage) holds it and an out-of-memory
+    // allocation asks this cache for memory in the middle of that construction.
+    std::recursive_mutex mutex;
     // bbport: FindImage results for unchanged image registrations (guarded by `mutex`).
     struct FindImageCacheEntry {
         VAddr address = 0;

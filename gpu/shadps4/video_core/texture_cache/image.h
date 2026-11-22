@@ -39,6 +39,11 @@ enum ImageFlagBits : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
+/// bbport: asks the texture cache for device memory when an image allocation runs out of it.
+/// The callback releases idle images and returns true if it freed anything.
+using ImageOomHandler = bool (*)(void* userdata, vk::DeviceSize size_bytes);
+void SetImageOomHandler(ImageOomHandler handler, void* userdata);
+
 struct UniqueImage {
     explicit UniqueImage() = default;
     explicit UniqueImage(vk::Device device, VmaAllocator allocator)

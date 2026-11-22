@@ -13,18 +13,23 @@ on:
       - 'scripts/stage_dlls.py'
       - 'CMakeLists.txt'
       - 'build.bat'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
   build:
     name: Build Windows x86_64
     runs-on: windows-latest
+    env:
+      # UCRT64 is required: the MINGW64 (MSVCRT) repo no longer ships
+      # vulkan-memory-allocator or zydis.
+      MSYS2_PREFIX: /ucrt64
     steps:
       - name: Enable Long Paths
         run: git config --system core.longpaths true
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
           fetch-depth: 0
@@ -32,65 +37,91 @@ jobs:
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: false
           cache: true
 
       - name: Install MSYS2 dependencies
         shell: msys2 {0}
         run: |
+          set -e
+
+          packages=(
+            git
+            curl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-glslang
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-fmt
+            mingw-w64-ucrt-x86_64-robin-map
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+            mingw-w64-ucrt-x86_64-xxhash
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-zydis
+            mingw-w64-ucrt-x86_64-python
+          )
+
+          installed=0
           for attempt in 1 2 3; do
             echo "Attempt $attempt installing packages..."
-            pacman -S --noconfirm --needed \
-              git curl \
-              mingw-w64-x86_64-gcc \
-              mingw-w64-x86_64-cmake \
-              mingw-w64-x86_64-ninja \
-              mingw-w64-x86_64-pkgconf \
-              mingw-w64-x86_64-vulkan-headers \
-              mingw-w64-x86_64-vulkan-loader \
-              mingw-w64-x86_64-glslang \
-              mingw-w64-x86_64-boost \
-              mingw-w64-x86_64-fmt \
-              mingw-w64-x86_64-robin-map \
-              mingw-w64-x86_64-vulkan-memory-allocator \
-              mingw-w64-x86_64-xxhash \
-              mingw-w64-x86_64-sdl3 \
-              mingw-w64-x86_64-ffmpeg \
-              mingw-w64-x86_64-zydis && break
-            echo "Failed attempt $attempt, waiting before retry..."
+            if pacman -S --noconfirm --needed "${packages[@]}"; then
+              installed=1
+              break
+            fi
+            echo "Attempt $attempt failed, retrying in 10s..."
             sleep 10
           done
-          mkdir -p /mingw64/include/magic_enum
-          curl -sSL -o /mingw64/include/magic_enum/magic_enum.hpp https://raw.githubusercontent.com/Neargye/magic_enum/master/include/magic_enum/magic_enum.hpp
-          mkdir -p /mingw64/share/licenses/magic_enum
-          curl -sSfL -o /mingw64/share/licenses/magic_enum/LICENSE https://raw.githubusercontent.com/Neargye/magic_enum/master/LICENSE
-          
-          # Fix VMA header location
-          if [ -f /mingw64/include/vma/vk_mem_alloc.h ]; then
-            cp -f /mingw64/include/vma/vk_mem_alloc.h /mingw64/include/vk_mem_alloc.h
+          if [ "$installed" -ne 1 ]; then
+            echo "::error::pacman could not install the required MSYS2 packages"
+            exit 1
           fi
 
-          # Build and install miniz via CMake
-          git clone --depth 1 https://github.com/richgel999/miniz /tmp/miniz_repo
-          cmake -S /tmp/miniz_repo -B /tmp/miniz_build -G Ninja -DCMAKE_INSTALL_PREFIX=/mingw64 -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF
-          cmake --build /tmp/miniz_build --target install
-          cp -f /mingw64/include/miniz/*.h /mingw64/include/ || true
-          install -Dm644 /tmp/miniz_repo/LICENSE /mingw64/share/licenses/miniz/LICENSE
-          echo "Miniz successfully built and installed to /mingw64"
+          # The build only worked by accident when pacman failed: git/cmake were
+          # missing and the next step died with exit code 127. Check them here.
+          for tool in git cmake ninja gcc python; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool '$tool' is missing after package installation"
+              exit 1
+            fi
+          done
 
-          # Install xbyak headers
+          # magic_enum is header-only and not packaged for UCRT64.
+          mkdir -p "$MSYS2_PREFIX/include/magic_enum" "$MSYS2_PREFIX/share/licenses/magic_enum"
+          curl -sSfL -o "$MSYS2_PREFIX/include/magic_enum/magic_enum.hpp" https://raw.githubusercontent.com/Neargye/magic_enum/master/include/magic_enum/magic_enum.hpp
+          curl -sSfL -o "$MSYS2_PREFIX/share/licenses/magic_enum/LICENSE" https://raw.githubusercontent.com/Neargye/magic_enum/master/LICENSE
+
+          # VMA ships its header under include/vma, but find_path(VMA_INC ...) looks
+          # for include/vk_mem_alloc.h.
+          if [ ! -f "$MSYS2_PREFIX/include/vma/vk_mem_alloc.h" ]; then
+            echo "::error::vulkan-memory-allocator is missing $MSYS2_PREFIX/include/vma/vk_mem_alloc.h"
+            exit 1
+          fi
+          cp -f "$MSYS2_PREFIX/include/vma/vk_mem_alloc.h" "$MSYS2_PREFIX/include/vk_mem_alloc.h"
+
+          # miniz itself is vendored (gpu/third_party/miniz); only the licence is staged.
+          mkdir -p "$MSYS2_PREFIX/share/licenses/miniz"
+          curl -sSfL -o "$MSYS2_PREFIX/share/licenses/miniz/LICENSE" https://raw.githubusercontent.com/richgel999/miniz/master/LICENSE
+
+          # Install xbyak headers (header-only, used by the shader recompiler).
+          rm -rf /tmp/xbyak
           git clone --depth 1 https://github.com/herumi/xbyak /tmp/xbyak
-          cp -r /tmp/xbyak/xbyak /mingw64/include/
-          install -Dm644 /tmp/xbyak/COPYRIGHT /mingw64/share/licenses/xbyak/COPYRIGHT
-          echo "Xbyak headers installed to /mingw64/include/xbyak"
+          cp -r /tmp/xbyak/xbyak "$MSYS2_PREFIX/include/"
+          install -Dm644 /tmp/xbyak/COPYRIGHT "$MSYS2_PREFIX/share/licenses/xbyak/COPYRIGHT"
+          echo "Xbyak headers installed to $MSYS2_PREFIX/include/xbyak"
 
       - name: Compile Bloodborne PC Port
         shell: msys2 {0}
         run: |
           set -e
+          msys_prefix_win="$(cygpath -m "$MSYS2_PREFIX")"
           mkdir -p out/atrac9 out/gpu
-          
+
           echo "=== 1. Building LibAtrac9 ==="
           gcc -std=c99 -O2 -g -w -c third_party/LibAtrac9/C/src/*.c
           mv *.o out/atrac9/
@@ -103,23 +134,36 @@ jobs:
           fi
 
           echo "=== 3. Configuring CMake ==="
+          # gpu/CMakeLists.txt probes $ENV{MINGW_PREFIX} and hard-coded MSYS2
+          # paths; seed the cache with Windows-style paths so lookups succeed
+          # regardless of how the environment is translated.
           cmake -S gpu -B out/gpu -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_PREFIX_PATH="/mingw64" \
+            -DCMAKE_PREFIX_PATH="$msys_prefix_win" \
+            -DMAGIC_ENUM_INC="$msys_prefix_win/include" \
+            -DVMA_INC="$msys_prefix_win/include" \
+            -DGLSLANG_COMPILER="$msys_prefix_win/bin/glslangValidator.exe" \
             -DBB_LTO=OFF \
             -DCMAKE_C_FLAGS="-D_WIN32_WINNT=0x0A00 -Wno-implicit-function-declaration" \
             -DCMAKE_CXX_FLAGS="-D_WIN32_WINNT=0x0A00"
 
           echo "=== 4. Building bbgpu and bbport ==="
-          cmake --build out/gpu --target bbgpu bbport bb-gpu-capabilities -j $(nproc)
+          cmake --build out/gpu --target bbgpu bbport bb-gpu-capabilities -j "$(nproc)"
 
           echo "=== 5. Finalizing binaries ==="
           strip -s out/bbport.exe
           cp -f out/bbport.exe out/bb-probe.exe
 
           echo "=== 6. Staging DLLs ==="
-          python scripts/stage_dlls.py || true
-          
+          export MINGW_BIN="$(cygpath -w "$MSYS2_PREFIX/bin")"
+          python scripts/stage_dlls.py
+          for required in SDL3.dll libZydis.dll; do
+            if [ ! -f "out/$required" ]; then
+              echo "::error::Runtime DLL out/$required was not staged"
+              exit 1
+            fi
+          done
+
           ls -la out/bbport.exe
 
           echo "=== 7. Staging licences ==="
@@ -127,15 +171,15 @@ jobs:
           cp -f LICENSE out/licenses/LICENSE
           cp -rf licenses/. out/licenses/
           # The MSYS2 packages that own the staged DLLs, with their licence files and versions.
-          pkgs=$(for dll in out/*.dll; do pacman -Qqo "/mingw64/bin/$(basename "$dll")" 2>/dev/null || true; done | sort -u)
+          pkgs=$(for dll in out/*.dll; do pacman -Qqo "$MSYS2_PREFIX/bin/$(basename "$dll")" 2>/dev/null || true; done | sort -u)
           test -n "$pkgs" || { echo "No staged DLL belongs to an MSYS2 package"; exit 1; }
           pacman -Qi $pkgs | awk -F ' *: ' '/^Name/{n=$2} /^Version/{v=$2} /^Licenses/{print n, v, "-", $2}' \
             > out/licenses/msys2/PACKAGES.txt
           echo "Sources: https://repo.msys2.org/mingw/sources/" >> out/licenses/msys2/PACKAGES.txt
           for pkg in $pkgs; do
             # Not every package ships files under share/licenses.
-            pacman -Qql "$pkg" | { grep '^/mingw64/share/licenses/.*[^/]$' || true; } | while read -r f; do
-              rel=${f#/mingw64/share/licenses/}
+            pacman -Qql "$pkg" | { grep "^$MSYS2_PREFIX/share/licenses/.*[^/]$" || true; } | while read -r f; do
+              rel=${f#"$MSYS2_PREFIX/share/licenses/"}
               mkdir -p "out/licenses/msys2/$(dirname "$rel")"
               cp -f "$f" "out/licenses/msys2/$rel"
             done
@@ -152,19 +196,19 @@ jobs:
             SPIRV-Headers:gpu/third_party/sirit/externals/SPIRV-Headers/LICENSE \
             half:gpu/third_party/half/LICENSE.txt \
             DejaVu-fonts:gpu/third_party/fonts/LICENSE-DejaVu.txt \
-            robin-map:/mingw64/share/licenses/robin-map/LICENSE \
-            VulkanMemoryAllocator:/mingw64/share/licenses/VulkanMemoryAllocator/LICENSE \
-            vulkan-headers:/mingw64/share/licenses/vulkan-headers/LICENSE \
-            magic_enum:/mingw64/share/licenses/magic_enum/LICENSE \
-            miniz:/mingw64/share/licenses/miniz/LICENSE \
-            xbyak:/mingw64/share/licenses/xbyak/COPYRIGHT; do
+            robin-map:$MSYS2_PREFIX/share/licenses/robin-map/LICENSE \
+            VulkanMemoryAllocator:$MSYS2_PREFIX/share/licenses/vulkan-memory-allocator/LICENSE.txt \
+            vulkan-headers:$MSYS2_PREFIX/share/licenses/vulkan-headers/LICENSE \
+            magic_enum:$MSYS2_PREFIX/share/licenses/magic_enum/LICENSE \
+            miniz:$MSYS2_PREFIX/share/licenses/miniz/LICENSE \
+            xbyak:$MSYS2_PREFIX/share/licenses/xbyak/COPYRIGHT; do
             mkdir -p "out/licenses/third_party/${spec%%:*}"
             cp -f "${spec#*:}" "out/licenses/third_party/${spec%%:*}/"
           done
           ls -R out/licenses | head -n 50 || true
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: bbport-windows-x86_64
           path: |

@@ -85,6 +85,19 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
     return feature_flags;
 }
 
+namespace {
+
+// bbport: installed by the texture cache (see ImageOomHandler).
+ImageOomHandler g_image_oom_handler = nullptr;
+void* g_image_oom_userdata = nullptr;
+
+} // namespace
+
+void SetImageOomHandler(ImageOomHandler handler, void* userdata) {
+    g_image_oom_handler = handler;
+    g_image_oom_userdata = userdata;
+}
+
 UniqueImage::~UniqueImage() {
     if (image) {
         vmaDestroyImage(allocator, image, allocation);
@@ -109,53 +122,71 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         const char* env = std::getenv("BB_VMA_DEDICATED_MB");
         return vk::DeviceSize(env ? std::strtoull(env, nullptr, 10) : 4) << 20;
     }();
-    VmaAllocationCreateFlags dedicated = 0;
-    if (device && dedicated_from != 0) {
+    vk::DeviceSize memory_size = 0;
+    if (device) {
         const vk::DeviceImageMemoryRequirements query{.pCreateInfo = &image_ci};
-        if (device.getImageMemoryRequirements(query).memoryRequirements.size >= dedicated_from) {
-            dedicated = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-        }
+        memory_size = device.getImageMemoryRequirements(query).memoryRequirements.size;
     }
-    const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | dedicated,
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        .requiredFlags = 0,
-        .preferredFlags = 0,
-        .pool = VK_NULL_HANDLE,
-        .pUserData = nullptr,
-    };
+    VmaAllocationCreateFlags dedicated = 0;
+    if (device && dedicated_from != 0 && memory_size >= dedicated_from) {
+        dedicated = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    }
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
-                                     &allocation, &alloc_info);
-    if (result != VK_SUCCESS) {
-        const VmaAllocationCreateInfo fallback_alloc_ci = {
-            .flags = dedicated,
-            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    const auto allocate = [&](VmaAllocationCreateFlags flags, VmaMemoryUsage usage) {
+        unsafe_image = VK_NULL_HANDLE;
+        allocation = VK_NULL_HANDLE;
+        const VmaAllocationCreateInfo alloc_ci = {
+            .flags = flags,
+            .usage = usage,
             .requiredFlags = 0,
             .preferredFlags = 0,
             .pool = VK_NULL_HANDLE,
             .pUserData = nullptr,
         };
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &fallback_alloc_ci, &unsafe_image,
-                                &allocation, &alloc_info);
+        return vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                              &alloc_info);
+    };
+
+    VkResult result = allocate(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | dedicated,
+                               VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    if (result != VK_SUCCESS) {
+        // The reported budget can be conservative; try again without it before assuming the
+        // device really is out of memory.
+        result = allocate(dedicated, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    }
+    VkResult out_of_memory = VK_SUCCESS;
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        // bbport: device memory can run out mid-load (e.g. a map transition on a 4 GB card), while
+        // the texture collector only evicts on submission boundaries. Ask it to release idle
+        // images and retry once, instead of aborting the process.
+        out_of_memory = result;
+        if (g_image_oom_handler != nullptr &&
+            g_image_oom_handler(g_image_oom_userdata, memory_size)) {
+            result = allocate(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | dedicated,
+                              VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+            if (result != VK_SUCCESS) {
+                result = allocate(dedicated, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+            }
+        }
     }
     if (result != VK_SUCCESS) {
-        const VmaAllocationCreateInfo sys_alloc_ci = {
-            .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-            .requiredFlags = 0,
-            .preferredFlags = 0,
-            .pool = VK_NULL_HANDLE,
-            .pUserData = nullptr,
-        };
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &sys_alloc_ci, &unsafe_image,
-                                &allocation, &alloc_info);
+        // Host-visible memory as a last resort (integrated GPUs expose one for optimal images).
+        // On a discrete GPU this cannot back the image and VMA fails with FEATURE_NOT_PRESENT.
+        result = allocate(VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+                          VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
     }
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
-               vk::to_string(vk::Result{result}));
+    if (result != VK_SUCCESS && out_of_memory != VK_SUCCESS) {
+        // Report the real cause instead of the host fallback's FEATURE_NOT_PRESENT, which only
+        // says that the image cannot live in host memory.
+        result = out_of_memory;
+    }
+    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image {}x{}x{} {} ({} bytes): {}",
+               image_ci.extent.width, image_ci.extent.height, image_ci.extent.depth,
+               vk::to_string(image_ci.format),
+               static_cast<unsigned long long>(memory_size), vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
 }
