@@ -298,6 +298,15 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
 }
 
+extern "C" int bbgpu_invalidate_memory(void* address, uint64_t size) {
+    if (!address || size == 0) return 0;
+    auto* mem = Core::Memory::Instance();
+    if (!mem) return 0;
+    auto* rasterizer = mem->GetRasterizer();
+    if (!rasterizer) return 0;
+    return rasterizer->InvalidateMemory(reinterpret_cast<VAddr>(address), size) ? 1 : 0;
+}
+
 extern "C" void bbgpu_set_redzone_fault(int active) {
     BbFaultHint::redzone = active != 0;
 }

@@ -125,10 +125,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     switch (stage) {
     case HwStage::Local: {
         BuildCommon(regs.ls_program);
-        Shader::TessellationDataConstantBuffer tess_constants{};
-        const auto* hull_info = sel.infos[u32(SwStage::TessellationControl)];
-        hull_info->ReadTessConstantBuffer(tess_constants);
-        info.hw.ls.ls_stride = tess_constants.ls_stride;
+        // bbport: the Local stage is only meaningful alongside a bound hull shader; its
+        // tessellation constants come from the hull Info. RefreshGraphicsStages defers the draw
+        // when the hull program is missing or still compiling, so a null here is unexpected and
+        // must not be dereferenced.
+        info.hw.ls.ls_stride = 0;
+        if (const auto* hull_info = sel.infos[u32(SwStage::TessellationControl)]) {
+            Shader::TessellationDataConstantBuffer tess_constants{};
+            hull_info->ReadTessConstantBuffer(tess_constants);
+            info.hw.ls.ls_stride = tess_constants.ls_stride;
+        }
         break;
     }
     case HwStage::Hull:
@@ -1257,8 +1263,11 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel, bool rebind_mo
         if (!instance.IsTessellationSupported()) {
             return false;
         }
+        // bbport: HwStage::Local reads the hull shader's Info (tessellation constants), so a
+        // missing or still-compiling hull program must defer the whole draw. Continuing would
+        // build a Local runtime info from a null sel.infos[TessellationControl].
         if (bind_stage(HwStage::Hull, SwStage::TessellationControl) < 0) {
-            any_pending = true;
+            return false;
         }
         if (bind_stage(HwStage::Vertex, SwStage::TessellationEval) < 0) {
             any_pending = true;
@@ -1279,8 +1288,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel, bool rebind_mo
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
+        // bbport: as in the LsHs case, HwStage::Local needs the hull shader's Info.
         if (bind_stage(HwStage::Hull, SwStage::TessellationControl) < 0) {
-            any_pending = true;
+            return false;
         }
         if (bind_stage(HwStage::Export, SwStage::TessellationEval) < 0) {
             any_pending = true;

@@ -553,7 +553,7 @@ class LauncherView(QWidget):
             lambda: (self.save_settings(), self.save_bbport_ini()))
 
         self.chk_fps_patch = self._check(
-            "Enable Live FPS Patching (60/90/120/Uncap)", "chk_fps_patch")
+            "Enable Live FPS Patching (30-240 / Uncapped)", "chk_fps_patch")
         self.chk_fps_patch.setChecked(self.settings.get("feat_fps_patch", True))
         self._populate_fps_combo(self.chk_fps_patch.isChecked(), self.settings.get("fps", "60"))
         self.chk_fps_patch.toggled.connect(self._on_fps_patch_toggled)

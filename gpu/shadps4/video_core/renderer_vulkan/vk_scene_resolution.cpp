@@ -138,7 +138,7 @@ void SceneTargets::ResolveAll() {
     }
 }
 bool SceneTargets::NativeStale(const VideoCore::Image& image) const {
-    if (!image.scene_proxy) return false;
+    if (!Reduced() || !image.scene_proxy) return false;
     const u32 levels = std::min(16u, image.info.resources.levels);
     for (u32 level = 0; level < levels; ++level) {
         const auto it = entries.find(Key(image.image_uid, level));
@@ -147,7 +147,7 @@ bool SceneTargets::NativeStale(const VideoCore::Image& image) const {
     return false;
 }
 void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access) {
-    if (copying || !image.scene_proxy) return; // most images never had a proxy
+    if (!Reduced() || copying || !image.scene_proxy) return; // most images never had a proxy
     constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
         vk::AccessFlagBits2::eMemoryWrite;
@@ -534,7 +534,7 @@ SceneTargets::Target SceneTargets::Attachment(VideoCore::ImageId id,
     return {e.image, View(e, original, attachment_info), e.layout, e.image.image_ci.usage};
 }
 bool SceneTargets::ProxyCurrent(const VideoCore::Image& image, u32 level, u32 levels) const {
-    if (copying || !image.scene_proxy || image.info.props.is_depth || levels != 1) {
+    if (!Reduced() || copying || !image.scene_proxy || image.info.props.is_depth || levels != 1) {
         return false;
     }
     const auto it = entries.find(Key(image.image_uid, level));
@@ -554,6 +554,9 @@ vk::ImageLayout SceneTargets::PrepareSample(const VideoCore::Image& image, u32 l
 }
 std::optional<SceneTargets::Target> SceneTargets::SampleProxy(
     const VideoCore::Image& image, const VideoCore::ImageViewInfo& info) {
+    if (!Reduced()) {
+        return std::nullopt;
+    }
     const u32 level = info.range.base.level;
     if (!ProxyCurrent(image, level, info.range.extent.levels)) {
         return std::nullopt;

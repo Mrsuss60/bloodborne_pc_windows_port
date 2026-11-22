@@ -46,21 +46,26 @@ def build_stamp() -> str:
         return ""
 
 
-FPS_CHOICES = ["uncap", "60", "90", "30"]
+FPS_CHOICES = ["30", "40", "60", "75", "90", "120", "144", "165", "240", "uncap"]
 # Displayed in the Display & Graphics tab. The item data is the rate passed to run.bat
-# ("uncap" for Uncapped); 30 is the native PS4 path in both modes.
+# ("uncap" for Uncapped).
 FPS_LIVE_CHOICES = [
+    ("30 (Live patch)", "30"),
+    ("40 (Live patch)", "40"),
     ("60 (Live patch)", "60"),
+    ("75 (Live patch)", "75"),
     ("90 (Live patch)", "90"),
     ("120 (Live patch)", "120"),
+    ("144 (Live patch)", "144"),
+    ("165 (Live patch)", "165"),
+    ("240 (Live patch)", "240"),
     ("Uncap (Live patch)", "uncap"),
-    ("30 (Native PS4)", "30"),
 ]
 FPS_XML_CHOICES = [
+    ("30 (Native PS4)", "30"),
     ("60 (XML patch)", "60"),
     ("90 (XML patch)", "90"),
     ("Uncap (XML patch)", "uncap"),
-    ("30 (Native PS4)", "30"),
 ]
 RES_CHOICES = ["1920x1080 (Native)", "1280x720", "2560x1440", "3840x2160"]
 WINDOW_MODE_CHOICES = ["Windowed", "Borderless", "Fullscreen"]

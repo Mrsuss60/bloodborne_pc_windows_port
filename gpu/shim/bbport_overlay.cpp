@@ -1050,31 +1050,65 @@ void Menu() {
     {
         const char* const live_fps_labels[] = {
             Tr("30 FPS", "30 FPS"),
+            Tr("40 FPS (Handheld / 120Hz)", "40 FPS (Портатив / 120Гц)"),
             Tr("60 FPS", "60 FPS"),
+            Tr("75 FPS", "75 FPS"),
             Tr("90 FPS", "90 FPS"),
             Tr("120 FPS", "120 FPS"),
+            Tr("144 FPS", "144 FPS"),
+            Tr("165 FPS", "165 FPS"),
+            Tr("240 FPS", "240 FPS"),
             Tr("Uncapped", "Без ограничения"),
         };
-        static constexpr int live_fps_values[] = {30, 60, 90, 120, 0};
+        static constexpr int live_fps_values[] = {30, 40, 60, 75, 90, 120, 144, 165, 240, 0};
+        constexpr int preset_count = sizeof(live_fps_values) / sizeof(live_fps_values[0]);
+
         const int current = s.target_fps.load();
-        int current_index = 0;
-        for (int i = 0; i < 5; ++i) {
+        int current_index = -1;
+        for (int i = 0; i < preset_count; ++i) {
             if (live_fps_values[i] == current) {
                 current_index = i;
                 break;
             }
         }
+        char combo_preview[64];
+        if (current_index >= 0) {
+            snprintf(combo_preview, sizeof(combo_preview), "%s", live_fps_labels[current_index]);
+        } else {
+            snprintf(combo_preview, sizeof(combo_preview), "%s (%d FPS)", Tr("Custom", "Пользовательский"), current);
+        }
+
         const bool live_ok = s.live_clock_supported.load();
         ImGui::BeginDisabled(!live_ok);
-        if (ImGui::BeginCombo(Tr("Target Framerate (Live)", "Целевая частота кадров (Live)"),
-                              live_fps_labels[current_index])) {
-            for (int i = 0; i < 5; ++i) {
+        if (ImGui::BeginCombo(Tr("Target Framerate (Live)", "Целевая частота кадров (Live)"), combo_preview)) {
+            for (int i = 0; i < preset_count; ++i) {
                 if (ImGui::Selectable(live_fps_labels[i], i == current_index)) {
                     Store(s.target_fps, live_fps_values[i], true);
                 }
             }
             ImGui::EndCombo();
         }
+
+        // Display refresh rate detection & Auto VRR button
+        int display_hz = 60;
+#ifdef _WIN32
+        DEVMODEW dm = {};
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 24) {
+            display_hz = (int)dm.dmDisplayFrequency;
+        }
+#endif
+        const int vrr_cap = std::max(30, display_hz - 3);
+        char vrr_btn_label[64];
+        snprintf(vrr_btn_label, sizeof(vrr_btn_label), "%s (%d Hz -> %d FPS)",
+                 Tr("Match Display VRR", "Синхронизация с VRR"), display_hz, vrr_cap);
+        if (ImGui::Button(vrr_btn_label)) {
+            Store(s.target_fps, vrr_cap, true);
+        }
+        ImGui::SameLine();
+        Hint(Tr("Sets target to Display Refresh Rate - 3 for optimal G-Sync / FreeSync tear-free latency.",
+                "Устанавливает частоту монитора - 3 FPS для минимальной задержки в G-Sync / FreeSync."));
+
         ImGui::EndDisabled();
         if (live_ok) {
             const float dt_ms = s.live_clock_dt_ms.load();
@@ -1466,16 +1500,25 @@ void FpsCounter() {
                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing);
     const auto& s = BbSettings::Get();
-    ImGui::Text(Tr("%.0f FPS  %.1f ms  %s", "%.0f FPS  %.1f мс  %s"),
-                frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg,
-                s.upscaler == BbSettings::UpscalerFsr3     ? "FSR 3.1"
-                : s.upscaler == BbSettings::UpscalerFsr4   ? "FSR 4"
-                : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
-                : s.upscaler == BbSettings::UpscalerFsr    ? "FSR"
-                : s.upscaler == BbSettings::UpscalerXess   ? "XeSS"
-                : s.upscaler == BbSettings::UpscalerDlss   ? "DLSS"
-                : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
-                                                           : "");
+    const float render_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
+    const bool live_active = s.live_clock_supported.load() && s.live_fps.load();
+    const float sim_hz = live_active ? s.live_clock_hz.load() : render_fps;
+
+    const char* upscaler = s.upscaler == BbSettings::UpscalerFsr3     ? "FSR 3.1"
+                         : s.upscaler == BbSettings::UpscalerFsr4     ? "FSR 4"
+                         : s.upscaler == BbSettings::UpscalerFsr411   ? "FSR 4.1.1"
+                         : s.upscaler == BbSettings::UpscalerFsr      ? "FSR"
+                         : s.upscaler == BbSettings::UpscalerXess     ? "XeSS"
+                         : s.upscaler == BbSettings::UpscalerDlss     ? "DLSS"
+                         : s.upscaler == BbSettings::UpscalerTaa      ? "TAA"
+                                                                      : "";
+
+    if (live_active && sim_hz > 0.0f && std::abs(render_fps - sim_hz) > 3.0f) {
+        ImGui::Text("%.0f FPS (Sim %.0f Hz)  %.1f ms  %s", render_fps, sim_hz, frame_ms_avg, upscaler);
+    } else {
+        ImGui::Text(Tr("%.0f FPS  %.1f ms  %s", "%.0f FPS  %.1f мс  %s"),
+                    render_fps, frame_ms_avg, upscaler);
+    }
     ImGui::End();
 }
 
@@ -1523,8 +1566,12 @@ void HudOverlay() {
         // Update host telemetry (CPU, RAM)
         UpdateSystemTelemetry();
 
-        // 1. Performance: FPS & Frametime
-        const float cur_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
+        // 1. Performance: Dual-Rate Telemetry (Render FPS vs. Simulation Tick Rate)
+        const float render_fps = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
+        const bool live_active = s.live_clock_supported.load() && s.live_fps.load();
+        const float sim_hz = live_active ? s.live_clock_hz.load() : render_fps;
+        const float sim_ms = live_active ? s.live_clock_dt_ms.load() : frame_ms_avg;
+
         const char* upscaler_label = s.upscaler == BbSettings::UpscalerFsr3     ? " [FSR 3.1]"
                                    : s.upscaler == BbSettings::UpscalerFsr4     ? " [FSR 4]"
                                    : s.upscaler == BbSettings::UpscalerFsr411   ? " [FSR 4.1.1]"
@@ -1534,9 +1581,22 @@ void HudOverlay() {
                                    : s.upscaler == BbSettings::UpscalerTaa      ? " [TAA]"
                                                                                 : "";
 
-        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "FPS: %.1f", cur_fps);
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "FPS: %.1f", render_fps);
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "(%.2f ms)%s", frame_ms_avg, upscaler_label);
+
+        if (live_active && sim_hz > 0.0f) {
+            const float diff = std::abs(render_fps - sim_hz);
+            const ImVec4 tick_color = (diff > 5.0f && render_fps > 30.0f)
+                                          ? ImVec4(1.0f, 0.75f, 0.2f, 1.0f)
+                                          : ImVec4(0.4f, 0.9f, 0.6f, 1.0f);
+            ImGui::TextColored(tick_color, "Sim: %.1f Hz (%.2f ms)", sim_hz, sim_ms);
+            ImGui::SameLine();
+            ImGui::TextDisabled("| Target: %s",
+                                s.target_fps.load() > 0
+                                    ? (std::to_string(s.target_fps.load()) + " FPS").c_str()
+                                    : "Uncapped");
+        }
 
         // Frametime variance graph
         char overlay_text[32];

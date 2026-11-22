@@ -2808,15 +2808,17 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             set.generation = ~0ull;
             return false;
         }
-        // Proxy entries need a current proxy; native entries of a proxied image go through
-        // BindTextures, which may sample the proxy instead.
+        // Proxy entries need a current proxy; native entries only miss if a reduced proxy
+        // is now active and current to take its place.
         const bool proxies_on = !BbToggle::Disabled(BbToggle::SampleSceneProxies);
         if (image.backing != entry.backing || image.binding.needs_rebind ||
             image.binding.is_target || !texture_cache.IsUpToDate(entry.id) ||
             (entry.proxy ? !proxies_on ||
                                !scene_targets->ProxyCurrent(image, entry.range.base.level,
                                                             entry.range.extent.levels)
-                         : image.scene_proxy && proxies_on && !point_native) ||
+                         : proxies_on && !point_native && scene_targets->Reduced() &&
+                               scene_targets->ProxyCurrent(image, entry.range.base.level,
+                                                           entry.range.extent.levels)) ||
             (upscaler->Enabled() && upscaler->RedirectsSampled(entry.id))) {
             ++texture_set_why[2];
             ++texture_set_misses;
@@ -3373,32 +3375,32 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 }
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
-    DrainDrawPipe();
     if (!IsMapped(addr, size)) {
-        // Not GPU mapped memory, can skip invalidation logic entirely.
+        // Not GPU mapped memory, can skip invalidation logic entirely without stalling the draw pipe.
         return false;
     }
+    DrainDrawPipe();
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }
 
 bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks) {
-    DrainDrawPipe();
     if (!IsMapped(addr, 8)) {
         return false;
     }
+    DrainDrawPipe();
     buffer_cache.OnWriteFault(addr, 8, BbFaultHint::redzone, assume_locks);
     texture_cache.InvalidateMemory(addr, 8);
     return true;
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
-    DrainDrawPipe();
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    DrainDrawPipe();
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
 }

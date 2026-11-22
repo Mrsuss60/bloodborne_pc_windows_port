@@ -22,6 +22,9 @@ int bbgpu_init(const BbGpuConfig *config);
 uintptr_t bbgpu_resolve(const char *scoped_nid);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */
 int bbgpu_handle_fault(void *ucontext, void *address);
+/* Unprotects and invalidates a GPU memory range in a single pass (e.g. for bulk guest file reads).
+ * Returns 1 if handled by GPU memory tracker, 0 otherwise. */
+int bbgpu_invalidate_memory(void *address, uint64_t size);
 /* Set while a fault from the PS4 red-zone vertex generators is being handled: their pages must
  * stay writable, because the Windows exception frame destroys the red-zone locals. */
 void bbgpu_set_redzone_fault(int active);

@@ -380,11 +380,17 @@ float Halton(u32 index, u32 base) {
 } // namespace
 
 bool TemporalUpscaler::ReducedScene(const VideoCore::Image& color) const {
+    if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
+        return false;
+    }
     return (!scaled_session || early_upscale) && scene_targets.Reduced() &&
            scene_targets.EligibleScene(color);
 }
 
 bool TemporalUpscaler::RasterScaling() const {
+    if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
+        return false;
+    }
     return (!scaled_session || early_upscale) && scene_targets.Reduced() && !done_this_frame;
 }
 
@@ -418,14 +424,16 @@ bool TemporalUpscaler::OnFrameStart() {
     // bbport: the Custom preset's ratio (render_scale) moves its render size like a preset change.
     const float preset_scale = BbSettings::PresetScale(preset);
     const bool scale_changed = applied_scale != preset_scale;
-    if (applied_preset != preset || scale_changed || settings.upscaler == BbSettings::UpscalerOff)
+    const int upscaler = settings.upscaler.load();
+    const bool upscaler_changed = applied_upscaler != upscaler;
+    if (applied_preset != preset || scale_changed || upscaler_changed ||
+        settings.upscaler == BbSettings::UpscalerOff)
         failed = false;
     if (dispatch_failed.exchange(false, std::memory_order_relaxed)) {
         failed = true;
     }
     const bool active = Active();
     const bool jitter_on = active && settings.jitter && !BbToggle::Disabled(1u << 25);
-    const int upscaler = settings.upscaler.load();
     const int output = settings.output_res.load();
     const bool output_changed = !scaled_session && applied_output != output;
     if (output_changed) {
@@ -438,15 +446,16 @@ bool TemporalUpscaler::OnFrameStart() {
     }
     const bool changed = output_changed || applied_preset != preset || scale_changed ||
                          active != last_active || jitter_on != last_jitter ||
-                         applied_upscaler != upscaler;
-    if (applied_upscaler != upscaler) {
+                         upscaler_changed;
+    if (upscaler_changed) {
+        failed = false;
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
         scheduler.Finish();
         fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
         if (BbSettings::IsFrameUpscaler(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
     }
-    if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
-    if (applied_upscaler != upscaler) fsr4_building = false; // a new provider object
+    if (upscaler_changed) fsr4_failed = false; // retry after a menu change
+    if (upscaler_changed) fsr4_building = false; // a new provider object
     if (fsr4_building && !fsr4->Preparing()) {
         fsr4_building = false;
         reset = true;
@@ -589,9 +598,10 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     const bool use_fsr4 = UseFsr4();
     const bool use_taa = BbSettings::Get().upscaler == BbSettings::UpscalerTaa;
-    if (use_taa && (w != ow || h != oh)) {
-        std::printf("TAA: remove BB_RENDER_RES to use native-resolution TAA\n");
-        return false;
+    if (use_taa) {
+        // TAA runs at native output resolution; align input dimensions
+        w = ow;
+        h = oh;
     }
     if (resources_ready && w == width && h == height && ow == out_width && oh == out_height &&
         hdr == context_hdr && use_fsr4 == resources_fsr4 && use_taa == resources_taa) {
@@ -1643,6 +1653,14 @@ void TemporalUpscaler::Run() {
         cmdbuf.pushConstants(*merge_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                              sizeof(mode), &mode);
         cmdbuf.dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
+        const vk::MemoryBarrier2 post_merge{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                             vk::AccessFlagBits2::eShaderSampledRead | vk::AccessFlagBits2::eShaderStorageRead,
+        };
+        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &post_merge});
     }
 }
 

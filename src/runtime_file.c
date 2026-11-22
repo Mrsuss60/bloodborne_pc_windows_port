@@ -5,6 +5,7 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -304,8 +305,10 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
     if (fd<0) { pthread_mutex_unlock(&lock); close(host); free_listing(dir); return -EMFILE; }
-    files[fd]=(File){.used=1,.host=host,.dir=dir};
+    files[fd].host=host;
+    files[fd].dir=dir;
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
+    __atomic_store_n(&files[fd].used, 1, __ATOMIC_RELEASE);
     ++opens;
     pthread_mutex_unlock(&lock);
     CHECK_LOW_ADDR((uintptr_t)fd);
@@ -328,24 +331,32 @@ static int64_t do_close(int fd) {
     pthread_mutex_lock(&lock);
     File *f=get(fd);
     if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
-    close(f->host); free_listing(f->dir);
-    *f=(File){0};
+    int host = f->host;
+    Listing *dir = f->dir;
+    __atomic_store_n(&f->used, 0, __ATOMIC_RELEASE);
+    f->host = -1;
+    f->dir = NULL;
+    f->path[0] = 0;
+    close(host); free_listing(dir);
     pthread_mutex_unlock(&lock);
     return 0;
 }
 static int host_fd(int fd) {
     if (fd>=0 && fd<3) return fd;
-    pthread_mutex_lock(&lock);
-    File *f=get(fd);
-    int h=f ? f->host : -1;
-    pthread_mutex_unlock(&lock);
-    return h;
+    if (fd<3 || fd>=MAX_FILES) return -1;
+    if (!__atomic_load_n(&files[fd].used, __ATOMIC_ACQUIRE)) return -1;
+    return files[fd].host;
 }
-/* Pages of the destination may be write-protected for GPU tracking: the kernel's copy then
- * fails with EFAULT instead of faulting to our handler. A user-mode write to each page first
- * goes through the handler, which unprotects it (and records the upcoming write). */
+/* bbport: bulk memory invalidation and unprotection for guest file reads.
+ * When streaming area assets, reading into GPU-tracked memory previously triggered
+ * hundreds of VEH page faults via page-by-page touches, repeatedly stalling the draw pipe.
+ * bbgpu_invalidate_memory unprotects the entire destination range and marks it CPU-modified
+ * in a single atomic pass, eliminating all page faults and pipeline bubbles. */
 static void touch_for_write(void *buffer,uint64_t size) {
-    if (!size) return;
+    if (!size || !buffer) return;
+    if (bbgpu_invalidate_memory(buffer, size)) {
+        return;
+    }
     uintptr_t p=(uintptr_t)buffer & ~(uintptr_t)4095, end=(uintptr_t)buffer+size;
     for (; p<end; p+=4096) {
         volatile unsigned char *b=(volatile unsigned char *)(p<(uintptr_t)buffer ? (uintptr_t)buffer : p);
@@ -415,17 +426,17 @@ static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset)
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
     if (whence<0 || whence>2) return -EINVAL;
-    pthread_mutex_lock(&lock);
-    File *f=get(fd);
-    if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
-    if (f->dir) {
-        /* Directory offsets are entry indices for getdirentries. */
+    if (fd<3 || fd>=MAX_FILES) return -EBADF;
+    if (!__atomic_load_n(&files[fd].used, __ATOMIC_ACQUIRE)) return -EBADF;
+    if (files[fd].dir) {
+        pthread_mutex_lock(&lock);
+        File *f=get(fd);
+        if (!f || !f->dir) { pthread_mutex_unlock(&lock); return -EBADF; }
         if (whence==0 && offset>=0) { f->position=(size_t)offset; pthread_mutex_unlock(&lock); return offset; }
         pthread_mutex_unlock(&lock);
         return -EINVAL;
     }
-    int host = f->host;
-    pthread_mutex_unlock(&lock);
+    int host = files[fd].host;
 #ifdef _WIN32
     int64_t r = _lseeki64(host, offset, whence);
     if (r < 0) {

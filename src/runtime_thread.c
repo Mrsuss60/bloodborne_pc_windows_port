@@ -297,10 +297,20 @@ static int get_host_cores(void) {
 static int ps4_prio_to_win32(int prio, const char *name) {
     int cores = get_host_cores();
     int is_audio = (name && (strstr(name, "Audio") || strstr(name, "audio") || strstr(name, "Sound") || strstr(name, "sound") || strstr(name, "pad")));
-    int is_render = (name && (strstr(name, "Render") || strstr(name, "render") || strstr(name, "Present") || strstr(name, "Flip") || strstr(name, "Display") || strstr(name, "GX") || strstr(name, "Gnm")));
+    int is_gx_worker = (name && strstr(name, "GXWorker"));
+    int is_render = (name && !is_gx_worker && (strstr(name, "Render") || strstr(name, "render") || strstr(name, "Present") || strstr(name, "Flip") || strstr(name, "Display") || strstr(name, "GXRender") || strstr(name, "Gnm")));
     int is_main = (name && (strstr(name, "Main") || strstr(name, "main") || strstr(name, "host") || strstr(name, "WorldChrMan")));
     int is_sim = (name && (strstr(name, "Havok") || strstr(name, "Cloth") || strstr(name, "Physics") || strstr(name, "physics")));
-    int is_worker = (name && (strstr(name, "Worker") || strstr(name, "worker") || strstr(name, "Pool") || strstr(name, "pool") || strstr(name, "Work") || strstr(name, "work") || strstr(name, "Job") || strstr(name, "job") || strstr(name, "Async") || strstr(name, "async"))) && !is_render && !is_sim;
+    int is_bg_stream = (name && (strstr(name, "CSChr") || strstr(name, "Core.Res") || strstr(name, "FaceGen") ||
+                                 strstr(name, "FMOD file") || strstr(name, "FMOD nonblocking") ||
+                                 strstr(name, "SpCloth") || strstr(name, "Trophy") ||
+                                 strstr(name, "NexusRevolution") || strstr(name, "Logging")));
+    int is_generic_worker = (name && (strstr(name, "Worker") || strstr(name, "worker") || strstr(name, "Pool") ||
+                                      strstr(name, "pool") || strstr(name, "Work") || strstr(name, "work") ||
+                                      strstr(name, "Job") || strstr(name, "job") || strstr(name, "Async") ||
+                                      strstr(name, "async") || strstr(name, "Loader") || strstr(name, "loader") ||
+                                      strstr(name, "Task") || strstr(name, "task")));
+    int is_worker = (is_gx_worker || is_bg_stream || is_generic_worker) && !is_render && !is_sim;
 
     /* Audio threads get elevated priority to prevent audio dropouts */
     if (is_audio || prio <= 180) {
@@ -317,16 +327,20 @@ static int ps4_prio_to_win32(int prio, const char *name) {
         return THREAD_PRIORITY_NORMAL;
     }
 
-    /* On 4 cores or fewer (no SMT / low core count), worker pools must NOT preempt main or render threads */
+    /* Background workers, streaming loaders, and decompressors:
+     * Demoted below normal so area transitions / doors never starve GXRenderThread or MOMainThread */
+    if (is_worker) {
+        return THREAD_PRIORITY_BELOW_NORMAL;
+    }
+
+    /* On 4 cores or fewer (no SMT / low core count), background tasks must never preempt render/main path */
     if (cores <= 4) {
-        if (is_worker) return THREAD_PRIORITY_BELOW_NORMAL;
         if (prio <= 260) return THREAD_PRIORITY_NORMAL;
-        if (prio <= 700) return THREAD_PRIORITY_NORMAL;
+        if (prio <= 700) return THREAD_PRIORITY_BELOW_NORMAL;
         return THREAD_PRIORITY_LOWEST;
     }
 
     /* Higher core systems (6C/12T+) */
-    if (is_worker) return THREAD_PRIORITY_BELOW_NORMAL;
     if (prio <= 260) return THREAD_PRIORITY_ABOVE_NORMAL;
     if (prio <= 400) return THREAD_PRIORITY_NORMAL;
     if (prio <= 700) return THREAD_PRIORITY_BELOW_NORMAL;
@@ -343,7 +357,8 @@ static void *host_start(void *p) {
         SetThreadPriority(GetCurrentThread(), ps4_prio_to_win32(t->attr.prio, t->name));
     }
     const char *tname = t->name;
-    int is_render = (tname && (strstr(tname, "Render") || strstr(tname, "render") || strstr(tname, "Present") || strstr(tname, "Flip") || strstr(tname, "Display") || strstr(tname, "GX") || strstr(tname, "Gnm")));
+    int is_gx_worker_init = (tname && strstr(tname, "GXWorker"));
+    int is_render = (tname && !is_gx_worker_init && (strstr(tname, "Render") || strstr(tname, "render") || strstr(tname, "Present") || strstr(tname, "Flip") || strstr(tname, "Display") || strstr(tname, "GXRender") || strstr(tname, "Gnm")));
     int is_audio = (tname && (strstr(tname, "Audio") || strstr(tname, "audio") || strstr(tname, "Sound") || strstr(tname, "sound")));
     if (is_render || is_audio) {
         static HMODULE s_avrt = NULL;
@@ -420,6 +435,12 @@ static ABI int32_t thread_join(GuestThread *t,void **result) {
     runtime_thread_set_blocked("thread_join", (uintptr_t)t);
     int e=host_thread_join(t->host);
     runtime_thread_clear_blocked();
+#ifdef _WIN32
+    if (t->win32_handle) {
+        CloseHandle(t->win32_handle);
+        t->win32_handle = NULL;
+    }
+#endif
     if (e) { fprintf(stderr,"STOP: host thread join failed: %d\n",e); exit(21); }
     if (result) *result=t->result;
     host_lock(&lock); ++joined_count; host_unlock(&lock);
@@ -430,6 +451,12 @@ static ABI int32_t thread_detach(GuestThread *t) {
     if (!find_thread(t)) return ERR(3);
     if (t->detached) return ERR(22);
     t->detached=1;
+#ifdef _WIN32
+    if (t->win32_handle) {
+        CloseHandle(t->win32_handle);
+        t->win32_handle = NULL;
+    }
+#endif
     if (!t->host_owned) host_thread_detach(t->host);
     return 0;
 }

@@ -57,6 +57,16 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
             }
         }
     }
+    // Prewarm DeviceLocal staging memory so texture detiling (TileManager::DetileImage)
+    // during area streaming does not block the render thread with synchronous vkAllocateMemory.
+    Ring& dev_ring = rings[u32(MemoryType::DeviceLocal)];
+    for (u64 i = 0; i < 2; ++i) {
+        dev_ring.blocks.emplace_back(Block{
+            .buffer = std::make_unique<VideoCore::StreamBuffer>(
+                instance, scheduler, MemoryType::DeviceLocal, BLOCK_SIZE),
+            .last_used_frame = frame.load(std::memory_order_relaxed),
+        });
+    }
 }
 
 StagingBufferPool::~StagingBufferPool() = default;

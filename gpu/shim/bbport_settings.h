@@ -175,7 +175,7 @@ struct Values {
     /// Live engine clock (probe.c hook). live_fps/target_fps/max_dt_hz persist; the rest is
     /// runtime status for the overlay.
     std::atomic<bool> live_fps{true};
-    std::atomic<int> target_fps{60}; ///< 30/60/90/120, 0 = uncapped
+    std::atomic<int> target_fps{60}; ///< 30/40/60/75/90/120/144/165/240, 0 = uncapped
     std::atomic<int> max_dt_hz{30}; ///< physics upper clamp (1/30 s by default)
     std::atomic<bool> live_clock_supported{false};
     std::atomic<float> live_clock_dt_ms{0.0f};

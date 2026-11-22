@@ -1691,8 +1691,7 @@ class BloodborneLauncher(LauncherView):
                 "hud_opacity": f"{self.sl_hud_opacity.value() / 100:.2f}",
                 "hud_scale": f"{self.sl_hud_scale.value() / 100:.2f}",
                 "model_lod": self.cmb_model_lod.currentData() or "0",
-                "live_fps": "1" if (self.chk_fps_patch.isChecked()
-                                    and (self.cmb_fps.currentData() or "60") != "30") else "0",
+                "live_fps": "1" if self.chk_fps_patch.isChecked() else "0",
                 "target_fps": self.cmb_fps.currentData() or "60",
                 "game_language": self.cmb_lang.currentData() or "1",
             })
@@ -2053,6 +2052,8 @@ class BloodborneLauncher(LauncherView):
         self._set_combo_data(self.cmb_model_lod, ini_opts.get("model_lod", "0"))
 
         ini_fps = ini_opts.get("target_fps", "").strip()
+        if ini_fps == "0":
+            ini_fps = "uncap"
         if ini_fps and hasattr(self, "cmb_fps"):
             self._set_combo_data(self.cmb_fps, ini_fps)
         if "live_fps" in ini_opts and hasattr(self, "chk_fps_patch"):
@@ -2542,8 +2543,9 @@ class BloodborneLauncher(LauncherView):
         env["BB_LIVE_RES"] = "0"
         env["BB_GAME_DIR"] = str(game_dir)
         fps_rate = cfg["fps"]
-        # 30 is the native PS4 path in both modes: no FPS patch and no live clock hook.
-        live_fps = bool(cfg["feat_fps_patch"]) and fps_rate != "30"
+        # If the Live FPS patch is checked, install the live clock hook even at 30 FPS initial target
+        # so that framerates and VRR can be adjusted dynamically in the in-game overlay without restart.
+        live_fps = bool(cfg["feat_fps_patch"])
         env["BB_FPS"] = fps_rate
         env["BB_LIVE_FPS"] = "1" if live_fps else "0"
         env["BB_MODS_ENABLED"] = "1" if cfg["mods"] else "0"

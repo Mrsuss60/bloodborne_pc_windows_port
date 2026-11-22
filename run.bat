@@ -105,7 +105,6 @@ if "%BB_AUTO_RENDER_RES%"=="1" (
     set "BB_AUTO_RENDER_RES="
 )
 
-if "%BB_FPS%"=="30" set "BB_LIVE_FPS=0"
 if "%BB_LIVE_FPS%"=="1" (
     set "fps=live"
     if "%BB_VBLANK_HZ%"=="" set "BB_VBLANK_HZ=0"

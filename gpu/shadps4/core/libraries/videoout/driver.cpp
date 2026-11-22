@@ -7,6 +7,9 @@
 #include <chrono>
 #include <cstdio>
 #include <time.h>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -682,12 +685,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    // High-precision hybrid pacer: coarse sleep while > 1.5ms remaining, then spin-wait with _mm_pause()
+    const auto precise_wait_until = [](std::chrono::steady_clock::time_point target) {
+        auto now = std::chrono::steady_clock::now();
+        while (target - now > std::chrono::microseconds(1500)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+            now = std::chrono::steady_clock::now();
+        }
+        while (now < target) {
+#if defined(_M_X64) || defined(__x86_64__)
+            _mm_pause();
+#endif
+            now = std::chrono::steady_clock::now();
+        }
+    };
+
     // bbport: with a frame limit (uncapped presets) a queued flip is presented as soon as it
     // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
     while (!token.stop_requested()) {
-        timer.Start();
-        const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
-
         // Live clock: the overlay can change the target without a restart. Recompute the slot
         // period when it changes; reset next_flip so a faster target is not stuck behind the
         // old one. One relaxed atomic read per iteration when live mode is off.
@@ -703,6 +718,18 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                         BbSettings::LiveFrameLimitActive() ? " (live)" : "");
         }
         const bool immediate_flips = frame_limit != 0;
+
+        // Decouple presenter vblank cadence from static 60 Hz when Live FPS is active.
+        // Ticks the vblank pump and request deadlines at the target frame rate (or 240 Hz uncapped)
+        // to eliminate 60 Hz harmonic stutter at 90, 120, 144, and uncapped framerates.
+        const auto active_vblank_period = (BbSettings::LiveFrameLimitActive() && frame_limit > 0)
+                                              ? frame_period
+                                              : (BbSettings::LiveFrameLimitActive() && frame_limit == 0)
+                                                    ? std::chrono::nanoseconds(1000000000 / 240)
+                                                    : vblank_period;
+
+        timer.Start();
+        const auto tick_deadline = std::chrono::steady_clock::now() + active_vblank_period;
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -773,7 +800,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (next_flip >= tick_deadline) {
                     break;
                 }
-                std::this_thread::sleep_until(next_flip);
+                precise_wait_until(next_flip);
             }
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
@@ -783,7 +810,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 FRAME_END;
             }
         }
-        std::this_thread::sleep_until(tick_deadline);
+        if (std::chrono::steady_clock::now() < tick_deadline) {
+            precise_wait_until(tick_deadline);
+        }
     }
 }
 

@@ -2971,6 +2971,8 @@ void runtime_restart(void) {
 static int g_live_clock_deltatime;
 static float s_smoothed_dt;
 static int s_prev_target_fps = -1;
+static int s_drop_frames = 0;
+static int s_recover_frames = 0;
 
 /* Live engine clock (Phase 2). Called from the 25-byte guest stub installed at 0x2018e3d with
  * rdi = clock singleton (rbx). No allocation, no locks: relaxed atomic reads from BbSettings
@@ -2984,13 +2986,28 @@ ABI float bb_live_clock_tick(void *singleton) {
     if (mode == 0) return *interval; /* static XML patches: no behaviour change */
     const float measured = *(float *)((char *)singleton + 0x264);
     const float target = target_fps > 0 ? 1.0f / (float)target_fps : 1.0f / 240.0f;
-    float max_dt = max_dt_hz > 0 ? 1.0f / (float)max_dt_hz : (1.0f / 30.0f);
-    if (max_dt < target) max_dt = target;
-    *interval = target;
 
-    float raw = measured > 0.0f ? measured : target;
+    /* Sub-30 FPS Anti-Slow-Motion Protection:
+     * - Isolated spikes (< 2 frames): clamp to 1/30 s (0.0333 s) to shield Havok cloth constraints.
+     * - Sustained low FPS (s_drop_frames >= 2): gracefully expand ceiling to 1/20 s (0.0500 s)
+     *   so gameplay animations and combat stay 100% real-time down to 20 FPS instead of slowing down. */
+    float floor_hz = (max_dt_hz > 0 && max_dt_hz < 30) ? (float)max_dt_hz : 30.0f;
+    if (s_drop_frames >= 2 && floor_hz > 20.0f) {
+        floor_hz = 20.0f;
+    }
+    float max_dt = 1.0f / floor_hz;
+    if (max_dt < target) max_dt = target;
+
+    float raw = (measured > 0.0f && isfinite(measured)) ? measured : target;
     if (raw > max_dt) raw = max_dt;
     if (raw < 1.0f / 240.0f) raw = 1.0f / 240.0f;
+
+    /* Reset/re-seed filter on long pauses, level loads, or area warps (> 200 ms) */
+    if (measured > 0.20f) {
+        s_smoothed_dt = target_fps > 0 ? target : raw;
+        s_drop_frames = 0;
+        s_recover_frames = 0;
+    }
 
     /* Deadband: if measured dt is within ±8% of target frametime, lock to exact target.
      * Wipes out OS timer/vsync micro-jitter so foliage and Havok cloth stay rock-steady at target FPS. */
@@ -3001,31 +3018,53 @@ ABI float bb_live_clock_tick(void *singleton) {
         }
     }
 
-    /* Seed immediately on initial tick or smoothly slew when target FPS is switched in the menu */
+    /* Seed immediately on initial tick or when target FPS is switched in the menu */
     if (s_smoothed_dt <= 0.0f) {
-        s_smoothed_dt = target;
+        s_smoothed_dt = target_fps > 0 ? target : raw;
         s_prev_target_fps = target_fps;
+        s_drop_frames = 0;
+        s_recover_frames = 0;
     } else {
         if (s_prev_target_fps != target_fps) {
             s_prev_target_fps = target_fps;
+            s_drop_frames = 0;
+            s_recover_frames = 0;
             /* Prevent UI menu dropdown stalls during target switch from injecting spikes */
             if (target_fps > 0 && raw > target && raw > s_smoothed_dt) {
                 raw = target > s_smoothed_dt ? target : s_smoothed_dt;
             }
         }
 
-        /* Slew-rate limiter / spike dampener: prevent sudden impulse shocks to Havok cloth
-         * constraints and foliage accumulators (+12% max increase, -15% max decrease per frame). */
-        const float max_increase = s_smoothed_dt * 0.12f;
-        const float max_decrease = s_smoothed_dt * 0.15f;
+        /* Adaptive slew-rate limiter:
+         * - Single-frame hitches: capped at +15% / -18% to shield Havok cloth from sudden impulses.
+         * - Sustained framerate changes (>= 2 frames): accelerates to eliminate slow-motion lag. */
         if (raw > s_smoothed_dt) {
-            float step = raw - s_smoothed_dt;
-            if (step > max_increase) step = max_increase;
-            s_smoothed_dt += step;
+            s_recover_frames = 0;
+            s_drop_frames++;
+            if (s_drop_frames >= 3) {
+                s_smoothed_dt = raw;
+            } else {
+                const float rate = (s_drop_frames == 1) ? 0.15f : 0.40f;
+                const float max_increase = s_smoothed_dt * rate;
+                float step = raw - s_smoothed_dt;
+                if (step > max_increase) step = max_increase;
+                s_smoothed_dt += step;
+            }
         } else if (raw < s_smoothed_dt) {
-            float step = s_smoothed_dt - raw;
-            if (step > max_decrease) step = max_decrease;
-            s_smoothed_dt -= step;
+            s_drop_frames = 0;
+            s_recover_frames++;
+            if (s_recover_frames >= 3) {
+                s_smoothed_dt = raw;
+            } else {
+                const float rate = (s_recover_frames == 1) ? 0.18f : 0.40f;
+                const float max_decrease = s_smoothed_dt * rate;
+                float step = s_smoothed_dt - raw;
+                if (step > max_decrease) step = max_decrease;
+                s_smoothed_dt -= step;
+            }
+        } else {
+            s_drop_frames = 0;
+            s_recover_frames = 0;
         }
     }
 
@@ -3038,6 +3077,11 @@ ABI float bb_live_clock_tick(void *singleton) {
      * accumulators) sample [singleton + 0x264]. Overwriting the raw OS timer reading with our
      * deadbanded and smoothed dt eliminates high-frequency wind flutter and cloth vibration. */
     *(float *)((char *)singleton + 0x264) = dt;
+
+    /* Dynamic interval: when target FPS is set, interval reflects the fixed target cadence.
+     * In uncapped mode (target_fps <= 0), interval dynamically tracks the real filtered dt,
+     * avoiding artificial 240 Hz scale distortion in internal engine ratio calculations. */
+    *interval = (target_fps > 0) ? target : dt;
 
     if (g_live_clock_deltatime && image) {
         *(float *)(image + 0x535A908) = dt;
@@ -3847,9 +3891,29 @@ int main(int argc, char **argv) {
             *(uint32_t *)(image + 0x203485f) = pacer_uncap;
             *(uint32_t *)(image + 0x2034883) = pacer_uncap;
             *(uint32_t *)(image + 0x20348b8) = pacer_uncap;
+#ifdef _WIN32
+            FlushInstructionCache(GetCurrentProcess(), image + 0x2034840, 0x80);
+#else
+            __builtin___clear_cache((char *)(image + 0x2034840), (char *)(image + 0x2034840 + 0x80));
+#endif
         }
+
+        /* Wind Phase Fix: remove the two 6-byte zero-crossing holds at 0x019084ef and 0x01908512
+         * (PS4 addresses 0x01D084EF and 0x01D08512) so that foliage and grass wind oscillation
+         * sweeps continuously without pausing for 2-8 frames at 60-240 FPS. */
+        static const unsigned char six_nops[6] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+        if (size > 0x1908518) {
+            memcpy(image + 0x019084ef, six_nops, sizeof(six_nops));
+            memcpy(image + 0x01908512, six_nops, sizeof(six_nops));
+#ifdef _WIN32
+            FlushInstructionCache(GetCurrentProcess(), image + 0x019084ef, 0x40);
+#else
+            __builtin___clear_cache((char *)(image + 0x019084ef), (char *)(image + 0x019084ef + 0x40));
+#endif
+        }
+
         bbgpu_set_live_clock_supported(1);
-        printf("[LIVE CLOCK] Hook installed at image+0x2018e3d (stub=%p, target=%d FPS, max dt 1/%d s, deltatime=%d)\n",
+        printf("[LIVE CLOCK] Hook installed at image+0x2018e3d (stub=%p, target=%d FPS, max dt 1/%d s, deltatime=%d, wind_fix=1)\n",
                (void *)t, live_target, live_max_dt, g_live_clock_deltatime);
     } while (0);
 
