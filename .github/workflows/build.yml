@@ -91,10 +91,13 @@ jobs:
             fi
           done
 
-          # magic_enum is header-only and not packaged for UCRT64.
+          # magic_enum is header-only and not packaged for UCRT64. Pin it: post-0.9.8 upstream
+          # rejects enums with named values outside MAGIC_ENUM_RANGE_MIN/MAX (e.g.
+          # AmdGpu::PM4ItOpcode, which reaches 0x84) with a static_assert.
+          magic_enum_tag=v0.9.8
           mkdir -p "$MSYS2_PREFIX/include/magic_enum" "$MSYS2_PREFIX/share/licenses/magic_enum"
-          curl -sSfL -o "$MSYS2_PREFIX/include/magic_enum/magic_enum.hpp" https://raw.githubusercontent.com/Neargye/magic_enum/master/include/magic_enum/magic_enum.hpp
-          curl -sSfL -o "$MSYS2_PREFIX/share/licenses/magic_enum/LICENSE" https://raw.githubusercontent.com/Neargye/magic_enum/master/LICENSE
+          curl -sSfL -o "$MSYS2_PREFIX/include/magic_enum/magic_enum.hpp" "https://raw.githubusercontent.com/Neargye/magic_enum/$magic_enum_tag/include/magic_enum/magic_enum.hpp"
+          curl -sSfL -o "$MSYS2_PREFIX/share/licenses/magic_enum/LICENSE" "https://raw.githubusercontent.com/Neargye/magic_enum/$magic_enum_tag/LICENSE"
 
           # VMA ships its header under include/vma, but find_path(VMA_INC ...) looks
           # for include/vk_mem_alloc.h.
