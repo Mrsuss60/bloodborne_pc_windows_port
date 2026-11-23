@@ -1,3 +1,130 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2ca94cc..3fb4b0a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -231,7 +231,7 @@ if(FFX_VK_PORTABLE_BUILD_FSR3_HOST)
+             "${FFX_1_1_4_ROOT}/src/shared"
+             "${FFX_1_1_4_ROOT}/src/components"
+     )
+-    if(NOT WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++    if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+         target_compile_options(ffx_vulkan_fsr3_host_1_1_4 PRIVATE
+             -include "${CMAKE_CURRENT_SOURCE_DIR}/src/ffx_1_1_4_portability.hpp"
+         )
+@@ -281,7 +281,7 @@ if(FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND)
+     target_link_libraries(ffx_vulkan_fsr3_vk_backend_1_1_4
+         PUBLIC ffx-vulkan::fsr3-host-1.1.4 Vulkan::Vulkan
+     )
+-    if(NOT WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
++    if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+         target_compile_options(ffx_vulkan_fsr3_vk_backend_1_1_4 PRIVATE
+             -include "${CMAKE_CURRENT_SOURCE_DIR}/src/ffx_1_1_4_portability.hpp"
+         )
+diff --git a/include/ffx_vk_portable.h b/include/ffx_vk_portable.h
+index 1fa6a61..9ad47e1 100644
+--- a/include/ffx_vk_portable.h
++++ b/include/ffx_vk_portable.h
+@@ -313,6 +313,24 @@ FfxVkPortableResult ffxVkPortableUpscaleContextGetMemoryUsage(
+     FfxVkPortableUpscaleContext* context,
+     FfxVkPortableMemoryUsage* usage);
+ 
++/*
++ * bbport: FSR 3.1's tuning constants (ffxFsr3UpscalerSetConstant), kept by the context
++ * for the dispatches that follow.  The SDK's defaults: velocityFactor 1, reactivenessScale 1,
++ * shadingChangeScale 1, accumulationAddedPerFrame 0.333, minDisocclusionAccumulation -0.333.
++ */
++typedef struct FfxVkPortableUpscaleTuning {
++    uint32_t structSize;
++    float velocityFactor;              /* [0, 1]: lower steadies bright pixels in motion */
++    float reactivenessScale;           /* [0, inf): scales the reactive mask */
++    float shadingChangeScale;          /* [0, inf): reacts more to shading changes */
++    float accumulationAddedPerFrame;   /* [0, 1]: lower ghosts less, thin details flicker more */
++    float minDisocclusionAccumulation; /* [-1, 1]: higher flickers less at disocclusions */
++} FfxVkPortableUpscaleTuning;
++
++FfxVkPortableResult ffxVkPortableUpscaleContextSetTuning(
++    FfxVkPortableUpscaleContext* context,
++    const FfxVkPortableUpscaleTuning* tuning);
++
+ /*
+  * Record one upscaler dispatch into an already-recording primary or secondary
+  * command buffer.  No queue submission or wait is performed.  Calls for a
+diff --git a/src/ffx_1_1_4_portability.hpp b/src/ffx_1_1_4_portability.hpp
+index c7be6c3..0b00e8d 100644
+--- a/src/ffx_1_1_4_portability.hpp
++++ b/src/ffx_1_1_4_portability.hpp
+@@ -9,6 +9,11 @@
+ 
+ #pragma once
+ 
++// MSVC's CRT provides this macro, but MinGW/Clang does not, including on Windows.
++#ifndef _countof
++#define _countof(array) (sizeof(array) / sizeof((array)[0]))
++#endif
++
+ #if !defined(_WIN32)
+ 
+ #include <cerrno>
+@@ -19,10 +24,6 @@
+ #include <cstring>
+ #include <cwchar>
+ 
+-#ifndef _countof
+-#define _countof(array) (sizeof(array) / sizeof((array)[0]))
+-#endif
+-
+ inline int wcscpy_s(wchar_t* destination, std::size_t destinationSize, const wchar_t* source)
+ {
+     if (!destination || destinationSize == 0) {
+diff --git a/src/ffx_vk_fsr3_portable.cpp b/src/ffx_vk_fsr3_portable.cpp
+index 578f9a3..b115bb7 100644
+--- a/src/ffx_vk_fsr3_portable.cpp
++++ b/src/ffx_vk_fsr3_portable.cpp
+@@ -22,6 +22,7 @@
+ #include <cwchar>
+ #include <limits>
+ #include <mutex>
++#include <utility>
+ #include <new>
+ 
+ namespace {
+@@ -558,6 +559,36 @@ extern "C" FfxVkPortableResult ffxVkPortableUpscaleContextGetMemoryUsage(
+     return FFX_VK_PORTABLE_OK;
+ }
+ 
++extern "C" FfxVkPortableResult ffxVkPortableUpscaleContextSetTuning(
++    FfxVkPortableUpscaleContext* context,
++    const FfxVkPortableUpscaleTuning* tuning)
++{
++    if (context == nullptr || tuning == nullptr)
++        return FFX_VK_PORTABLE_ERROR_INVALID_POINTER;
++    if (tuning->structSize < sizeof(*tuning))
++        return FFX_VK_PORTABLE_ERROR_INVALID_STRUCT_SIZE;
++    if (context->magic != kContextMagic || !context->ffxContextCreated)
++        return FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
++
++    std::lock_guard<std::mutex> lock(context->mutex);
++    const std::pair<FfxFsr3UpscalerConfigureKey, float> values[] = {
++        {FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR, tuning->velocityFactor},
++        {FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE, tuning->reactivenessScale},
++        {FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE, tuning->shadingChangeScale},
++        {FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME,
++         tuning->accumulationAddedPerFrame},
++        {FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION,
++         tuning->minDisocclusionAccumulation},
++    };
++    for (const auto& [key, value] : values) {
++        float v = value;
++        const FfxErrorCode result = ffxFsr3UpscalerSetConstant(&context->ffxContext, key, &v);
++        if (result != FFX_OK)
++            return fromFfxResult(result);
++    }
++    return FFX_VK_PORTABLE_OK;
++}
++
+ extern "C" FfxVkPortableResult ffxVkPortableUpscaleContextRecordDispatch(
+     FfxVkPortableUpscaleContext* context,
+     const FfxVkPortableUpscaleDispatchInfo* dispatchInfo)
 diff --git a/src/ffx_vk_fsr4_v07.c b/src/ffx_vk_fsr4_v07.c
 index c30f7cf..eb42c16 100644
 --- a/src/ffx_vk_fsr4_v07.c

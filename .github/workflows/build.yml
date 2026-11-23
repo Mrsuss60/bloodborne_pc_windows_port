@@ -132,8 +132,19 @@ jobs:
           echo "Built out/libatrac9.a"
 
           echo "=== 2. Applying FSR-Vulkan Patch ==="
-          if [ -f patches/fsr_vulkan_mingw.patch ]; then
-            git -C gpu/third_party/fsr-vulkan apply ../../../patches/fsr_vulkan_mingw.patch || true
+          # The submodule is checked out at the commit the superproject tracks, so the port's
+          # FSR-Vulkan changes (MSVC/MinGW portability plus the FSR 3.1 tuning entry points
+          # used by vk_temporal_upscaler.cpp) are carried in this patch. Do not skip it
+          # silently: without it the build uses an API the submodule does not have.
+          fsr_patch=../../../patches/fsr_vulkan_mingw.patch
+          if git -C gpu/third_party/fsr-vulkan apply --check "$fsr_patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan apply --whitespace=nowarn "$fsr_patch"
+            echo "Applied fsr_vulkan_mingw.patch"
+          elif git -C gpu/third_party/fsr-vulkan apply --reverse --check "$fsr_patch" 2>/dev/null; then
+            echo "fsr_vulkan_mingw.patch is already applied"
+          else
+            echo "::error::patches/fsr_vulkan_mingw.patch no longer applies to the fsr-vulkan submodule"
+            exit 1
           fi
 
           echo "=== 3. Configuring CMake ==="
